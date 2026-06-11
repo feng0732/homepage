@@ -180,6 +180,11 @@ url    = `${schema}://${host}${path}`
 1. spec.hostnames 必须存在
 2. path 类型不能是 RegularExpression
 3. 通过 parentRefs[0] 关联的 Gateway 资源查询监听器协议（http/https）
+   → 直接使用 parentRef.namespace 作为 Gateway 所在命名空间
+     （⚠️ 命名空间边界：parentRef 未写 namespace 时，
+      不会自动改用 HTTPRoute 自身的命名空间，
+      会将 undefined 传给 API 导致查询失败，
+      catch 后协议回退为 "http"）
    → CustomObjectsApi.getNamespacedCustomObject() 获取 Gateway
    → 匹配 sectionName 或取第一个 listener 的 protocol
 4. url = `${schema}://${hostnames[0]}${rules[0].matches[0].path.value}`
