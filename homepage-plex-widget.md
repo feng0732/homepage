@@ -447,44 +447,297 @@ if (error) {
 
 ---
 
-## 八、关键调用链速查表
+## 八、边界场景深入分析
 
-### 8.1 配置加载链
+### 8.1 空闲播放状态（无活跃会话）的代码行为
+
+当 Plex 没有任何人播放媒体时，各层代码的处理容易被误解。逐段核查：
+
+#### 8.1.1 Proxy 层：`src/widgets/plex/proxy.js` L73-L85
+
+```javascript
+logger.debug("Getting streams from Plex API");
+let streams;                               // 声明但不初始化 → 值为 undefined
+let [status, apiData] = await fetchFromPlexAPI("/status/sessions", widget);
+
+if (status !== 200) { /* 返回错误，不往下走 */ }
+
+if (apiData && apiData.MediaContainer) {  // ← 关键分支
+  streams = apiData.MediaContainer._attributes.size;
+}
+// 如果 if 条件不满足，streams 保持 undefined
+```
+
+Plex API 在空闲时的返回特征：
+- HTTP 状态码仍然是 **200**（不是 404 或空）
+- 返回的 XML 中仍然包含 `<MediaContainer>` 根元素
+- 但 `size="0"` 属性存在（空会话），所以 `apiData && apiData.MediaContainer` 始终为 `true`
+
+**真实的空闲输出**：`streams` 会被赋值为字符串 `"0"`，而不是 `undefined`。`undefined` 只会在以下罕见情况出现：
+- Plex 返回非 200 状态码（已在前面 return 了）
+- `xml2json` 解析失败返回 `null`（L56-L61 catch 分支返回 `[status, null]`）
+- Plex 返回了完全异常的 XML（无 MediaContainer）
+
+> ⚠️ **容易误解点**：注释写的是"当 Plex 无活跃会话时 streams 将保持 undefined"，但实际空闲场景几乎总是得到 `"0"`。只有 API 调用/解析异常才会得到 `undefined`。
+
+#### 8.1.2 组件层：`src/widgets/plex/component.jsx` L31-L38
+
+```jsx
+<Block label="plex.streams" value={t("common.number", { value: plexData.streams })} />
+```
+
+`plexData.streams` 取值与 Block 表现：
+
+| `plexData.streams` | 场景 | `t("common.number", ...)` 输出 | Block 视觉 |
+|---|---|---|---|
+| `"2"` | 正常播放中（字符串） | `"2"` 或 `"2,000"`（本地化） | 正常显示 |
+| `"0"` | 空闲（字符串） | `"0"` | 正常显示数字 0 |
+| `undefined` | API/解析异常 | `undefined` | Block 进入加载态（`animate-pulse` + 显示 `-`） |
+| `2`（number） | 测试/未来修正后 | `"2"` | 正常显示 |
+
+#### 8.1.3 与同类服务的空闲态对比
+
+| Widget | 空闲时的输出与渲染 |
+|---|---|
+| **Plex** | `streams: "0"`，Block 正常显示数字 0，**无任何"空闲"提示文案** |
+| **Emby** | `playing.length === 0`，显示 `t("emby.no_active")` 文案（`src/widgets/emby/component.jsx` L278-L294） |
+| **Jellyfin** | 与 Emby 完全相同逻辑，显示 `t("jellyfin.no_active")` 文案 |
+| **Tautulli** | `playing.length === 0`，显示 `t("tautulli.no_active")` 文案（`src/widgets/tautulli/component.jsx` L180-L193） |
+
+**关键差异**：Plex 空闲时用户只能看到 `streams` 显示为 `0`，其余三个服务都会明确显示一段"无活跃播放"的文字提示。这是 Plex "不显眼"的又一个具体表现。
+
+#### 8.1.4 测试用例揭示的类型不一致问题
+
+`src/widgets/plex/proxy.test.js` L90（真实代理输出）：
+```javascript
+expect(res.body).toEqual({ streams: "2", albums: 30, movies: 10, tv: 20 });
+//                                                  ^^ string        ^^ numbers
+```
+
+`src/widgets/plex/component.test.jsx` L43（传给组件的 mock 数据）：
+```javascript
+useWidgetAPI.mockReturnValue({ data: { streams: 1, albums: 2, movies: 3, tv: 4 }, error: undefined });
+//                                                     ^ number
+```
+
+组件测试用 number，但 proxy 实际返回 string。之所以没有暴露问题，是因为 `t("common.number", { value })` 在 i18next-intl 内部对 string 和 number 都做了 `Number()` 转换。这是一个潜在的测试覆盖盲区。
+
+---
+
+### 8.2 定时刷新与缓存过期的配合机制
+
+Plex Widget 的刷新存在**两层独立的缓存/轮询**，容易被混淆为同一机制：
+
+| 层级 | 机制 | 位置 | 控制参数 | 间隔 |
+|---|---|---|---|---|
+| 前端 | SWR 轮询 | `src/utils/proxy/use-widget-api.js` | `refreshInterval` | **5 秒**（Plex） |
+| 后端 | memory-cache TTL | `src/widgets/plex/proxy.js` | `cache.put(key, val, TTL)` | **10 分钟**（计数） / **6 小时**（库列表） |
+
+两层缓存互相独立，实际效果如下：
+
+#### 8.2.1 时间轴示例（假设服务启动后）
+
+```
+t=0s     浏览器首次加载
+         SWR → GET /api/services/proxy (第1次)
+         proxy: streams=实时请求, libraries=未命中→请求并缓存6h, counts=未命中→请求并缓存10min
+         返回: { streams:"2", movies:800, tv:3000, albums:150 }
+         ↓
+t=5s     SWR refreshInterval 触发
+         SWR → GET /api/services/proxy (第2次)
+         proxy: streams=实时请求(重新取), libraries=命中缓存, counts=命中缓存(还有9:55)
+         返回: { streams:"2", movies:800, tv:3000, albums:150 }  ← movies/tv/albums 完全没变
+         ↓
+t=10s    SWR 再次触发（第3次）
+         ... 同上，movies/tv/albums 仍然是缓存值
+         ↓
+         ...（每 5s 重复一次 streams 实时请求）...
+         ↓
+t=10min  后端 counts 缓存过期（第120次 SWR 请求时）
+         proxy: streams=实时请求, libraries=仍有5h50min, counts=未命中→重新请求
+         返回: movies/tv/albums 可能变化了
+         ↓
+t=6h     libraries 缓存过期，重新拉一次媒体库列表
+```
+
+#### 8.2.2 关键配合要点
+
+1. **前端 5s × 后端 10min = 数据新鲜度不匹配**：
+   - `streams` 字段真正做到了 5 秒级实时（因为 proxy 从不缓存它）
+   - `movies/tv/albums` 每 5 秒从后端返回的都是同一个缓存值，直到 10 分钟过期才刷新
+   - 前端以为自己在"每 5 秒刷新全部数据"，但计数数据实际上最多 10 分钟才变一次
+
+2. **多实例缓存隔离**：
+   - 缓存键格式为 `${cacheKey}.${service}.${index}`（proxy.js L87 等）
+   - 同一 Homepage 配置了两个 Plex 服务（如 `Plex-Home` 和 `Plex-Office`，index 分别为 0、1）时，缓存完全独立
+
+3. **进程重启 = 缓存全失效**：
+   - `memory-cache` 是进程内内存缓存，Next.js 服务器重启后全部丢失
+   - 对比：SWR 是浏览器端缓存，刷新页面后丢失，不影响后端
+
+4. **同类服务对比**：
+
+| Widget | refreshInterval（前端） | 后端缓存 |
+|---|---|---|
+| **Plex** | `5000ms`（unified） | `memory-cache`，libraries 6h，counts 10min |
+| **Emby** | Sessions `5000ms` / Count `60000ms` | 无（`genericProxyHandler` 不做缓存） |
+| **Jellyfin** | Sessions `5000ms` / Count `60000ms` | 无（`jellyfinProxyHandler` 不做缓存） |
+| **Tautulli** | `get_activity` `5000ms` | 无（`genericProxyHandler` 不做缓存） |
+
+**Emby/Jellyfin 的设计思路**：直接用两个不同的 `refreshInterval` 区分实时数据（5s）与静态计数（60s），计数不需要 5 秒那么频繁。Plex 因为 proxy 内部做了聚合只能传一个 `refreshInterval`，所以用了更激进的 5 秒轮询 + 后端缓存 TTL 来限流。
+
+---
+
+### 8.3 同类媒体服务输出类型与字段结构对比
+
+为了让复核者准确把握各服务返回给前端的数据形态，以下是逐项对比：
+
+#### 8.3.1 数据类型对比
+
+| 字段 | Plex | Emby Count | Emby Sessions | Jellyfin Count | Tautulli |
+|---|---|---|---|---|---|
+| **电影数** | `movies: number`（parseInt） | `MovieCount: number`（原生 JSON） | — | `MovieCount: number` | — |
+| **剧集/节目** | `tv: number`（parseInt） | `SeriesCount: number` | — | `SeriesCount: number` | — |
+| **单集** | — | `EpisodeCount: number` | — | `EpisodeCount: number` | — |
+| **音乐/专辑** | `albums: number`（parseInt） | `SongCount: number` | — | `SongCount: number` | — |
+| **播放流数** | `streams: string`（xml2json） | — | `sessionsData.length`（JS 计算） | — | `sessions.length`（JS 计算） |
+| **流详情数组** | ❌ 无 | — | `session.NowPlayingItem` 对象 | — | `session` 对象 |
+
+#### 8.3.2 Plex 输出 JSON 样本
+
+```json
+{
+  "streams": "2",
+  "albums": 150,
+  "movies": 800,
+  "tv": 3000
+}
+```
+
+#### 8.3.3 Emby Count 输出 JSON 样本（`src/widgets/emby/widget.js` → Items/Counts）
+
+```json
+{
+  "MovieCount": 800,
+  "SeriesCount": 200,
+  "EpisodeCount": 3000,
+  "SongCount": 5000,
+  "ArtistCount": 150,
+  "AlbumCount": 150
+}
+```
+
+#### 8.3.4 Emby Sessions 输出 JSON 样本（节选单个 Session，`Sessions` 接口）
+
+```json
+[
+  {
+    "Id": "session-id-xxx",
+    "UserId": "user-id-xxx",
+    "UserName": "alice",
+    "NowPlayingItem": {
+      "Name": "Inception",
+      "Type": "Movie",
+      "RunTimeTicks": 90000000000,
+      "ParentName": null,
+      "SeriesName": null,
+      "MediaSources": [{ "Id": "xxx", "Bitrate": 8000000 }]
+    },
+    "PlayState": {
+      "PositionTicks": 36000000000,
+      "IsPaused": false
+    }
+  }
+]
+```
+
+#### 8.3.5 Jellyfin V1 vs V2 差异
+
+Jellyfin 通过 `useJellyfinV2` 标志切换 API 路径（`src/widgets/jellyfin/component.jsx` L207-L208）：
+- **V1 路径**：`emby/Sessions?api_key={key}` / `emby/Items/Counts?api_key={key}`（兼容 Emby API 风格，key 在 query 参数里）
+- **V2 路径**：`Sessions` / `Items/Counts`（新版 Jellyfin API，key 通过 `Authorization: MediaBrowser Token=...` header 传递，见 `src/widgets/jellyfin/proxy.js`）
+
+Jellyfin 的输出字段结构与 Emby 完全一致（MovieCount、SeriesCount 等），区别仅在传输方式。
+
+#### 8.3.6 Tautulli 输出 JSON 样本（`get_activity` 接口，节选）
+
+```json
+{
+  "response": {
+    "result": "success",
+    "data": {
+      "sessions": [
+        {
+          "user": "alice",
+          "full_title": "Inception",
+          "title": "Inception",
+          "grandparent_title": null,
+          "parent_title": null,
+          "media_type": "movie",
+          "view_offset": 3600000,
+          "duration": 9000000,
+          "transcode_decision": "direct play",
+          "quality_profile": "1080p"
+        }
+      ],
+      "stream_count": 1,
+      "wan_bandwidth": 0,
+      "lan_bandwidth": 8000
+    }
+  }
+}
+```
+
+#### 8.3.7 类型设计哲学差异
+
+| 设计维度 | Plex | Emby/Jellyfin | Tautulli |
+|---|---|---|---|
+| **聚合方式** | Proxy 内部 4~N 个 API 聚合为 1 个 JSON | 2 个独立 endpoint，前端分别请求 | 1 个 endpoint 含全部 |
+| **类型一致性** | 不一致（streams 为 string，其余 number） | 一致（全是 JSON 原生类型） | 一致 |
+| **字段命名** | 简短英文单词（movies/tv） | PascalCase + Count 后缀 | snake_case |
+| **计数粒度** | movies + tv + albums（粗粒度，tv 是节目+单集混合） | Movie + Series + Episode + Song（细粒度） | 无计数字段 |
+| **流详情** | 丢弃，仅保留 size | 完整 NowPlayingItem + PlayState | 完整 sessions 数组 |
+
+---
+
+## 九、关键调用链速查表
+
+### 9.1 配置加载链
 
 ```
 services.yaml
-  → service-helpers.js: servicesFromConfig() / servicesFromDocker() / servicesFromKubernetes()
-    → service-helpers.js: parseServicesToGroups()
-      → service-helpers.js: cleanServiceGroups()  ← 字段白名单清洗，widget 配置结构化
+  → src/utils/config/service-helpers.js: servicesFromConfig() / servicesFromDocker() / servicesFromKubernetes()
+    → src/utils/config/service-helpers.js: parseServicesToGroups()
+      → src/utils/config/service-helpers.js: cleanServiceGroups()  ← 字段白名单清洗，widget 配置结构化
         → 前端拿到 service + widgets[]
 ```
 
-### 8.2 数据请求链
+### 9.2 数据请求链
 
 ```
 src/widgets/plex/component.jsx
-  → use-widget-api.js: useWidgetAPI(widget, endpoint, { refreshInterval })
-    → api-helpers.js: formatProxyUrl() → /api/services/proxy?...&endpoint=XXX
-      → use-widget-api.js: SWR useSWR() → 自动轮询 + 缓存
+  → src/utils/proxy/use-widget-api.js: useWidgetAPI(widget, endpoint, { refreshInterval })
+    → src/utils/proxy/api-helpers.js: formatProxyUrl() → /api/services/proxy?...&endpoint=XXX
+      → src/utils/proxy/use-widget-api.js: SWR useSWR() → 自动轮询 + 缓存
         → src/pages/api/services/proxy.js: handler
-          → service-helpers.js: getServiceWidget() → 取服务端完整配置（含 url/key）
-          → widgets.js: widgets[type] → 取 widget 定义
+          → src/utils/config/service-helpers.js: getServiceWidget() → 取服务端完整配置（含 url/key）
+          → src/widgets/widgets.js: widgets[type] → 取 widget 定义
           → widget.mappings[endpoint] → 逻辑名→真实路径
           → proxyHandler(req, res, map) → 真实 API 调用
-            → http.js: httpProxy() → 实际 HTTP 请求
-            → validate-widget-data.js: validateWidgetData() → 数据校验
+            → src/utils/proxy/http.js: httpProxy() → 实际 HTTP 请求
+            → src/utils/proxy/validate-widget-data.js: validateWidgetData() → 数据校验
             → map?.(data) → 可选字段变换
           ← res.send(data)
 ```
 
-### 8.3 渲染链
+### 9.3 渲染链
 
 ```
 src/components/services/item.jsx
   → service.widgets.map(widget)
     → src/components/services/widget.jsx: <Widget widget={w} service={service}>
-      → components.js: components[widget.type] → e.g. src/widgets/plex/component.jsx
-        → container.jsx: Container（字段过滤 + 错误处理 + 高亮）
-          → block.jsx: Block × N （或自定义组件，如 Emby 的 SessionEntry）
+      → src/widgets/components.js: components[widget.type] → e.g. src/widgets/plex/component.jsx
+        → src/components/services/widget/container.jsx: Container（字段过滤 + 错误处理 + 高亮）
+          → src/components/services/widget/block.jsx: Block × N （或自定义组件，如 Emby 的 SessionEntry）
             → next-i18next: t(label) 国际化 + t("common.number") 本地化
 ```
