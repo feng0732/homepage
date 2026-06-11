@@ -246,10 +246,33 @@ const widget = {
   wsAPI: "{url}/api/current",
   proxyHandler: truenasProxyHandler,
   mappings: {
-    alerts: { endpoint: "alert/list", wsMethod: "alert.list", map: (data) => {...} },
-    status: { endpoint: "system/info", wsMethod: "system.info", validate: ["loadavg"] },
-    pools: { endpoint: "pool", wsMethod: "pool.query", map: (data) => {...} },
-    dataset: { endpoint: "pool/dataset", wsMethod: "pool.dataset.query" },
+    alerts: {
+      endpoint: "alert/list",
+      wsMethod: "alert.list",
+      map: (data) => {
+        if (Array.isArray(data)) {
+          return { pending: data.filter((item) => item?.dismissed === false).length };
+        }
+        return { pending: jsonArrayFilter(data, (item) => item?.dismissed === false).length };
+      },
+    },
+    status: {
+      endpoint: "system/info",
+      wsMethod: "system.info",
+      validate: ["loadavg", "uptime_seconds"],
+    },
+    pools: {
+      endpoint: "pool",
+      wsMethod: "pool.query",
+      map: (data) => {
+        const list = Array.isArray(data) ? data : asJson(data);
+        return list.map((entry) => ({ id: entry.name, name: entry.name, healthy: entry.healthy }));
+      },
+    },
+    dataset: {
+      endpoint: "pool/dataset",
+      wsMethod: "pool.dataset.query",
+    },
   },
 };
 ```
@@ -536,11 +559,28 @@ export default function createUnifiProxyHandler({
      (mapping) => mapping.endpoint === endpoint
    );
    ```
-   **⚠️ TrueNAS 的 WebSocket 路径**调用它时传入的 `endpoint` 已经是真实路径（如 `system/info`），所以能正确匹配到 `mappings.status` 并拿到 `validate: ["loadavg"]`。
+   **⚠️ TrueNAS 的 WebSocket 路径**调用它时传入的 `endpoint` 已经是真实路径（如 `system/info`），所以能正确匹配到 `mappings.status` 并拿到 `validate: ["loadavg", "uptime_seconds"]`。
 2. 若 `mapping.allowEmpty === true` 且 data 是空 Buffer → 直接返回 true
 3. Buffer → JSON parse（第一次直接 parse，失败则去空白后再 parse）
 4. 遍历 `mapping.validate` 数组中的每个 key，若 JSON 中该 key 为 undefined 则标记 invalid
 5. invalid 时 `logger.error` 详细日志（含期望字段、parse 错误、原始 data）
+
+**⚠️ 缺少 validate 字段时的行为**：
+```javascript
+// validate-widget-data.js L33-37
+if (dataParsed && Object.entries(dataParsed).length) {
+  mapping?.validate?.forEach((key) => {   // ← 可选链 ?.forEach
+    if (dataParsed[key] === undefined) {
+      valid = false;
+    }
+  });
+}
+```
+当 mapping 中没有 `validate` 字段时（如 TrueNAS 的 `alerts`、`pools`、`dataset`），`mapping?.validate` 为 `undefined`，`undefined?.forEach(...)` 是空操作，`valid` 保持 `true`，函数直接返回 `true`。
+
+**也就是说：缺少 validate 字段 = 不做任何字段校验 = 始终通过**。这是"约定优于配置"的体现——只在你关心特定字段时才声明 validate，否则只检查数据可解析且非空。
+
+对于 TrueNAS WebSocket 路径，`sendMethod` 返回的 data 已经是 JavaScript 对象（`waitForEvent` 中 `parseJson: true` 自动解析了），不是 Buffer。因此 `Buffer.isBuffer(data)` 为 false，跳过 JSON parse 步骤，直接进入 validate 检查——如果没有 validate 字段，直接通过。
 
 **⚠️ 调用位置**：
 - generic/credentialed：HTTP 200 时调用，validate 失败直接返回错误
@@ -673,6 +713,41 @@ if (map) data = map(data);
 return res.status(200).json(data);
 ```
 **⚠️ 重要一致点**：validate 和 map 的调用顺序与 generic/credentialed 完全相同——**先 validate，后 map**。这保持了整个代理层的契约一致性。
+
+**⚠️ TrueNAS 各 endpoint 的 validate/map 行为差异**：
+
+| 逻辑 endpoint | 真实路径 | wsMethod | validate | map | validateWidgetData 行为 |
+|--------------|---------|----------|----------|-----|------------------------|
+| `alerts` | `alert/list` | `alert.list` | 无 | ✅ 有 | `mapping.validate` 为 undefined → `?.forEach` 空操作 → 直接通过 |
+| `status` | `system/info` | `system.info` | `["loadavg", "uptime_seconds"]` | 无 | 检查响应中 `loadavg` 和 `uptime_seconds` 两个 key 是否都存在 |
+| `pools` | `pool` | `pool.query` | 无 | ✅ 有 | 同 alerts，无 validate → 直接通过 |
+| `dataset` | `pool/dataset` | `pool.dataset.query` | 无 | 无 | 无 validate 也无 map → 原样返回 |
+
+**alerts 的 map 转换逻辑**（[widget.js#L14-L19](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/truenas/widget.js#L14-L19)）：
+```javascript
+map: (data) => {
+  if (Array.isArray(data)) {
+    // WebSocket 返回的是原生数组
+    return { pending: data.filter((item) => item?.dismissed === false).length };
+  }
+  // REST 返回的可能是 Buffer → asJson 后的对象，需要 jsonArrayFilter 辅助
+  return { pending: jsonArrayFilter(data, (item) => item?.dismissed === false).length };
+}
+```
+- 输入：告警对象数组 `[{ dismissed: false, ... }, { dismissed: true, ... }, ...]`
+- 输出：`{ pending: <未 dismissed 的数量> }`
+- 两个分支分别处理数组数据（WebSocket 原生）和类 Buffer 数据（REST 兼容），过滤逻辑相同
+
+**pools 的 map 转换逻辑**（[widget.js#L29-L36](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/truenas/widget.js#L29-L36)）：
+```javascript
+map: (data) => {
+  const list = Array.isArray(data) ? data : asJson(data);
+  return list.map((entry) => ({ id: entry.name, name: entry.name, healthy: entry.healthy }));
+}
+```
+- 输入：存储池对象数组 `[{ name: "tank", healthy: true, ... }, ...]`
+- 输出：`[{ id: "tank", name: "tank", healthy: true }, ...]`（只保留前端需要的 3 个字段）
+- 同样有 Array.isArray 兼容处理
 
 ##### TrueNAS 设计总结
 TrueNAS 是自定义 proxy 中**对通用层复用程度最高**的：
@@ -885,7 +960,7 @@ genericProxyHandler (继续)
   ↓ HTTP GET
 pages/api/services/proxy.js (入口 L29)
   ↓ 有 endpoint 且 handler 不是 calendar → 不进快速分支
-  ↓ widgets["truenas"].mappings["status"] → { endpoint: "system/info", wsMethod: "system.info", validate: ["loadavg"] }
+  ↓ widgets["truenas"].mappings["status"] → { endpoint: "system/info", wsMethod: "system.info", validate: ["loadavg", "uptime_seconds"] }
   ↓ mapping.method 未设置 → req.method = "GET"
   ↓ mapping.body 未设置 → 不改写
   ↓ req.query.endpoint = "system/info"（逻辑名 status → 真实 REST 路径 system/info）
@@ -902,14 +977,14 @@ truenasProxyHandler
   ↓ authenticate(ws, widget)
   │   ← sendMethod(ws, "auth.login_with_api_key", [key]) → true
   ↓ sendMethod(ws, "system.info") → { loadavg: [...], uptime_seconds: 12345, ... }
-  ↓ validateWidgetData(widget, "system/info", data) → 检查 loadavg 字段存在
+  ↓ validateWidgetData(widget, "system/info", data) → 检查 loadavg 和 uptime_seconds 字段存在
   ↓ validate 通过 → map 为 undefined → 不转换
   ↓ res.status(200).json(data)
   ↓
 前端 SWR 缓存 → 组件渲染
 ```
 
-### 示例 3：TrueNAS alerts 端点（v2 WebSocket 且有 validate + map）
+### 示例 3：TrueNAS alerts 端点（v2 WebSocket，无 validate + 有 map）
 
 ```
 ...（入口层处理同上）
@@ -920,8 +995,8 @@ truenasProxyHandler
 truenasProxyHandler
   ...（WebSocket 连接和鉴权同上）
   ↓ sendMethod(ws, "alert.list") → [{ dismissed: false, ... }, { dismissed: true, ... }, ...]
-  ↓ validateWidgetData(widget, "alert/list", data) → 此 mapping 无 validate 字段 → 直接通过
-  ↓ map(data) → { pending: 1 }（统计未 dismissed 的数量）
+  ↓ validateWidgetData(widget, "alert/list", data) → 此 mapping 无 validate 字段 → mapping?.validate?.forEach 空操作 → 直接通过
+  ↓ map(data) → { pending: 1 }（Array.isArray 分支：filter(item => item.dismissed === false).length）
   ↓ res.status(200).json({ pending: 1 })
 ```
 
@@ -938,7 +1013,7 @@ credentialedProxyHandler
   ↓ 因为无 key，自动加 Basic Auth 头（username + password）
   ↓ headers 三层合并 + application/json
   ↓ httpProxy(...) → 返回 [200, ...]
-  ↓ validateWidgetData → 检查 loadavg
+  ↓ validateWidgetData → 检查 loadavg 和 uptime_seconds
   ↓ validate 通过 → map（如果有）
   ↓ res.status(200).json(data)
 ```
