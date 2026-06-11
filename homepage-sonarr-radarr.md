@@ -1550,7 +1550,241 @@ if (group && service) {
 
 ---
 
-## 十三、相关文件索引
+## 十三、配置清洗中的 URL 移除与 baseUrl 传递：跳转链接的统一来源
+
+本节解决一个核心问题：配置清洗中**为什么只删 `url` 而保留 `baseUrl`**，以及日历事件中的跳转链接从哪来、如何拼接、缺失时如何防御。
+
+### 13.1 `url` 与 `baseUrl` 的语义区别
+
+两者虽然都含有 URL，但用途和安全性完全不同：
+
+| 字段 | 语义 | 用途 | 是否含敏感信息 | 所在层级 |
+|------|------|------|---------------|----------|
+| `url` | 服务的 **API 基地址** | 服务端代理向 Sonarr/Radarr 发起 HTTP 请求 | 是（通常含内网地址、端口、可能带 token） | Widget 顶层（`widget.url`） |
+| `baseUrl` | 服务的 **Web 界面地址** | 前端浏览器跳转到 Sonarr/Radarr 的网页 | 否（通常是公网可访问的域名） | integration 内部（`integration.baseUrl`） |
+
+```yaml
+# 完整配置示例
+- 媒体管理:
+    - Sonarr:
+        href: http://sonarr:8989          # 浏览器点击服务卡片跳转（前端可用）
+        widget:
+          url: http://sonarr:8989          # API 基地址（服务端代理用，敏感）
+          type: sonarr
+          key: YOUR_API_KEY                # API 密钥（服务端代理用，敏感）
+
+- 媒体中心:
+    - 日历面板:
+        widget:
+          type: calendar
+          integrations:
+            - type: sonarr
+              service_group: 媒体管理
+              service_name: Sonarr
+              baseUrl: https://sonarr.example.com  # Web 界面地址（前端跳转用，非敏感）
+```
+
+### 13.2 配置清洗中为何只移除 `url`
+
+#### 13.2.1 `url` 的删除机制
+
+[service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/utils/config/service-helpers.js#L629) L629：
+
+```javascript
+const { url, ...integrationWithoutUrl } = integration;
+return integrationWithoutUrl;
+```
+
+这段代码**只对 integration 中的 `url` 字段生效**，使用解构赋值 + rest 语法将 `url` 剥离。
+
+#### 13.2.2 Widget 顶层的 `url` 也被过滤
+
+Widget 顶层的 `url` 字段不在 [白名单解构](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/utils/config/service-helpers.js#L256-L439) L256-L439 中（`url`、`key` 等敏感字段都被排除），所以也不会传给前端。
+
+#### 13.2.3 `baseUrl` 不被删除的原因
+
+`baseUrl` 在配置清洗中**没有被删除**，这是有意为之：
+
+1. **`baseUrl` 不是敏感信息**：它只是 Sonarr/Radarr 的公网 Web 地址，不含 API Key 或内网信息
+2. **`baseUrl` 是前端专用的**：服务端代理从不使用 `baseUrl`，它仅用于浏览器端跳转链接
+3. **`baseUrl` 在 integration 内部**：integration 的字段除了 `url` 都保留，`baseUrl` 在解构 `{ url, ...rest }` 中落在 `rest` 里
+
+#### 13.2.4 字段过滤的完整对比
+
+| 字段 | 在哪一层 | 白名单过滤 | 二次处理 | 最终传给前端 |
+|------|----------|-----------|---------|-------------|
+| `widget.url` | Widget 顶层 | ❌ 不在白名单中 | — | 不传 |
+| `widget.key` | Widget 顶层 | ❌ 不在白名单中 | — | 不传 |
+| `integration.url` | integration 内部 | ✅ integrations 整体保留 | ❌ 被删除 | 不传 |
+| `integration.baseUrl` | integration 内部 | ✅ integrations 整体保留 | ✅ 保留 | 传递 |
+
+### 13.3 `baseUrl` 的完整传递链路
+
+从 YAML 配置到日历事件中的可点击链接，`baseUrl` 经过以下 4 个阶段：
+
+```
+YAML 配置          配置清洗            前端合并             事件 URL 拼接
+─────────     ──────────────     ──────────────     ──────────────────
+integration:   integration:       config:            event.url:
+  baseUrl:       baseUrl:           baseUrl:           "https://sonarr
+  "https://      "https://          "https://          .example.com
+  sonarr.        sonarr.            sonarr.            /series/
+  example.       example.           example.           breaking-bad"
+  com"           com"               com"
+       │                │                 │                   │
+       │  保留          │  合并时新增      │  拼接             │
+       ▼                ▼                 ▼                   ▼
+  只删 url         ...integration     config.baseUrl    baseUrl + path
+  保留 baseUrl     覆盖日历widget     + titleSlug       + titleSlug
+```
+
+#### 阶段一：YAML 配置
+
+```yaml
+integrations:
+  - type: sonarr
+    baseUrl: https://sonarr.example.com   # ← 用户显式配置
+```
+
+#### 阶段二：配置清洗
+
+[service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/utils/config/service-helpers.js#L625-L630) L625-L630：
+
+```javascript
+widget.integrations = integrations.map((integration) => {
+  const { url, ...integrationWithoutUrl } = integration;
+  return integrationWithoutUrl;
+  // baseUrl 在 integrationWithoutUrl 中，被保留
+});
+```
+
+传给前端的 integration 对象：
+```javascript
+{ type: "sonarr", service_group: "媒体管理", service_name: "Sonarr", baseUrl: "https://sonarr.example.com" }
+```
+
+#### 阶段三：前端合并
+
+[calendar/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/component.jsx#L83) L83：
+
+```javascript
+widget: { ...widget, ...integration }
+// 日历 widget 没有 baseUrl，integration 有 → 合并后 config.baseUrl = "https://sonarr.example.com"
+```
+
+#### 阶段四：事件 URL 拼接
+
+**Sonarr** ([sonarr.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/sonarr.jsx#L32) L32)：
+
+```javascript
+url: config?.baseUrl && event.series.titleSlug && `${config.baseUrl}/series/${event.series.titleSlug}`
+// "https://sonarr.example.com" + "/series/" + "breaking-bad"
+// → "https://sonarr.example.com/series/breaking-bad"
+```
+
+**Radarr** ([radarr.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/radarr.jsx#L25) L25)：
+
+```javascript
+const url = config?.baseUrl && event.titleSlug && `${config.baseUrl}/movie/${event.titleSlug}`;
+// "https://radarr.example.com" + "/movie/" + "inception"
+// → "https://radarr.example.com/movie/inception"
+```
+
+### 13.4 跳转链接的统一来源模型
+
+日历事件的跳转链接有三种来源，对应三种集成模式：
+
+#### 来源一：Sonarr/Radarr 的 `baseUrl` 拼接
+
+**适用**：服务引用模式（sonarr、radarr、lidarr、readarr）
+
+```
+链接 = baseUrl + 资源路径 + titleSlug
+```
+
+| 集成类型 | baseUrl 前缀 | 资源路径 | titleSlug 来源 | 完整链接示例 |
+|----------|-------------|---------|---------------|------------|
+| Sonarr | `config.baseUrl` | `/series/` | `event.series.titleSlug` | `https://sonarr.example/series/breaking-bad` |
+| Radarr | `config.baseUrl` | `/movie/` | `event.titleSlug` | `https://radarr.example/movie/inception` |
+
+**关键特点**：
+- `baseUrl` 是用户在 integration 中**显式配置**的，不是从服务配置中自动获取的
+- 如果不配置 `baseUrl`，日历事件**不可点击**
+- `titleSlug` 来自 Sonarr/Radarr API 返回的日历数据
+
+#### 来源二：iCal 事件的 `event.url`
+
+**适用**：直接 URL 模式（ical）
+
+[ical.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/ical.jsx#L143) L143：
+
+```javascript
+url: event.url    // 直接取 iCal 数据中的 URL 字段
+```
+
+**关键特点**：
+- 链接直接来自 iCal 数据源（如 Google Calendar 的事件链接）
+- 不需要任何前端配置
+- 如果 iCal 事件本身没有 URL，则为 `undefined`，事件不可点击
+
+#### 来源三：无链接
+
+**适用**：以上两种来源都缺失时
+
+- Sonarr/Radarr 未配置 `baseUrl` → `config.baseUrl` 为 `undefined` → 短路求值返回 falsy
+- Sonarr/Radarr 的 API 返回事件缺少 `titleSlug` → 短路求值返回 falsy
+- iCal 事件没有 `url` 属性 → `event.url` 为 `undefined`
+
+### 13.5 跳转链接的渲染逻辑
+
+[event.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/event.jsx#L39-L55) L39-L55：
+
+```javascript
+return event.url ? (
+  <a href={event.url} target="_blank" rel="noopener noreferrer">
+    {children}
+  </a>
+) : (
+  <div>
+    {children}
+  </div>
+);
+```
+
+| `event.url` 值 | 渲染结果 | 行为 |
+|----------------|---------|------|
+| `"https://sonarr.example/series/breaking-bad"` | `<a>` 标签 | 可点击，新窗口打开 |
+| `undefined` | `<div>` 标签 | 不可点击，纯文本展示 |
+| `""` (空字符串) | `<div>` 标签 | 不可点击（空字符串是 falsy） |
+| `false` (Sonarr 短路结果) | `<div>` 标签 | 不可点击 |
+
+### 13.6 `baseUrl` 为何不能从 `widget.url` 自动派生
+
+一个自然的疑问是：既然 `widget.url` 已经包含 Sonarr 的地址，为什么不自动把它作为 `baseUrl` 传给前端？
+
+**原因**：
+
+1. **安全隔离**：`widget.url` 可能是内网地址（如 `http://192.168.1.100:8989`），不应暴露给前端；而 `baseUrl` 是用户有意配置的公网地址（如 `https://sonarr.example.com`）
+
+2. **地址可能不同**：服务端代理使用的是内网地址（直接访问 Sonarr），而浏览器需要的可能是反向代理后的公网地址（经 CDN/认证）
+
+3. **协议和端口可能不同**：`widget.url` 可能是 `http://sonarr:8989`，而 `baseUrl` 是 `https://sonarr.example.com`（经反向代理加了 TLS）
+
+4. **设计原则**：每个字段只服务于一个明确的用途。`url` 用于服务端代理请求，`baseUrl` 用于前端浏览器跳转，职责分离
+
+### 13.7 跳转链接来源的完整对照
+
+| 集成模式 | 链接来源 | 前端配置 | 缺失时行为 |
+|----------|---------|---------|-----------|
+| **Sonarr** | `config.baseUrl + "/series/" + event.series.titleSlug` | integration 中的 `baseUrl` | 事件不可点击 |
+| **Radarr** | `config.baseUrl + "/movie/" + event.titleSlug` | integration 中的 `baseUrl` | 事件不可点击 |
+| **Lidarr** | `config.baseUrl + "/artist/" + event.artist.titleSlug` | integration 中的 `baseUrl` | 事件不可点击 |
+| **Readarr** | `config.baseUrl + "/author/" + event.author.titleSlug` | integration 中的 `baseUrl` | 事件不可点击 |
+| **iCal** | `event.url`（来自 iCal 数据本身） | 无需配置 | 事件不可点击 |
+
+---
+
+## 十四、相关文件索引
 
 | 文件路径 | 职责 |
 |----------|------|
@@ -1568,6 +1802,7 @@ if (group && service) {
 | [src/widgets/calendar/integrations/sonarr.test.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/sonarr.test.jsx) | Sonarr 日历集成测试 |
 | [src/widgets/calendar/integrations/radarr.test.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/radarr.test.jsx) | Radarr 日历集成测试 |
 | [src/widgets/calendar/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/component.jsx) | 日历主组件（集成加载 + 配置合并） |
+| [src/widgets/calendar/event.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/event.jsx) | 日历事件组件（根据 url 渲染为 &lt;a&gt; 或 &lt;div&gt;） |
 | [src/widgets/calendar/proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/proxy.js) | 日历专属代理处理器（iCal 模式 URL 直接请求） |
 | [docs/widgets/services/calendar.md](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/docs/widgets/services/calendar.md) | 日历 Widget 配置文档 |
 | [src/components/services/widget/container.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/components/services/widget/container.jsx) | Widget 容器（错误拦截 + 字段过滤 + 高亮） |
