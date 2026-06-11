@@ -300,10 +300,10 @@ Services 的合并逻辑集中在 `servicesResponse()` 函数 —— `src/utils/
 │     ...configGroups.map(g→g.name),                                 │
 │   ])                                                               │
 ├────────────────────────────────────────────────────────────────────┤
-│ Step 4: 注入 layout-only 组（仅 services.yaml 支持嵌套结构）       │
-│   mergeLayoutGroupsIntoConfigured()                                │
-│   settings.layout 中定义但 services.yaml 未定义的组                 │
-│   会被构造成空组插入 configuredServices                             │
+│ Step 4: 注入 layout-only 组与嵌套结构（services.yaml 或 layout 均可声明） │
+│   convertLayoutGroupToGroup() → mergeLayoutGroupsIntoConfigured()    │
+│   settings.layout 中定义但 services.yaml 未定义的组/嵌套子组          │
+│   会被构造成空组结构注入 configuredServices 树                        │
 ├────────────────────────────────────────────────────────────────────┤
 │ Step 5: ★ 按组名拼接三源服务数组（关键！不是覆盖）                  │
 │   对每个 groupName：                                                │
@@ -322,8 +322,8 @@ Services 的合并逻辑集中在 `servicesResponse()` 函数 —— `src/utils/
 │   如果 Docker 和 services.yaml 中都定义了同名 "Nginx"，             │
 │   结果是两个 "Nginx" 条目并存，由排序决定先后                       │
 │                                                                    │
-│   mergedGroup.groups 仅来自 configuredGroup.groups                 │
-│   （嵌套子组结构只能在 services.yaml 中声明）                       │
+│   mergedGroup.groups 来自 configuredGroup.groups                    │
+│   （配置树 = services.yaml 原生嵌套 + Step 4 layout 注入的嵌套）     │
 ├────────────────────────────────────────────────────────────────────┤
 │ Step 6: 组排序 + 嵌套子组归属处理                                  │
 │   - settings.layout 中出现的组按 key 定义顺序排列                   │
@@ -358,7 +358,7 @@ mergedGroupsNames.forEach((groupName) => {
     ]
       .filter((service) => service)          // 过滤空值
       .sort(compareServices),                // 排序（不是覆盖！）
-    groups: [...configuredGroup.groups],     // 嵌套结构仅来自 services.yaml
+    groups: [...configuredGroup.groups],     // 嵌套结构来自配置树（services.yaml + layout 注入）
   };
   // ...
 });
@@ -447,7 +447,7 @@ const definedLayouts = initialSettings.layout ? Object.keys(initialSettings.layo
 
 **`parent` 不是用户可配置的字段。** 它不出现在任何 YAML 文件、Docker 标签或 Kubernetes 注解中，也无法通过 `homepage.parent` 标签或 `gethomepage.dev/parent` 注解来设置。
 
-`parent` 唯一的赋值来源是 `findGroupByName()` 函数在深度遍历配置树时的动态标注行为：
+`parent` 唯一的赋值来源是 `findGroupByName()` 函数在深度遍历 **合并配置树**（= services.yaml 原生结构 + Step 4 layout 注入的嵌套结构）时的动态标注行为：
 
 ```js
 // src/utils/config/service-helpers.js 第 710-725 行
@@ -496,8 +496,9 @@ if (definedLayouts) {
 ```
 
 **判断逻辑**：
-- 对每个 `groupName`，通过 `findGroupByName(configuredServices, groupName)` 在 **services.yaml 解析出的配置树** 中查找
-- 若找到且返回对象带有 `.parent`，说明该组名在 services.yaml 中是某个父组的嵌套子组
+- 对每个 `groupName`，通过 `findGroupByName(configuredServices, groupName)` 在 **合并配置树** 中查找
+- **合并配置树** = services.yaml 原生结构 **+** Step 4 通过 `mergeLayoutGroupsIntoConfigured()` 注入的 layout 嵌套结构
+- 若找到且返回对象带有 `.parent`，说明该组名在合并配置树中是某个父组的嵌套子组（不论该结构源自 services.yaml 还是 layout）
 - 此时不将该组当作独立顶层组放入 `sortedGroups` / `unsortedGroups`，而是通过 `mergeSubgroups` 将其服务挂回父组
 
 #### 5.6.3 `mergeSubgroups()` —— 将拼接结果写回父组的嵌套位置
@@ -515,7 +516,7 @@ function mergeSubgroups(configuredGroups, mergedGroup) {
 }
 ```
 
-在 `configuredServices` 树中递归查找与 `mergedGroup` 同名的组，找到后用三源拼接+排序后的 services 替换。效果是：Docker/K8s 发现的同名组服务被注入到 services.yaml 已声明的嵌套位置。
+在 `configuredServices` 合并配置树中递归查找与 `mergedGroup` 同名的组，找到后用三源拼接+排序后的 services 替换。效果是：Docker/K8s 发现的同名组服务被注入到 services.yaml 或 settings.yaml layout 已声明的嵌套位置。
 
 #### 5.6.4 `ensureParentGroupExists()` —— 确保顶层父组进入排序结果
 
@@ -559,7 +560,7 @@ Docker/K8s 自动发现的服务本身 **只有 `group` 字段**（Docker 标签
             href: http://a
 ```
 
-此时 `configuredServices` 树中已存在 `Top.groups[0].name = "Child"` 的嵌套结构。当 Docker 发现了 `homepage.group=Child` 的服务时：
+此时 `configuredServices` 合并配置树中已存在 `Top.groups[0].name = "Child"` 的嵌套结构。当 Docker 发现了 `homepage.group=Child` 的服务时：
 1. `mergedGroupsNames` 包含 "Child"
 2. `findGroupByName(configuredServices, "Child")` 在递归遍历中找到它，并动态标注 `parent = "Top"`
 3. 进入 `configuredGroup.parent` 分支，`mergeSubgroups` 将三源拼接结果写回 `Top.groups[0].services`
@@ -574,7 +575,7 @@ layout:
     Child:
 ```
 
-此时 layout 先通过 `convertLayoutGroupToGroup()` 转换为空组结构，再通过 `mergeLayoutGroupsIntoConfigured()` 注入 `configuredServices` 树中，后续流程与路径 A 相同。
+此时 layout 先通过 `convertLayoutGroupToGroup()` 转换为空组结构，再通过 `mergeLayoutGroupsIntoConfigured()` 在 Step 4 注入 `configuredServices` 合并配置树中，后续流程与路径 A 相同。
 
 **如果既没有在 services.yaml 也没有在 layout 中声明嵌套结构**，那么即使 Docker/K8s 发现了 `group=Child` 的服务，"Child" 只会被当作一个 **普通顶层组** 处理，不会被挂入任何父组。
 
@@ -605,7 +606,7 @@ function mergeLayoutGroupsIntoConfigured(configuredGroups, layoutGroups) {
 }
 ```
 
-此函数在 `servicesResponse()` 的 Step 4 执行，将 layout 中声明的嵌套组结构注入到 `configuredServices` 树中。这使得即使 services.yaml 中没有声明某个子组，仅靠 layout 也可以建立起嵌套结构，为后续 Docker/K8s 服务的自动挂入提供"锚点"。
+此函数在 `servicesResponse()` 的 Step 4 执行，将 layout 中声明的嵌套组结构注入到 `configuredServices` 合并配置树中。这使得即使 services.yaml 中没有声明某个子组，仅靠 layout 也可以建立起嵌套结构，为后续 Docker/K8s 服务的自动挂入提供"锚点"。
 
 ---
 
@@ -736,7 +737,7 @@ Services Widgets 也有类似的白名单过滤（`src/utils/config/service-help
    `shvl.set()` 会拒绝 `__proto__`、`constructor`、`prototype` 路径，这是安全设计，不是 Bug。
 
 7. **`parent` 不是用户可配置字段**：
-   `parent` 属性是 `findGroupByName()` 在深度遍历 services.yaml 配置树时的 **内部临时标注**，仅用于标记"这个组在配置树中是某个父组的嵌套子组"。它不出现在任何 YAML 文件、Docker 标签（无 `homepage.parent`）或 Kubernetes 注解（无 `gethomepage.dev/parent`）中，每次运行时由代码动态计算。
+   `parent` 属性是 `findGroupByName()` 在深度遍历 **`configuredServices` 合并配置树**（= services.yaml 原生结构 + Step 4 layout 注入的嵌套结构）时的 **内部临时标注**，仅用于标记"这个组在配置树中是某个父组的嵌套子组"。它不出现在任何 YAML 文件、Docker 标签（无 `homepage.parent`）或 Kubernetes 注解（无 `gethomepage.dev/parent`）中，每次运行时由代码动态计算。
 
 8. **自动发现服务进入嵌套子组的前提条件**：
    Docker/K8s 自动发现的服务只有 `group` 字段（Docker: `homepage.group`，K8s: `gethomepage.dev/group`），该字段仅声明组名，无法表达嵌套层级。要使自动发现的服务进入嵌套子组，**必须** 在 services.yaml 或 settings.yaml layout 中预先声明该子组结构。否则，该组只会被当作普通顶层组处理。
