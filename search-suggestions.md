@@ -40,59 +40,70 @@ export const searchProviders = {
 
 ## 三、输入状态管理机制
 
-### 3.1 全局按键唤醒的精妙时序：字符如何"自动"进入输入框
+### 3.1 全局按键唤醒的隐含时序：首个字符如何进入输入框
 
-这是最容易被忽略的核心细节。整个链路无需手动传递字符，完全依靠浏览器事件的自然传播机制：
+这是一个**非显式实现**的隐式行为。代码中**没有任何地方**手动提取 `e.key` 并将其拼接到 `searchString` 中，完全依赖浏览器事件的默认传播与执行时序：
 
-**Step 1：全局监听捕获按键** [index.jsx#L253-L277](src/pages/index.jsx#L253-L277)
+**Step 1：全局监听捕获按键（仅唤醒，不获取字符）** [index.jsx#L253-L277](src/pages/index.jsx#L253-L277)
 ```javascript
 document.addEventListener("keydown", function handleKeyDown(e) {
   if (e.target.tagName === "BODY" || e.target.id === "inner_wrapper") {
     if (/* 匹配可输入字符、粘贴快捷键等 */) {
-      setSearching(true);  // 只做一件事：标记打开
-      // ⚠️  关键点：这里没有调用 e.preventDefault()！
+      setSearching(true);  // 仅做一件事：标记打开
+      // ❗ 注意：此处既没有调用 e.preventDefault()，也没有读取 e.key
     }
   }
 });
 ```
 
 **Step 2：React 状态更新触发重渲染**
-- `searching` 状态从 `false` → `true`，`Home` 组件重渲染
-- `QuickLaunch` 组件收到 `isOpen={true}` 的 prop
+- `searching` 状态从 `false` → `true`，`Home` 组件同步重渲染
+- `QuickLaunch` 组件收到新的 prop `isOpen={true}`
 
-**Step 3：QuickLaunch 打开时自动聚焦输入框** [quicklaunch.jsx#L223-L239](src/components/quicklaunch.jsx#L223-L239)
+**Step 3：QuickLaunch 打开 effect 中主动聚焦输入框** [quicklaunch.jsx#L223-L239](src/components/quicklaunch.jsx#L223-L239)
 ```javascript
 useEffect(() => {
   if (isOpen) {
-    searchField.current.focus();  // 输入框获得焦点
+    searchField.current.focus();  // 🔑 关键：浏览器默认行为执行之前，输入框已获得焦点
     setHidden(false);
   }
 }, [isOpen]);
 ```
 
-**Step 4：浏览器默认行为完成字符输入**
-- 因为全局监听中**没有** `preventDefault()`，`keydown` 事件继续执行浏览器默认行为
-- 此时输入框已获得焦点，浏览器会自动将按键字符插入到输入框中
-- 输入框的 `onChange` 触发 `handleSearchChange`，完成状态同步
+**Step 4：浏览器默认行为被动完成字符注入**
+- 因为没有调用 `preventDefault()`，浏览器继续执行 `keydown` 的原生默认行为
+- 原生默认行为的逻辑是：**「向当前获得焦点的可输入元素插入按键字符」**
+- 此时输入框正好获得了焦点，字符被自动插入
+- 输入框内容变化触发 `onChange` → `handleSearchChange` → `setSearchString(...)`
 
-**整个流程时序图**：
+**时序依赖图（隐含条件，代码未显式保证）**：
 ```
 用户按下 'h' 键
     │
     ▼
-keydown 事件触发
+keydown 事件同步分发
     │
-    ├─→ 全局 handleKeyDown(e)
-    │     └─ setSearching(true)  [无 preventDefault]
+    ├─→ ① 全局 handleKeyDown(e) 同步执行
+    │     └─ setSearching(true)   [仅标记，不 preventDefault]
     │
-    ├─→ React 微任务：更新 state → 重渲染 → useEffect
-    │     └─ searchField.current.focus()  ✓ 输入框获得焦点
+    ├─→ ② React 批处理微任务（依赖事件循环模型保证在默认行为之前）
+    │     ├─ state 更新：searching = true
+    │     ├─ 重渲染：<QuickLaunch isOpen={true} />
+    │     └─ useEffect 执行：searchField.current.focus()  ✓ 焦点已转移
     │
-    └─→ 浏览器默认行为：将 'h' 插入聚焦元素（即输入框）
-          └─→ input onChange → handleSearchChange → setSearchString("h")
+    └─→ ③ 浏览器默认行为（最后执行）
+          └─ 向当前焦点元素（输入框）插入 'h'
+              └─ onChange → handleSearchChange → setSearchString("h")
 ```
 
-> **设计要点**：依赖事件循环中「React 微任务更新」先于「浏览器默认行为」执行的特性，确保字符到达时输入框已经准备好。无需手动拼接字符，完全靠浏览器原生机制。
+> **隐含风险说明**：这套机制不是代码显式传递字符，而是利用「在同一个 keydown 事件中，React 微任务批处理先于浏览器默认行为执行」的时序特性。如果该特性在未来浏览器/React 版本中发生变化，或者 React 渲染卡顿导致 focus() 延迟，**第一个按键字符将丢失**——这是一个对运行时环境的隐式依赖。
+
+**全局键盘事件触发条件详解** [index.jsx#L253-L277](src/pages/index.jsx#L253-L277)：
+只有当焦点位于 `BODY` 或 `#inner_wrapper`（即用户没有聚焦任何输入框/按钮）时，全局监听才生效：
+- **普通字符**：`e.key.length === 1` 且匹配字母/空格/Unicode 字母范围（包括西欧重音、西里尔字母等），且**没有**按修饰键（Alt/Ctrl/Cmd/Shift）时 → 唤醒
+- **特殊重音与感叹号**：由于某些键盘布局输入 `à-ü` / `!` 需要按住 Shift 等修饰键，因此额外作为例外匹配 → 唤醒
+- **粘贴快捷键**：`e.key === "v"` 且 `Ctrl/Cmd` 按下 → 唤醒（支持用户直接粘贴，剪贴板内容由浏览器默认行为填入输入框）
+- **Escape 键**：反向操作——`setSearchString("")` 清空输入内容 + `setSearching(false)` 关闭模态框
 
 ### 3.2 Search Widget（独立搜索栏）
 
@@ -128,43 +139,103 @@ keydown 事件触发
 
 ```javascript
 function handleSearchChange(event) {
-  const rawSearchString = event.target.value;  // 浏览器自动填入的原始值
+  const rawSearchString = event.target.value;  // 浏览器填入的原始值（未处理）
   try {
-    if (!/.+[.:].+/g.test(rawSearchString)) throw new Error();  // URL 预检测
+    if (!/.+[.:].+/g.test(rawSearchString)) throw new Error();  // URL 预检测正则
     let urlString = rawSearchString;
     if (urlString.toLowerCase().indexOf("http") !== 0) urlString = `https://${rawSearchString}`;
-    setUrl(new URL(urlString));          // 验证通过，保存 URL 对象
-    setSearchString(rawSearchString);    // ✅ URL：保留原始大小写，不做转换
+    setUrl(new URL(urlString));          // ✅ 保存规范化后的 URL 对象（补了 https 前缀）
+    setSearchString(rawSearchString);    // ✅ searchString：保留用户输入的原始大小写
     return;
   } catch (e) {
-    setUrl(null);
+    setUrl(null);                        // ❌ 非 URL，清空 url 状态
   }
-  setSearchString(rawSearchString.toLowerCase());  // ✅ 普通查询：统一转为小写
+  setSearchString(rawSearchString.toLowerCase());  // ✅ 普通查询：searchString 被强制小写化
 }
 ```
 
 **两条路径的对比**：
 
-| 输入内容 | 路径 | searchString 存储值 | 说明 |
-|---------|------|-------------------|------|
-| `GitHub.com` | URL 路径 | `"GitHub.com"` | 保留原始大小写，便于后续 URL 访问 |
-| `GitHub` | 普通查询 | `"github"` | 转为小写，用于不区分大小写的本地过滤 |
-| `docs.example.com/guide` | URL 路径 | `"docs.example.com/guide"` | 路径部分也完整保留 |
-| `hello world` | 普通查询 | `"hello world"` | 含空格的查询也整体小写 |
+| 输入内容 | 路径 | searchString | `url` state | 说明 |
+|---------|------|--------------|-------------|------|
+| `GitHub.com` | URL 路径 | `"GitHub.com"`（原值） | `URL("https://GitHub.com")` | searchString 保留原值，用于显示 |
+| `GitHub` | 普通查询 | `"github"`（小写） | `null` | searchString 转为小写 |
+| `docs.example.com/Guide` | URL 路径 | `"docs.example.com/Guide"`（原值） | `URL("https://docs.example.com/Guide")` | 路径大小写完整保留 |
+| `hello world` | 普通查询 | `"hello world"`（小写） | `null` | 含空格的查询也整体小写 |
 
-**为什么要区分处理？**
-- **URL 保留原值**：URL 的路径部分可能区分大小写（如 GitHub Pages 的 `/Guide/` vs `/guide/`），小写化可能导致 404
-- **查询小写化**：本地服务/书签匹配使用 `includes()` 比较，统一小写后实现不区分大小写的搜索体验
+---
 
-**小写化的影响范围**：
-- 只影响 `searchString`（用于本地过滤匹配）
-- 发送到搜索引擎的查询在 `doSearch` 中重新 `encodeURIComponent(value)`，使用用户输入的原始值
-- 高亮匹配时通过 `'gi'` 正则标志 [quicklaunch.jsx#L242](src/components/quicklaunch.jsx#L242) 实现不区分大小写的视觉高亮
+### 3.5 URL 原值保留、`url` state、`hideVisitURL` 与 URL 直达候选的完整关系链
 
-**全局键盘唤醒补充**：在 [index.jsx#L253-L277](src/pages/index.jsx#L253-L277)，`document` 级别监听 `keydown`，当焦点在 `BODY` 或 `#inner_wrapper` 时：
-- 键入普通字符 → `setSearching(true)`，唤醒模态框
-- `Ctrl/Cmd + V` → 同样触发（支持粘贴内容直接搜索）
-- `Escape` → 关闭并清空
+这四个概念形成一条**逐层递进的依赖链**，在候选列表构造 `useEffect` 中交汇 [quicklaunch.jsx#L140-L220](src/components/quicklaunch.jsx#L140-L220)：
+
+```
+handleSearchChange（输入变化时）
+    │
+    ├─→「URL 路径」分支执行时
+    │     ├─ setSearchString(rawSearchString)     ← 用户可见的显示值（保留原始大小写）
+    │     └─ setUrl(new URL(urlString))           ← 规范化后的 URL 对象（已补 https）
+    │
+    └─→「普通查询」分支执行时
+          ├─ setSearchString(rawSearchString.toLowerCase())  ← 小写化用于搜索
+          └─ setUrl(null)                                     ← 明确清空 url state
+                                                        ↓
+                                              候选列表构造 useEffect
+                                                        │
+                    ┌───────────────────────────────────┼───────────────────────────────────┐
+                    ▼                                   ▼                                   ▼
+        ① searchString（小写后）             ② url state（URL 对象/null）          ③ hideVisitURL（设置开关）
+        用于：本地服务/书签过滤              决定："Visit URL" 候选是否可见         控制：即使 url 存在，用户是否想看到
+        用于：Web 搜索 href 编码 URL         提供：候选真正跳转的 href（toString）    可完全屏蔽 URL 直达候选
+        用于：建议接口 query 参数
+                    │                                   │                                   │
+                    │                                   └──────────────┬────────────────────┘
+                    │                                                  ▼
+                    │                                    if (!hideVisitURL && url) {
+                    │                                      newResults.unshift({
+                    │                                        href: url.toString(),   // 👈 用 url state，不用 searchString
+                    │                                        name: "Visit URL",       //    确保跳转的是带协议的有效 URL
+                    │                                        type: "url"
+                    │                                      });
+                    │                                    }
+                    │
+                    ▼
+            Web 搜索候选：href = searchProvider.url + encodeURIComponent(searchString)
+            建议请求 fetch：query = encodeURIComponent(searchString)
+```
+
+**关键交叉验证点**：
+
+1. **Web 搜索和建议请求**——[quicklaunch.jsx#L161](src/components/quicklaunch.jsx#L161) 与 [L168-L170](src/components/quicklaunch.jsx#L168-L170)：
+   ```javascript
+   // Web 搜索候选的 href 使用小写后的 searchString
+   href: searchProvider.url + encodeURIComponent(searchString)
+   
+   // 建议接口的 query 参数也使用小写后的 searchString
+   `/api/search/searchSuggestion?query=${encodeURIComponent(searchString)}&providerName=...`
+   ```
+   ⚠️ **重要**：之前的理解有误——**普通查询小写化后，Web 搜索和建议请求实际也发送小写值**，并非用户输入的原始值。两者共享同一个 `searchString` 变量，这在配置了区分大小写的自定义搜索引擎时需要注意。
+
+2. **URL 直达候选的 href 来源**——[quicklaunch.jsx#L201-L207](src/components/quicklaunch.jsx#L201-L207)：
+   ```javascript
+   if (!hideVisitURL && url) {              // 双条件判断：开关 && 有有效 URL
+     newResults.unshift({
+       href: url.toString(),                // 👈 用 url state.toString()
+       name: `${t("quicklaunch.visit")} URL`,
+       type: "url",
+     });
+   }
+   ```
+   为什么不直接用 `searchString`？因为 `searchString` 是用户输入的 `GitHub.com`（无协议），而 `url.toString()` 返回的是 `new URL("https://GitHub.com").toString()` = `"https://GitHub.com/"`（带协议、带规范化尾斜杠），才能直接作为 `window.open` 的有效 href。
+
+3. **hideVisitURL 的作用**：在 [quicklaunch.jsx#L22](src/components/quicklaunch.jsx#L22) 从 settings 中解构：
+   - `hideVisitURL = false`（默认）：正常显示 URL 直达候选
+   - `hideVisitURL = true`：即使 `url` state 存在（输入是合法 URL），也**不渲染**「Visit URL」候选项，用户只能走 Web 搜索或其他路径
+
+4. **为什么 URL 路径要保留原值？**
+   - **searchString 保留原值**：用于输入框显示，用户看到的就是自己输入的内容，不会出现"输入 `GitHub.com`，输入框突然变成 `github.com`"的认知不一致
+   - **url state 存规范化对象**：用于实际跳转，保证一定带有 `https://` 协议，才能被浏览器正确打开
+   - 两者各司其职，互不干扰
 
 ---
 
@@ -394,5 +465,6 @@ const parts = text.split(new RegExp(`(${searchString})`, "gi"));
 2. **currentSuggestion 闭包变量**：Search Widget 中用非 state 变量追踪选中项，在 React 严格模式或并发渲染下可能出现不一致
 3. **重复请求保护**：前端通过 `query !== searchSuggestions[0]` 判断避免重复请求，这依赖后端返回的第一个元素（原始 query）完全一致
 4. **关闭延迟**：QuickLaunch 关闭时使用 `setTimeout(200ms)` + `setTimeout(300ms)` 两段延迟，需在测试中通过 `act + setTimeout` 等待
-5. **全局唤醒字符丢失风险**：唤醒的第一个按键依赖浏览器时序，如果 React 渲染卡顿导致 `focus()` 晚于浏览器默认行为执行，该字符可能丢失
+5. **全局首个字符丢失风险**：详见 3.1 节。唤醒的第一个按键不经过代码显式传递，完全依赖浏览器/React 事件微任务时序，渲染卡顿可能导致字符丢失
 6. **URL 检测正则的局限性**：`/.+[.:].+/` 会将 `ip:port`、`a.b` 等误认为 URL，在 catch 块才被纠正，有微小的性能开销
+7. **普通查询小写化会透传到搜索引擎**：QuickLaunch 中用户输入 `GitHub`，searchString 被转换为 `github`，后续 Web 搜索候选的 href 和建议接口的 query 参数**都会使用小写值**，自定义搜索引擎若区分大小写需留意
