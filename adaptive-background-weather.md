@@ -1689,4 +1689,339 @@ https://api.open-meteo.com/v1/forecast?latitude=39.9&longitude=116.4&daily=sunri
 - 客户端缓存键包含 `label`、`format` 等展示参数，导致相同天气数据被多份缓存
 - `apiKey` 出现在服务端缓存键中，如果不同用户使用不同的 key（如多租户场景），即使查询同一地点也无法共享缓存
 - `getPrivateWidgetOptions()` 每次请求都重新读取文件，可能成为高并发下的瓶颈
+---
+
+## 十、地区覆盖、密钥回查与 provider fallback 深度追踪
+
+### 10.1 静态地区覆盖定位结果的 options 合并细节
+
+三个天气组件在外层容器的最后一行都是：
+
+```javascript
+return <Widget options={{ ...location, ...options }} />;
+```
+
+这段看似简单的对象展开，实际决定了**谁覆盖谁**的最终结果。
+
+#### 10.1.1 对象展开的优先级
+
+JavaScript 对象展开 `{ ...a, ...b }` 的规则是：**后展开的对象会覆盖先展开的对象中同名属性**。
+
+```javascript
+const location = { latitude: 40.0, longitude: 116.5 };  // 浏览器定位结果
+const options  = { latitude: 39.9, longitude: 116.4, label: "Beijing", cache: 5 };  // YAML 配置
+
+const merged = { ...location, ...options };
+// 结果: { latitude: 39.9, longitude: 116.4, label: "Beijing", cache: 5 }
+//              ↑ 来自 options，覆盖了 location 中的值
+```
+
+所以 `{ ...location, ...options }` 的实际含义是：
+- **location 提供默认值**（浏览器定位结果）
+- **options 提供覆盖值**（YAML 静态配置）
+
+#### 10.1.2 三种场景的最终结果
+
+**场景 A：widgets.yaml 中配置了 latitude/longitude**
+
+```
+location = { latitude: 39.9, longitude: 116.4 }   ← 由第63行从 options 同步设置
+options  = { latitude: 39.9, longitude: 116.4, label: "Beijing", cache: 5, index: 0 }
+merged   = { ...location, ...options }
+         = { latitude: 39.9, longitude: 116.4, label: "Beijing", cache: 5, index: 0 }
+```
+
+> 虽然 location 和 options 中的经纬度相同（因为第 63-65 行的同步逻辑就是从 options 中取出来再塞回去），但 options 中的值仍然会覆盖 location 中的值——只是恰好值相同，实际效果没区别。
+
+**场景 B：无静态配置，浏览器定位成功**
+
+```
+location = { latitude: 40.001, longitude: 116.502 }   ← 由 requestLocation() 回调设置
+options  = { label: "Current Location", cache: 5, index: 0 }  ← 没有 latitude/longitude
+merged   = { ...location, ...options }
+         = { latitude: 40.001, longitude: 116.502, label: "Current Location", cache: 5, index: 0 }
+```
+
+> options 中没有 `latitude`/`longitude`，所以 location 提供这两个字段，options 补充其他字段。
+
+**场景 C：无静态配置，定位失败或未授权**
+
+```
+location = false   ← 始终未被 setLocation() 更新
+→ 走 if (!location) 分支，渲染 ContainerButton（授权按钮），不会渲染内部 Widget
+→ options 合并逻辑不会执行
+```
+
+#### 10.1.3 第 63 行同步设置与 options 合并的关系
+
+外层组件的第 63-65 行：
+
+```javascript
+if (!location && options.latitude && options.longitude) {
+  setLocation({ latitude: options.latitude, longitude: options.longitude });
+}
+```
+
+这段代码的作用是**把 options 中的经纬度复制一份到 location state**，但注意：
+- 它只是为了满足后续 `if (!location)` 的判断条件，让组件走到 `return <Widget ... />` 分支
+- 真正传给内部 Widget 的经纬度，**仍然来自 options**（因为 `...options` 在后）
+- 即使删掉这两行同步逻辑，只改判断条件为 `if (!location && !options.latitude)`，最终传给 Widget 的数据也完全一样
+
+> 换句话说，location state 的真正作用是**控制 UI 分支（显示授权按钮 vs 显示天气）**，而不是**提供经纬度数据源**。经纬度的实际来源永远是 options（静态配置或浏览器定位都先写入 location，再被 options 覆盖——静态配置场景下 options 里本来就有；动态定位场景下 options 里没有，location 里的值保留）。
+
+#### 10.1.4 options 合并的完整字段流向
+
+以 OpenMeteo 为例的完整字段来源追踪：
+
+```
+                        options（来自 widgets.yaml，已清洗）
+┌──────────────────────────────────────────────────────────────────┐
+│  latitude: 39.9           ← 可选，静态配置                          │
+│  longitude: 116.4         ← 可选，静态配置                          │
+│  units: metric            ← 默认或配置                              │
+│  cache: 5                 ← 默认或配置                              │
+│  timezone: Asia/Shanghai  ← 仅 OpenMeteo，可选                      │
+│  label: Beijing           ← 可选                                    │
+│  format: {...}            ← 可选                                    │
+│  index: 0                 ← 始终有，YAML 数组位置                    │
+└──────────────────────────────────────────────────────────────────┘
+                                    │
+    ┌───────────────────────────────┤
+    │ 有 latitude/longitude？       │ 无 latitude/longitude？
+    ▼                               ▼
+location = {                     location = {
+  latitude: options.latitude       latitude: 浏览器定位结果
+  longitude: options.longitude     longitude: 浏览器定位结果
+}                                }
+    │                               │
+    └───────────────┬───────────────┘
+                    ▼
+       merged = { ...location, ...options }
+                    │
+     ┌──────────────┴──────────────┐
+     ▼                             ▼
+  静态配置场景：                   动态定位场景：
+  latitude 来自 options          latitude 来自 location
+  longitude 来自 options         longitude 来自 location
+  其他字段来自 options            其他字段来自 options
+```
+
+### 10.2 私有密钥索引回查为空时的异常分支
+
+#### 10.2.1 `getPrivateWidgetOptions` 可能返回 undefined
+
+看回查函数的返回值 — [widget-helpers.js#L76-L78](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/utils/config/widget-helpers.js#L76-L78)
+
+```javascript
+return type !== undefined && widgetIndex !== undefined
+  ? privateOptions.find((o) => 
+      o.type === type && o.options.index === parseInt(widgetIndex, 10)
+    )?.options   // ← 注意这里的可选链 ?.
+  : privateOptions;
+```
+
+`Array.find()` 在找不到匹配项时返回 `undefined`，然后通过可选链 `?.options` 整个表达式也返回 `undefined`。
+
+**会触发 undefined 的情况**：
+- `index` 参数传了一个不存在的数字（如 widgets.yaml 只有 2 个 widget，但 index=5）
+- `type` 和 `index` 不匹配（如 index=0 对应的是 search 组件，但传了 `type="weatherapi"`）
+- `index` 参数为空字符串或格式错误，`parseInt(widgetIndex, 10)` 返回 `NaN`，与任何 `options.index` 都不相等；如果 `index` 参数完全缺失，则函数返回整个私有选项数组，handler 解构数组时 `apiKey` 仍是 `undefined`，会继续进入后续 400 分支
+
+#### 10.2.2 解构 undefined 抛出 TypeError
+
+回到 API handler — [weather.js#L7-L8](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/pages/api/widgets/weather.js#L7-L8)
+
+```javascript
+const privateWidgetOptions = await getPrivateWidgetOptions("weatherapi", index);
+let { apiKey } = privateWidgetOptions;   // ← 如果 privateWidgetOptions 是 undefined？
+```
+
+**解构 undefined 会直接抛出异常**：
+```
+TypeError: Cannot destructure property 'apiKey' of 'privateWidgetOptions' as it is undefined.
+```
+
+这个异常**没有被 try/catch 包裹**，所以：
+- Next.js 会捕获它并返回 HTTP 500
+- 不会进入 handler 内部后续的 400 错误分支
+- 前端看到的是 `data.error` 或 SWR 的 `error`，但错误信息是服务端 500 而非友好的 400
+
+#### 10.2.3 异常分支的实际路径对比
+
+**预期路径（测试覆盖的路径）**：
+```
+getPrivateWidgetOptions() → 返回 {}
+  → let { apiKey } = {} → apiKey = undefined
+  → 进入 if (!apiKey && !provider) 分支
+  → 返回 400 "Missing API key or provider"
+```
+
+**实际可能路径（未被测试覆盖）**：
+```
+getPrivateWidgetOptions() → 返回 undefined
+  → let { apiKey } = undefined
+  → 抛出 TypeError: Cannot destructure property 'apiKey'...
+  → Next.js 返回 500 Internal Server Error
+  → 永远不会执行后续的 if 判断
+```
+
+> 测试中所有 mock 都是 `getPrivateWidgetOptions.mockResolvedValueOnce({})`（返回空对象），从不返回 `undefined`，因此这个边界 bug 未被测试发现。
+
+#### 10.2.4 错误路径全景图
+
+```
+API handler 开始执行
+        │
+        ▼
+getPrivateWidgetOptions(type, index)
+        │
+        ├─ 找到匹配 widget → 返回 { apiKey, url, ... }（或空对象 {}）
+        │        │
+        │        ▼
+        │   解构 apiKey → 正常进入后续判断
+        │
+        └─ 找不到匹配 widget → 返回 undefined
+                 │
+                 ▼
+         let { apiKey } = undefined
+                 │
+                 ▼
+         抛出 TypeError（未捕获）
+                 │
+                 ▼
+         Next.js 返回 HTTP 500
+         （跳过所有 400 分支）
+```
+
+### 10.3 provider fallback 的真实错误路径
+
+#### 10.3.1 provider 参数的双重角色
+
+`provider` 参数在 handler 中实际上扮演了两个角色：
+
+| 角色 | 用途 | 代码位置 |
+|------|------|---------|
+| **开关** | 是否允许进入 fallback 分支的门控 | 第14行 `if (!apiKey && provider !== "weatherapi")` |
+| **白名单** | 必须等于 endpoint 对应的 provider 名称 | 第14行的字符串比较 |
+
+> 注意：`provider` 的作用**不是选择 provider**，因为每个 endpoint 只处理一种 provider（如 `/api/widgets/weather` 只处理 weatherapi）。它的作用是**授权从 settings.yaml 全局配置中取密钥**。
+
+#### 10.3.2 完整决策树（含 TypeError 分支）
+
+```
+privateWidgetOptions = getPrivateWidgetOptions(...)
+        │
+        ├─ undefined → TypeError → 500（终止）
+        │
+        └─ 对象（含或不含 apiKey）
+                │
+                ▼
+        apiKey = privateWidgetOptions.apiKey
+                │
+                ├─ 有值 → 直接使用，跳过所有 provider 校验
+                │        → 构造 URL → cachedRequest → 正常返回
+                │
+                └─ 无值（undefined）
+                        │
+                        ▼
+                !apiKey && !provider ?
+                        │
+                        ├─ true（无 provider 参数）
+                        │      → 400 "Missing API key or provider"（错误信息 A）
+                        │
+                        └─ false（有 provider 参数）
+                                │
+                                ▼
+                        provider !== "weatherapi" ?
+                                │
+                                ├─ true（provider 是其他值）
+                                │      → 400 "Invalid provider for endpoint"（错误信息 B）
+                                │
+                                └─ false（provider === "weatherapi"）
+                                        │
+                                        ▼
+                                settings.providers.weatherapi 有值？
+                                        │
+                                        ├─ 有值 → 使用 → 构造 URL → cachedRequest
+                                        │
+                                        └─ 无值 → 400 "Missing API key"（错误信息 C）
+```
+
+#### 10.3.3 三种错误信息的触发条件
+
+| 错误信息 | HTTP 状态 | 触发条件 | 代码行 |
+|---------|----------|---------|-------|
+| `"Missing API key or provider"` | 400 | widget 内联无 key + **前端没传 provider 参数** | [weather.js#L10-L12](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/pages/api/widgets/weather.js#L10-L12) |
+| `"Invalid provider for endpoint"` | 400 | widget 内联无 key + **前端传了错误的 provider 值**（如 "nope"） | [weather.js#L14-L16](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/pages/api/widgets/weather.js#L14-L16) |
+| `"Missing API key"` | 400 | widget 内联无 key + **provider 正确** + **settings.yaml 中也没配置** | [weather.js#L23-L25](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/pages/api/widgets/weather.js#L23-L25) |
+
+#### 10.3.4 隐含前提：provider 参数如何到达后端
+
+前端组件的 SWR 请求是：
+```javascript
+useSWR(`/api/widgets/weather?${new URLSearchParams({ lang: i18n.language, ...options }).toString()}`);
+```
+
+`options` 来自清洗后的 widgets 配置。由于 `provider` 不是敏感字段（不在清洗列表 `["username", "password", "key", "apiKey"]` 中），所以：
+- 如果用户在 widgets.yaml 中写了 `provider: weatherapi`，它会被原样带到后端
+- 如果没写，就不会出现在查询参数中
+
+#### 10.3.5 一个容易混淆的反直觉行为
+
+假设 widgets.yaml 配置：
+```yaml
+- weatherapi:
+    latitude: 39.9
+    longitude: 116.4
+    provider: openweathermap    # ← 故意写错，应该是 weatherapi
+    # 没有 apiKey
+```
+
+且 settings.yaml 中有：
+```yaml
+providers:
+  weatherapi: REAL_KEY
+```
+
+**执行结果**：返回 400 `"Invalid provider for endpoint"`，即使 settings.yaml 中有正确的密钥。
+
+为什么？因为 `provider !== "weatherapi"` 的判断先于 fallback 取值。provider 的值是 **widgets.yaml 中配置的字符串**，必须和 endpoint 期望的字符串**完全匹配**，否则即使全局配置中有密钥也无法使用。
+
+这意味着 `provider` 参数的设计是：
+- 它不是让用户"选择使用哪个全局密钥"
+- 而是让用户"明确确认使用当前 endpoint 对应的全局密钥"
+- 任何拼写错误或类型不匹配都会直接拒绝
+
+### 10.4 修复建议
+
+针对上述三个问题，代码可以做如下改进：
+
+#### 10.4.1 修复私有密钥回查为空时的崩溃
+
+```javascript
+// weather.js
+const privateWidgetOptions = (await getPrivateWidgetOptions("weatherapi", index)) ?? {};
+let { apiKey } = privateWidgetOptions;
+```
+
+使用 `?? {}` 确保即使回查返回 undefined 也能解构出 `undefined` 的 apiKey，进入正常的 400 分支而非抛出 500。
+
+#### 10.4.2 修复 options 合并的反模式
+
+当前第 63-65 行在渲染函数中同步 setState，可以改为：
+
+```javascript
+// 用 useMemo 计算初始 location，避免渲染期间 setState
+const initialLocation = options.latitude && options.longitude
+  ? { latitude: options.latitude, longitude: options.longitude }
+  : false;
+const [location, setLocation] = useState(initialLocation);
+```
+
+这样首次渲染时 location 就有值，不会先渲染授权按钮再闪切到天气数据。
+
+#### 10.4.3 明确 provider 的设计意图
+
+在文档或代码注释中说明：`provider` 参数不是"选择 provider 类型"，而是"授权使用全局 provider 密钥"的开关，且必须与当前 endpoint 名称完全一致。
+
 
