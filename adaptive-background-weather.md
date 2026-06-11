@@ -1584,52 +1584,86 @@ useEffect 执行
 
 #### 9.4.1 客户端 SWR 缓存键
 
-SWR 的缓存键就是请求的完整 URL，由 `useSWR(url)` 中的 `url` 决定。
+SWR 的缓存键就是请求的完整 URL，由 `useSWR(url)` 中的 `url` 决定。URL 通过 `new URLSearchParams({ lang: i18n.language, ...options }).toString()` 构造。
 
-**WeatherAPI 客户端缓存键示例**：
+##### URLSearchParams 对对象值的序列化规则
+
+**关键发现**：`URLSearchParams` 不会递归展开嵌套对象，而是对每个值直接调用 `String(value)`（本质是 `.toString()`）。
+
+| 值类型 | 传入 URLSearchParams 的值 | 序列化结果 |
+|-------|------------------------|-----------|
+| 普通对象 | `{ maximumFractionDigits: 1 }` | `%5Bobject+Object%5D` → 即 `[object Object]` |
+| 数组 | `[1, 2, 3]` | `1%2C2%2C3` → 即 `1,2,3`（逗号连接） |
+| null | `null` | `null`（字面字符串） |
+| undefined | `undefined` | `undefined`（字面字符串） |
+
+因此 `format`、`style` 等对象参数会被序列化为字符串 `[object Object]`，**丢失所有内部字段信息**。
+
+##### 真实的客户端缓存键示例
+
+**WeatherAPI 真实缓存键**：
 ```
-/api/widgets/weather?lang=zh-Hans&latitude=39.9&longitude=116.4&units=metric&cache=5&provider=weatherapi&index=0&label=Beijing&format[maximumFractionDigits]=1
+/api/widgets/weather?lang=zh-Hans&index=0&latitude=39.9042&longitude=116.4074&units=metric&cache=5&label=Beijing&format=%5Bobject+Object%5D&style=%5Bobject+Object%5D&provider=weatherapi
 ```
 
-**OpenMeteo 客户端缓存键示例**：
+**OpenMeteo 真实缓存键**：
 ```
-/api/widgets/openmeteo?latitude=39.9&longitude=116.4&units=metric&cache=5&timezone=Asia%2FShanghai&index=0&label=Beijing&format[maximumFractionDigits]=1
+/api/widgets/openmeteo?index=0&latitude=39.9042&longitude=116.4074&units=metric&cache=5&timezone=Asia%2FShanghai&label=Beijing&format=%5Bobject+Object%5D&style=%5Bobject+Object%5D
 ```
 
-**影响客户端缓存键的参数**：
+注意：
+- `format=%5Bobject+Object%5D` 即 `format=[object Object]`（URL 编码）
+- `style=%5Bobject+Object%5D` 即 `style=[object Object]`
+- `format` 无论内部是 `{ maximumFractionDigits: 1 }` 还是 `{ minimumFractionDigits: 2 }`，序列化结果完全相同
+- `style` 由 [widget.jsx#L26](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/components/widgets/widget.jsx#L26) 注入，结构为 `{ header, isRightAligned, cardBlur }`，同样被序列化为 `[object Object]`
 
-| 参数 | WeatherAPI | OpenWeatherMap | OpenMeteo | 说明 |
-|------|-----------|----------------|-----------|------|
-| `latitude` | ✅ | ✅ | ✅ | 纬度 |
-| `longitude` | ✅ | ✅ | ✅ | 经度 |
-| `lang` | ✅ | ✅ | ❌ | 语言（OpenMeteo 不传） |
-| `units` | ✅ | ✅ | ✅ | 单位 |
-| `cache` | ✅ | ✅ | ✅ | 缓存 TTL（仅传参，不影响键的语义） |
-| `provider` | ✅ | ✅ | ❌ | provider 标识 |
-| `index` | ✅ | ✅ | ✅ | widget 索引 |
-| `label` | ✅ | ✅ | ✅ | 显示标签（纯展示，但在 URL 中） |
-| `format` | ✅ | ✅ | ✅ | 数字格式配置 |
-| `timezone` | ❌ | ❌ | ✅ | 时区（仅 OpenMeteo） |
+##### 影响客户端缓存键的完整参数列表
 
-> 注意：`label`、`format`、`cache` 这些不影响 API 响应内容的参数也会出现在缓存键中，意味着**不同显示配置会产生不同的缓存条目**，即使返回的天气数据完全一样。
+| 参数 | WeatherAPI | OpenWeatherMap | OpenMeteo | 序列化形态 | 说明 |
+|------|-----------|----------------|-----------|-----------|------|
+| `latitude` | ✅ | ✅ | ✅ | 原值字符串 | 纬度 |
+| `longitude` | ✅ | ✅ | ✅ | 原值字符串 | 经度 |
+| `lang` | ✅ | ✅ | ❌ | 原值字符串 | 语言（OpenMeteo 不传） |
+| `units` | ✅ | ✅ | ✅ | 原值字符串 | 单位 |
+| `cache` | ✅ | ✅ | ✅ | 原值字符串 | 缓存 TTL（仅传参，不影响键的语义） |
+| `provider` | ✅ | ✅ | ❌ | 原值字符串 | provider 标识 |
+| `index` | ✅ | ✅ | ✅ | 原值字符串 | widget 索引 |
+| `label` | ✅ | ✅ | ✅ | 原值字符串 | 显示标签（纯展示） |
+| `format` | ✅ | ✅ | ✅ | `"[object Object]"` | **数字格式对象，被序列化为固定字符串** |
+| `style` | ✅ | ✅ | ✅ | `"[object Object]"` | **Widget 注入的样式对象，固定字符串** |
+| `timezone` | ❌ | ❌ | ✅ | 原值字符串 | 时区（仅 OpenMeteo） |
+
+##### `format` 和 `style` 对缓存键的实际影响
+
+由于 `format` 和 `style` 都被序列化为固定字符串 `[object Object]`，它们对缓存键的影响非常特殊：
+
+1. **相同结构不同值**：`format: { maximumFractionDigits: 0 }` 和 `format: { maximumFractionDigits: 2 }` → **缓存键完全相同**（都是 `format=[object Object]`）。这意味着不同数字格式配置会**共享同一条缓存**，不会产生缓存碎片——这是好事，但原因是错误的（信息丢失了而不是正确处理了）。
+
+2. **不同结构**：`format: { maximumFractionDigits: 1 }` 和 `format: { style: "unit" }` → **缓存键仍然完全相同**，因为任何对象 `.toString()` 都是 `[object Object]`。
+
+3. **后端收到的值**：`req.query.format` 是字符串 `"[object Object]"`，后端 handler 实际上**无法使用这个参数**。但天气 API handler 从不读取 `format` 和 `style`，所以这些参数只污染 URL，不影响后端逻辑。
+
+> **修正前的认知**：`format` 会展开为 `format[maximumFractionDigits]=1`（PHP/Rails 风格方括号语法）。**真实情况**：URLSearchParams 不会递归展开嵌套对象，直接序列化为 `format=[object Object]`。
+
+> **补充遗漏**：之前遗漏了 `style` 参数。它由 Widget 映射器 [widget.jsx#L26](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/components/widgets/widget.jsx#L26) 注入，同样被序列化为 `[object Object]`，进入缓存键。
 
 #### 9.4.2 服务端 cachedRequest 缓存键
 
-服务端缓存键是**第三方 API 的完整 URL**，由 API handler 构造。
+服务端缓存键是**第三方 API 的完整 URL**，由 API handler 构造。handler 只从 `req.query` 中读取实际需要的字段（`latitude`、`longitude`、`units`、`lang`、`cache`、`timezone`、`provider`、`index`），完全忽略 `format`、`style`、`label` 等展示参数。
 
 **WeatherAPI 服务端缓存键**：
 ```
-http://api.weatherapi.com/v1/current.json?q=39.9,116.4&key=from-widget&lang=zh
+http://api.weatherapi.com/v1/current.json?q=39.9042,116.4074&key=from-widget&lang=zh
 ```
 
 **OpenWeatherMap 服务端缓存键**：
 ```
-https://api.openweathermap.org/data/2.5/weather?lat=39.9&lon=116.4&appid=from-widget&units=metric&lang=zh
+https://api.openweathermap.org/data/2.5/weather?lat=39.9042&lon=116.4074&appid=from-widget&units=metric&lang=zh
 ```
 
 **OpenMeteo 服务端缓存键**：
 ```
-https://api.open-meteo.com/v1/forecast?latitude=39.9&longitude=116.4&daily=sunrise,sunset&current_weather=true&temperature_unit=celsius&timezone=Asia/Shanghai
+https://api.open-meteo.com/v1/forecast?latitude=39.9042&longitude=116.4074&daily=sunrise,sunset&current_weather=true&temperature_unit=celsius&timezone=Asia/Shanghai
 ```
 
 #### 9.4.3 两层缓存键的差异对比
@@ -1637,15 +1671,18 @@ https://api.open-meteo.com/v1/forecast?latitude=39.9&longitude=116.4&daily=sunri
 | 维度 | 客户端 SWR 缓存键 | 服务端 cachedRequest 缓存键 |
 |------|------------------|---------------------------|
 | **缓存位置** | 浏览器内存 | 服务器内存（memory-cache） |
-| **键构成** | 内部 API URL + 所有 options 参数 | 第三方 API 完整 URL |
+| **键构成** | 内部 API URL + 所有 options 参数展开（含 style） | 第三方 API 完整 URL |
+| **构造方式** | `URLSearchParams({ lang, ...options })` | 字符串模板拼接，只取需要的字段 |
+| **嵌套对象序列化** | `{ foo: 1 }` → `%5Bobject+Object%5D`（丢失信息） | 不包含任何对象参数 |
 | **包含密钥** | ❌ 不含 | ✅ **包含**（apiKey/appid 在 URL 中） |
 | **包含 index** | ✅ 包含 | ❌ 不包含 |
-| **包含 label** | ✅ 包含 | ❌ 不包含 |
-| **包含 format** | ✅ 包含 | ❌ 不包含 |
+| **包含 label** | ✅ 包含（原文） | ❌ 不包含 |
+| **包含 format** | ✅ 包含（序列化为 `"[object Object]"`） | ❌ 不包含 |
+| **包含 style** | ✅ 包含（序列化为 `"[object Object]"`，由 Widget 注入） | ❌ 不包含 |
 | **包含 cache** | ✅ 包含（作为参数值） | ❌ 不包含（只影响 TTL） |
-| **包含 provider** | ✅ 包含 | ❌ 不包含 |
+| **包含 provider** | ✅ 包含（如果配置了） | ❌ 不包含 |
 | **缓存失效** | 页面刷新、组件卸载 | 内存缓存过期（TTL）、服务重启 |
-| **缓存粒度** | 更细（每个显示配置一份） | 更粗（相同 API 参数共享） |
+| **缓存粒度** | 理论上更细，但对象参数被压扁后粒度粗于预期 | 更粗（相同 API 参数共享） |
 
 #### 9.4.4 缓存穿透与重复请求
 
@@ -1656,21 +1693,24 @@ https://api.open-meteo.com/v1/forecast?latitude=39.9&longitude=116.4&daily=sunri
         │
         ▼
   SWR 触发 revalidate
-   （检查客户端缓存）
+   （检查客户端缓存，缓存键 = 完整 URL，含 format=[object Object]、style=[object Object]）
         │
         ├─ 命中且新鲜 → 直接返回（不发请求）
         │
         └─ 不命中 / 需 revalidate → 发起 fetch 请求
                   │
                   ▼
-           /api/widgets/openmeteo?...
+           /api/widgets/openmeteo?index=0&latitude=...&format=%5Bobject+Object%5D&style=%5Bobject+Object%5D
                   │
                   ▼
            后端 API handler
                   │
+                  ├─ 从 req.query 读取 latitude、longitude、units、cache、timezone 等
+                  ├─ 完全忽略 format、style、label（虽然 req.query 里有字符串 "[object Object]"）
+                  │
                   ▼
            cachedRequest(apiUrl, cache)
-            （检查服务端缓存）
+            （检查服务端缓存，缓存键 = 第三方 API URL，不含任何展示参数）
                   │
                   ├─ 命中 → 直接返回（不请求第三方）
                   │
@@ -1686,9 +1726,10 @@ https://api.open-meteo.com/v1/forecast?latitude=39.9&longitude=116.4&daily=sunri
 - 两层缓存的 TTL 独立：SWR 由 `refreshInterval`（未设置则永不主动过期，只在 revalidate 时更新），服务端由 `cache` 参数控制
 
 **潜在问题**：
-- 客户端缓存键包含 `label`、`format` 等展示参数，导致相同天气数据被多份缓存
+- `format` 和 `style` 被序列化为无意义的 `[object Object]` 字符串，不仅没有实际区分度，还污染了 URL。如果未来需要根据不同 format 值区分缓存，当前实现无法支持
 - `apiKey` 出现在服务端缓存键中，如果不同用户使用不同的 key（如多租户场景），即使查询同一地点也无法共享缓存
 - `getPrivateWidgetOptions()` 每次请求都重新读取文件，可能成为高并发下的瓶颈
+- `label` 是纯展示参数，影响缓存键但不影响 API 响应内容，可能产生不必要的缓存碎片（不同 label 值会导致多条缓存，尽管内容完全相同）
 ---
 
 ## 十、地区覆盖、密钥回查与 provider fallback 深度追踪
