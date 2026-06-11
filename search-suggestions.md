@@ -42,7 +42,7 @@ export const searchProviders = {
 
 ### 3.1 全局按键唤醒：只负责打开弹层，不保证首字符保留
 
-**核心事实**：全局按键处理只做一件事——`setSearching(true)` 打开弹层。代码中**没有任何逻辑**把首字符显式写入输入状态，也**没有测试用例**覆盖「唤醒后首字符是否保留」。首字符能否保留，完全是一个依赖运行时时序的隐含行为，无法从代码层面给出确定结论。
+**核心事实**：全局按键处理只做一件事——`setSearching(true)` 打开弹层。代码中**没有任何逻辑**把首字符显式写入输入状态。页面级测试覆盖了「从空白处按键 → 弹层打开」的路径，但**没有断言首字符进入输入框**（且 mock 的 QuickLaunch 组件也没有真实 input）。首字符能否保留，完全是一个依赖运行时时序的隐含行为，无法从代码层面给出确定结论。
 
 **全局监听仅做唤醒** [index.jsx#L253-L277](src/pages/index.jsx#L253-L277)：
 ```javascript
@@ -61,63 +61,124 @@ document.addEventListener("keydown", function handleKeyDown(e) {
 
 ---
 
-#### 输入框聚焦发生在组件打开后的副作用里
+#### QuickLaunch 输入框常驻 DOM，通过样式控制显隐
 
-弹层打开后，输入框通过 `useEffect` 获得焦点 [quicklaunch.jsx#L223-L239](src/components/quicklaunch.jsx#L223-L239)：
+QuickLaunch 组件不是条件挂载/卸载的，而是**始终渲染在页面 DOM 树中**，通过三层状态组合控制可见性与交互性 [quicklaunch.jsx#L222-L267](src/components/quicklaunch.jsx#L222-L267)：
+
+```javascript
+// 内部状态：控制是否加 `hidden` class（完全从布局中移除）
+const [hidden, setHidden] = useState(true);
+
+// 显隐逻辑组合（外层 div className）：
+// ① opacity-0  →  完全透明（动画状态）
+// ② opacity-100 → 完全可见
+// ③ "hidden" class  →  display:none，从布局中移除
+//     生效条件：hidden === true 且 isOpen === false
+```
+
+三层状态的转换关系：
+
+| 阶段 | 提升层 `searching` | 组件内部 `hidden` | 结果样式 | 输入框状态 |
+|------|-------------------|-------------------|---------|----------|
+| **初始关闭** | `false` | `true` | `opacity-0 hidden` | DOM 存在但 `display:none`，无法获取/拥有焦点 |
+| **打开中（动画）** | `true` → prop 变为 `isOpen={true}` | useEffect 同步执行 `setHidden(false)` | 先失去 `hidden`，再从 `opacity-0` 过渡到 `opacity-100` | 同一 useEffect 中执行 `searchField.current.focus()` |
+| **完全打开** | `true` | `false` | `opacity-100` | 可见、可输入、拥有焦点 |
+| **关闭中（动画）** | `false` → prop 变为 `isOpen={false}` | useEffect 先 `blur()`，再 `setTimeout(300ms, setHidden(true))` | 从 `opacity-100` 过渡到 `opacity-0` | 失去焦点 |
+| **完全关闭** | `false` | `true`（300ms 延迟后） | `opacity-0 hidden` | 回到 `display:none` 状态 |
+
+---
+
+#### 输入框聚焦发生在组件打开后的 useEffect 里
+
+`isOpen` 变化后的 useEffect [quicklaunch.jsx#L223-L239](src/components/quicklaunch.jsx#L223-L239)：
 ```javascript
 useEffect(() => {
   if (isOpen) {
-    searchField.current.focus();  // 👈 这是一个渲染后的副作用，不是同步执行的
-    setHidden(false);
+    searchField.current.focus();  // 👈 先移除 hidden，再执行 focus
+    setHidden(false);             // 两者在同一渲染副作用中，但 focus() 调用在 setHidden 之前
+  } else {
+    searchField.current.blur();
+    setTimeout(() => setHidden(true), 300);  // 等待 300ms 过渡动画完成后再加 hidden
   }
-}, [isOpen]);
+}, [isOpen, closeAndReset]);
 ```
 
-重要：`useEffect` 中的 `focus()` 是**渲染之后异步执行**的，它与触发打开的那一次 `keydown` 事件**不在同一个同步调用栈**上。
+关键点：
+1. **DOM 始终存在** —— `searchField.current` 在组件首次挂载后就永不消失（哪怕是 `hidden` 状态），所以调用 `.focus()` 不会报 null
+2. **但处于 `display:none` 时无法持有焦点** —— 浏览器规范规定 `display:none` 的元素无法获得焦点，因此初始关闭状态下输入框没有焦点
+3. **`useEffect` 是渲染后异步执行** —— 与触发打开的那一次 `keydown` 事件不在同一个同步调用栈上
 
 ---
 
 #### 时序分析：首字符大概率丢失
 
-结合 React 18 自动批处理机制 + 浏览器事件循环模型，触发唤醒的那一次按键，其字符**大概率无法进入输入框**：
+结合 React 18 自动批处理机制 + 浏览器事件循环模型 + 组件显隐状态机，触发唤醒的那一次按键，其字符**大概率无法进入输入框**：
 
 ```
-【宏任务】用户按下 'h' 键 → keydown 事件触发
+【宏任务】用户按下 'h' 键 → keydown 事件触发（焦点在 BODY）
     │
     ├─ ① 原生事件监听器 handleKeyDown 同步执行
     │     └─ setSearching(true)
-    │        └─ React 18 自动批处理：将更新加入调度队列
-    │           （不立即重渲染，状态更新是异步的）
+    │        └─ React 18 自动批处理：更新加入调度队列（不立即重渲染）
     │
     ├─ ② 事件监听器函数返回
     │
-    ├─ ③ 浏览器执行 keydown 的默认行为
-    │     └─ 当前焦点仍在 BODY / #inner_wrapper
-    │        （因为 React 还没重渲染，输入框还没出现，更没获得焦点）
-    │        字符试图插入焦点元素 → BODY 不可输入 → 字符被丢弃
+    ├─ ③ 浏览器执行 keydown 默认行为
+    │     ├─ 当前焦点在 BODY（输入框处于 display:none 状态，无焦点）
+    │     └─ 字符向焦点元素插入 → BODY 不可输入 → 字符被丢弃
     │
     └─ 本次宏任务结束
          │
          ▼
        微任务 / 下一轮调度
-         └─ React 处理批处理的状态更新
-            ├─ Home 组件重渲染，searching = true
-            ├─ QuickLaunch 挂载或显示
-            └─ useEffect 执行 → searchField.current.focus()
-               （⚠️ 但 keydown 的默认行为早已执行完毕，
-                  第一个 'h' 字符已经丢失了）
+         └─ React 处理批处理
+            ├─ Home 重渲染 → searching = true
+            ├─ QuickLaunch 收到 isOpen={true}
+            ├─ useEffect 执行：
+            │    ├─ searchField.current.focus()    ✓ 输入框获得焦点
+            │    └─ setHidden(false)               ✓ 移除 display:none
+            └─ （⚠️ 但 keydown 默认行为早已执行完毕，第一个 'h' 字符已经丢失）
 ```
 
 **为什么说"大概率"而非"一定"**：
 - React 的批处理调度时机在不同版本/模式下可能有差异（并发模式 vs 传统模式）
-- 不同浏览器的事件默认行为执行时机也可能略有不同
-- 粘贴快捷键（`Ctrl/Cmd + V`）的情况更复杂，剪贴板内容可能通过 `input` 事件等其他路径进入
+- 不同浏览器的 `display:none → focus()` 时序处理可能略有不同
+- 粘贴快捷键（`Ctrl/Cmd + V`）的情况更复杂，剪贴板内容可能通过后续 `input` 事件等其他路径进入
 
-**但从代码角度可以确定的是**：
+**但从代码和测试角度可以确定的是**：
 1. ✅ 没有任何代码显式读取 `e.key` 并写入 `searchString`
-2. ✅ 聚焦发生在渲染后的 useEffect 中，与触发事件不同步
-3. ✅ 测试用例全部是 `fireEvent.keyDown(input, ...)` 直接在输入框上触发，**没有任何测试覆盖全局唤醒路径下的首字符保留**
-4. ❌ 无法从现有代码推导出「首字符一定保留」的结论
+2. ✅ 组件初始为 `display:none`，触发时输入框没有焦点，也不能接收输入
+3. ✅ `focus()` 发生在渲染后的 useEffect 中，与触发事件不同步
+4. ✅ 页面级测试 `fireEvent.keyDown(document.body, { key: "a" })` **断言了**弹层从 `closed:3` 变为 `open:3`，但**没有断言**任何字符进入输入框
+5. ✅ 页面级测试 mock 的 QuickLaunch 组件不含 `<input>` 元素，因此**技术上也无法验证**首字符进入输入框的行为
+6. ❌ 无法从现有代码 + 测试推导出「首字符一定保留」的结论
+
+---
+
+#### 页面级测试覆盖说明 [index.test.jsx#L407-L425](src/__tests__/pages/index.test.jsx#L407-L425)
+
+```javascript
+it("passes href-bearing services and bookmarks to QuickLaunch and toggles search on keydown", async () => {
+  await renderIndex({ ... });
+
+  expect(screen.getByTestId("quicklaunch")).toHaveTextContent("closed:3");
+
+  // ① 从页面空白处（document.body）触发按键 —— 模拟全局唤醒路径
+  fireEvent.keyDown(document.body, { key: "a" });
+  // ② 只断言弹层已打开 —— 没有断言 'a' 字符进入了输入框
+  expect(screen.getByTestId("quicklaunch")).toHaveTextContent("open:3");
+
+  // ③ 反向验证 —— Escape 关闭
+  fireEvent.keyDown(document.body, { key: "Escape" });
+  expect(screen.getByTestId("quicklaunch")).toHaveTextContent("closed:3");
+});
+```
+
+测试范围明确：
+- **已覆盖**：全局 `keydown` 监听器在 `document.body` 上正确工作
+- **已覆盖**：`searching` 状态变化正确传递给 QuickLaunch（mock 组件文本内容反映 `isOpen` prop）
+- **已覆盖**：Escape 键反向关闭路径
+- **未覆盖**：首字符 `'a'` 是否进入输入框（mock 组件没有 input，也没有相关断言）
 
 ---
 
@@ -492,6 +553,6 @@ const parts = text.split(new RegExp(`(${searchString})`, "gi"));
 2. **currentSuggestion 闭包变量**：Search Widget 中用非 state 变量追踪选中项，在 React 严格模式或并发渲染下可能出现不一致
 3. **重复请求保护**：前端通过 `query !== searchSuggestions[0]` 判断避免重复请求，这依赖后端返回的第一个元素（原始 query）完全一致
 4. **关闭延迟**：QuickLaunch 关闭时使用 `setTimeout(200ms)` + `setTimeout(300ms)` 两段延迟，需在测试中通过 `act + setTimeout` 等待
-5. **全局首字符丢失（代码未保证保留）**：详见 3.1 节。全局按键只负责 `setSearching(true)` 打开弹层，首字符没有任何代码显式写入 `searchString`；聚焦发生在渲染后的 `useEffect` 中，与触发事件不在同一调用栈。从代码层面无法证明首字符会保留，属于对运行时时序的隐式依赖
+5. **全局首字符丢失（代码未保证保留）**：详见 3.1 节。全局按键只负责 `setSearching(true)` 打开弹层，首字符没有任何代码显式写入 `searchString`；QuickLaunch 初始为 `opacity-0 display:hidden` 状态，`focus()` 发生在渲染后的 `useEffect` 中，与触发事件不在同一宏任务。页面级测试覆盖了「从 body 按键 → 弹层打开」路径，但未断言首字符进入输入框，且 mock 组件没有真实 input，技术上也无法验证该行为
 6. **URL 检测正则的局限性**：`/.+[.:].+/` 会将 `ip:port`、`a.b` 等误认为 URL，在 catch 块才被纠正，有微小的性能开销
 7. **普通查询小写化会透传到搜索引擎**：QuickLaunch 中用户输入 `GitHub`，searchString 被转换为 `github`，后续 Web 搜索候选的 href 和建议接口的 query 参数**都会使用小写值**，自定义搜索引擎若区分大小写需留意
