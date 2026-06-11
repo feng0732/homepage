@@ -16,7 +16,7 @@
 配置文件变更
      │
      ▼ 服务端计算
-  /api/hash → SHA256(所有配置文件 + buildTime)
+  /api/hash → SHA256(7个配置文件 + buildTime)
      │
      ▼ 浏览器检测
   窗口聚焦 → mutateHash() → 获取新 hash
@@ -28,7 +28,7 @@
   调用 /api/revalidate
      │
      ▼ 服务端 ISR
-  res.revalidate("/") → 后台重新生成首页
+  res.revalidate("/") → 后台重新生成首页静态页面
      │
      ▼ 浏览器
   window.location.reload() → 全页刷新
@@ -72,11 +72,11 @@ export default async function handler(req, res) {
 ```
 
 **关键要点**：
-- 监控 **8 个配置文件**：docker.yaml、settings.yaml、services.yaml、bookmarks.yaml、widgets.yaml、custom.css、custom.js
+- 监控 **7 个配置文件**：docker.yaml、settings.yaml、services.yaml、bookmarks.yaml、widgets.yaml、custom.css、custom.js
 - 使用 **SHA-256** 算法计算每个文件的哈希
 - 最终哈希 = 所有文件哈希拼接 + buildTime 环境变量，再做一次哈希
 - `HOMEPAGE_BUILDTIME` 确保容器重启/重建后也会触发刷新
-- **每次请求 /api/hash 都会实时计算**，不缓存结果
+- **每次请求 `/api/hash` 都会实时计算**，不缓存结果
 
 ### 1.3 哈希变更检测（浏览器端）
 
@@ -172,7 +172,7 @@ fetch("/api/revalidate").then((res) => {
 **为什么需要全页刷新**：
 - 配置变更可能影响页面结构（新增/删除服务、布局变化等）
 - SWR 只能刷新数据，不能改变页面结构
-- 全页刷新确保所有配置（包括 SSR 部分）都更新
+- 全页刷新确保所有配置（包括静态生成部分）都更新
 
 ---
 
@@ -211,7 +211,7 @@ fetch("/api/revalidate").then((res) => {
 >
 ```
 
-作用：注入 SSR 预获取的数据作为 SWR 初始缓存。
+作用：注入静态生成预获取的数据作为 SWR 初始缓存。
 
 **第三层：组件级配置（各 widget 组件）**
 
@@ -226,12 +226,12 @@ useSWR(url, { refreshInterval: 30000 });
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                     阶段 1: SSR 预渲染                      │
-│  服务端执行 getStaticProps()                                 │
+│                  阶段 1: 静态生成 (SSG)                      │
+│  构建时 / ISR 重新生成时执行 getStaticProps()                │
 │    → 服务发现（Docker/K8s/配置文件）                        │
 │    → 读取 widgets、bookmarks                                │
 │    → 数据打包进 fallback 对象                               │
-│    → 渲染完整 HTML 页面                                     │
+│    → 渲染完整 HTML 静态页面                                 │
 │    → fallback 数据序列化到 HTML 中（__NEXT_DATA__）         │
 └──────────────────────────┬───────────────────────────────────┘
                            │
@@ -290,15 +290,15 @@ fallback 中没有的（需要客户端请求）：
 ```
 
 **原因**：
-- Widget 数据是实时的（CPU、内存等），SSR 时的缓存很快过期
-- Widget 数量多，全部预获取会拖慢 SSR 速度
+- Widget 数据是实时的（CPU、内存等），静态生成时的缓存很快过期
+- Widget 数量多，全部预获取会拖慢静态生成速度
 - 采用「骨架屏 + 异步加载」的体验更好
 
 ### 2.5 刷新触发时机汇总
 
 | 触发方式 | 触发源 | 说明 |
 |---------|--------|------|
-| SSR 预填充 | getStaticProps | 构建/重新生成时执行，数据注入 fallback |
+| 静态生成预填充 | getStaticProps | 构建/重新生成时执行，数据注入 fallback |
 | 组件挂载 | useSWR 初始化 | 组件首次渲染时发起请求 |
 | 轮询刷新 | refreshInterval | 按固定间隔周期性刷新 |
 | 窗口聚焦 | revalidateOnFocus | 标签页从后台切回前台时刷新 |
@@ -322,7 +322,7 @@ fallback 中没有的（需要客户端请求）：
 | ISR 触发生成 | 按需重新生成静态页面 | `src/pages/api/revalidate.js` |
 | API 代理 | 转发 widget 请求到真实后端，处理认证 | `src/pages/api/services/proxy.js` |
 | 数据映射 | 精简、转换、过滤 API 返回数据 | 各 `widgets/<type>/widget.js` 的 map 函数 |
-| SSR 渲染 | 预获取数据，渲染完整 HTML | `src/pages/index.jsx` 的 `getStaticProps()` |
+| 静态生成 | 预获取数据，渲染完整 HTML | `src/pages/index.jsx` 的 `getStaticProps()` |
 
 **服务端特点**：
 - 有文件系统访问权限（读取 yaml 配置）
@@ -357,7 +357,7 @@ fallback 中没有的（需要客户端请求）：
 ┌───────────────────────────────────────────────────────────┐
 │                       服务端                               │
 │                                                           │
-│  配置文件 ──→ 服务发现 ──→ 数据清洗 ──→ SSR 渲染          │
+│  配置文件 ──→ 服务发现 ──→ 数据清洗 ──→ 静态生成          │
 │     │          │              │             │             │
 │     │          │              │         fallback          │
 │     │          │              │             ↓             │
@@ -404,9 +404,9 @@ SWR 使用 URL 字符串作为缓存键。
 
 | 数据 | 缓存键 | 来源 |
 |------|--------|------|
-| 服务列表 | `/api/services` | SSR fallback + 客户端 revalidate |
-| 书签列表 | `/api/bookmarks` | SSR fallback + 客户端 revalidate |
-| 信息组件 | `/api/widgets` | SSR fallback + 客户端 revalidate |
+| 服务列表 | `/api/services` | 静态生成 fallback + 客户端 revalidate |
+| 书签列表 | `/api/bookmarks` | 静态生成 fallback + 客户端 revalidate |
+| 信息组件 | `/api/widgets` | 静态生成 fallback + 客户端 revalidate |
 | 配置校验 | `/api/validate` | 仅客户端 |
 | 配置哈希 | `/api/hash` | 仅客户端 |
 
@@ -598,13 +598,13 @@ const widget = {
 
 ### 8.1 分层缓存策略
 
-1. **SSR + ISR 层**：页面结构级缓存，配置变更时触发
+1. **SSG + ISR 层**：页面结构级缓存，配置变更时触发
 2. **SWR 客户端层**：数据级缓存，自动刷新
 3. **服务端代理层**：可加缓存（当前实现不缓存，每次透传）
 
 ### 8.2 渐进式加载体验
 
-- 首屏：SSR 预渲染，完整内容立即可见
+- 首屏：静态生成预渲染，完整内容立即可见
 - 补水：SWR 用 fallback 数据立即渲染
 - 刷新：后台静默更新，有变化时平滑过渡
 - 实时：Widget 按各自间隔轮询更新
@@ -620,7 +620,7 @@ const widget = {
 
 | 策略 | 优点 | 缺点 | 适用场景 |
 |------|------|------|----------|
-| SSR + ISR | SEO 友好、首屏快 | 结构变更需全页刷新 | 页面结构、布局 |
+| SSG + ISR | SEO 友好、首屏快 | 结构变更需全页刷新 | 页面结构、布局 |
 | SWR fallback | 无闪烁、体验好 | 初始数据可能过期 | 列表、元数据 |
 | 轮询刷新 | 实时性可控 | 资源消耗随间隔降低而增加 | 指标、状态 |
 | 窗口聚焦刷新 | 用户关注时才更新 | 后台可能显示过期数据 | 非关键数据 |
