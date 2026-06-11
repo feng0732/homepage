@@ -77,11 +77,9 @@ export const config = {
 
 #### 关键修正：中间件不拦截首页 SSR 请求
 
-这是一个容易混淆的点。`config.matcher` 的值是 `"/api/:path*"`，这意味着：
+`config.matcher` 的值是 `"/api/:path*"`，这意味着：
 
 **中间件只拦截 `/api/` 开头的请求，不拦截页面请求。**
-
-具体来说：
 
 | 请求路径 | 是否经过中间件 | 原因 |
 |----------|:---:|------|
@@ -91,7 +89,7 @@ export const config = {
 | `GET /api/revalidate` | ✅ | 匹配 `/api/:path*` |
 | `GET /api/hash` | ✅ | 匹配 `/api/:path*` |
 
-**所以首页的 SSR 渲染流程实际上是这样的：**
+首页的 SSR 渲染流程：
 
 ```
 用户请求 GET /
@@ -102,14 +100,139 @@ export const config = {
     ↓
 执行 getStaticProps() 获取数据
     ↓
-渲染 HTML 返回
+渲染 HTML 返回（内含 __NEXT_DATA__ 携带完整业务数据）
 ```
 
-**中间件的真实角色是 API 网关防护，而非全局请求拦截。** 它保护的是 API 路由（如 `/api/services`、`/api/config/custom.css`），防止通过伪造 Host 头访问这些接口。这是因为项目作为一个仪表盘应用，其 API 端点暴露了 Docker/Kubernetes/Proxmox 等基础设施信息，需要做 Host 白名单校验。
+**中间件的真实角色是 API 网关防护。** 它保护的是 `/api/*` 路由，防止通过伪造 Host 头直接访问这些接口。
 
-**为什么首页不需要中间件保护？** 因为首页请求 `/` 是一个页面请求，走的是 Next.js 的页面渲染管道（`getStaticProps` → React SSR → HTML），而不是直接暴露 API 数据。即使恶意请求访问 `/`，返回的只是 HTML 页面，不会泄露敏感信息。
+#### 页面数据暴露边界——不能只说"首页只返回 HTML"
 
-**间接关联：** 首页的客户端代码中，`useSWR("/api/services")`、`useSWR("/api/bookmarks")` 等调用会向 `/api/*` 端点发请求，这些请求**会**经过中间件的 Host 校验。如果 Host 不合法，SWR 请求会被中间件拦截返回 400，导致客户端无法获取数据。
+上面的流程图容易产生一个误解：认为首页 `GET /` 不经过中间件就没有安全风险，"返回的只是 HTML 页面"。**这个说法不严谨。**
+
+实际上，`getStaticProps` 在服务端获取了完整的业务数据，这些数据以两种方式嵌入 HTML：
+
+**1. `initialSettings` 直接序列化为 `pageProps`**
+
+[index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/index.jsx#L59-L68) 中 `getSettings()` 返回的 `settings`（排除 `providers` 后）作为 `initialSettings` 传入 props：
+
+```javascript
+const { providers, ...settings } = getSettings();
+// ...
+return {
+  props: {
+    initialSettings: settings,  // 包含 title, layout, theme, color, background 等
+    // ...
+  },
+};
+```
+
+`providers` 被解构排除，说明设计者有意识地**不在客户端暴露 Docker/K8s/Proxmox 的连接凭证**。但 `settings` 中其余字段（布局、主题、背景图 URL、base 路径等）仍然会被序列化到 `__NEXT_DATA__` 中。
+
+**2. `fallback` 携带完整的 services / bookmarks / widgets 数据**
+
+[index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/index.jsx#L69-L74)：
+
+```javascript
+fallback: {
+  "/api/services": services,   // 所有服务项的名称、URL、图标、描述等
+  "/api/bookmarks": bookmarks, // 所有书签的名称、URL
+  "/api/widgets": widgets,     // 所有小部件的配置
+  "/api/hash": false,
+},
+```
+
+这些数据在服务端通过 `servicesResponse()`、`bookmarksResponse()`、`widgetsResponse()` 获取，**与对应的 API 端点 `/api/services`、`/api/bookmarks`、`/api/widgets` 返回的数据完全相同**。
+
+Next.js 在 SSR 时将整个 `pageProps`（包含 `initialSettings` 和 `fallback`）序列化为 JSON，嵌入到 HTML 中的 `<script id="__NEXT_DATA__">` 标签。任何人只需查看 HTML 源码，就能直接读取这些数据。
+
+**因此，`GET /` 返回的并非"只是 HTML"，而是 HTML + 完整的业务数据快照。**
+
+#### API Host 校验的实际保护范围
+
+既然 `GET /` 的 HTML 源码已经包含了 services/bookmarks/widgets 的完整数据，那 API 中间件保护 `/api/services` 等端点的意义何在？需要精确区分哪些数据只在 API 端点暴露，哪些在页面 HTML 中就已暴露：
+
+| 数据 | 页面 HTML 中的 `__NEXT_DATA__` | API 端点 | 中间件保护有效？ |
+|------|:---:|:---:|:---:|
+| 服务列表（名称、URL、图标、描述） | ✅ `fallback["/api/services"]` | ✅ `/api/services` | ❌ 已通过 HTML 暴露 |
+| 书签列表（名称、URL） | ✅ `fallback["/api/bookmarks"]` | ✅ `/api/bookmarks` | ❌ 已通过 HTML 暴露 |
+| 小部件配置（类型、参数） | ✅ `fallback["/api/widgets"]` | ✅ `/api/widgets` | ❌ 已通过 HTML 暴露 |
+| 设置（布局、主题、背景） | ✅ `initialSettings` | ❌ 无独立端点 | 不适用 |
+| Docker/K8s/Proxmox 连接凭证 | ❌ `providers` 被解构排除 | ❌ 无独立暴露端点 | 不适用 |
+| 服务实时状态（ping、资源占用） | ❌ 不在 fallback 中 | ✅ `/api/services/proxy` | ✅ **中间件有效** |
+| Glances 系统指标 | ❌ 不在 fallback 中 | ✅ `/api/widgets/glances` | ✅ **中间件有效** |
+| 天气/股票/Longhorn 实时数据 | ❌ 不在 fallback 中 | ✅ `/api/widgets/*` | ✅ **中间件有效** |
+| 配置文件哈希 | ❌ fallback 中为 `false` | ✅ `/api/hash` | ✅ **中间件有效** |
+| 配置 YAML 校验结果 | ❌ 不在 props 中 | ✅ `/api/validate` | ✅ **中间件有效** |
+| Ping 探测结果 | ❌ 不在 props 中 | ✅ `/api/ping` | ✅ **中间件有效** |
+| 自定义 CSS/JS 文件内容 | ❌ 不在 props 中 | ✅ `/api/config/custom.css` 等 | ✅ **中间件有效** |
+| ISR 重新验证触发 | ❌ 不在 props 中 | ✅ `/api/revalidate` | ✅ **中间件有效** |
+| Widget 实时数据代理 | ❌ 不在 props 中 | ✅ `/api/services/proxy` | ✅ **中间件有效** |
+
+**核心结论：中间件保护的重点不是"静态配置数据"（这些已经通过 HTML 暴露了），而是"实时动态数据"和"有副作用的操作"。**
+
+具体来说：
+
+1. **静态配置数据已被 HTML 暴露，中间件无法再保护**：services、bookmarks、widgets 的结构化数据已经通过 `__NEXT_DATA__` 完全暴露在页面 HTML 中。即使 `/api/services` 被中间件拦截，攻击者只需请求 `GET /` 就能获取同样的数据。
+
+2. **中间件有效保护的是实时数据通道**：[proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/api/services/proxy.js#L1-L115) 提供的服务实时状态代理（如 Docker 容器状态、Glances 系统指标、智能家居状态等）不经过 `getStaticProps`，只在客户端通过 SWR 动态请求获取。这些请求必须经过中间件的 Host 校验，中间件在这里确实起到了防护作用。
+
+3. **中间件有效保护有副作用的端点**：`/api/revalidate` 能触发 ISR 重新生成，`/api/ping` 能对内网主机发起 ICMP 探测。这些是有安全影响的操作，必须通过中间件限制访问。
+
+#### 客户端再请求与中间件的关系
+
+首页的客户端代码在 Hydration 后，通过 SWR 发起两类数据请求：
+
+**第一类：使用 fallback 缓存的请求（首次不会真正发网络请求）**
+
+```javascript
+const { data: services } = useSWR("/api/services");
+const { data: bookmarks } = useSWR("/api/bookmarks");
+const { data: widgets } = useSWR("/api/widgets");
+```
+
+由于 `fallback` 中已有这些 key 的数据，SWR 首次渲染直接使用缓存，**不会发起网络请求**。后续在窗口获得焦点或 revalidate 间隔到达时，SWR 才会真正请求 `/api/services` 等，此时**请求经过中间件**。如果 Host 不合法，revalidate 请求失败，但页面仍显示 fallback 中的旧数据。
+
+**第二类：无 fallback 缓存的实时请求（必须经过中间件）**
+
+```javascript
+const { data: errorsData } = useSWR("/api/validate");
+const { data: hashData, mutate: mutateHash } = useSWR("/api/hash");
+```
+
+`/api/hash` 在 fallback 中设为 `false`，SWR 发现缓存无效，会立即发起网络请求。这类请求**必须通过中间件**的 Host 校验才能成功。此外，各 Widget 组件通过 [useWidgetAPI](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/utils/proxy/use-widget-api.js#L1-L16) 发起的实时数据请求（如 `/api/services/proxy?...`）也全部经过中间件。
+
+**所以中间件对客户端请求的实际效果是：**
+
+- 静态配置数据：首次渲染不受影响（使用 fallback 缓存），后续 revalidate 受中间件控制
+- 实时动态数据：完全受中间件控制，Host 不合法则无法获取实时状态
+- 有副作用的操作：完全受中间件控制，Host 不合法则无法触发
+
+#### 安全视角下的完整数据暴露边界
+
+```
+攻击者请求 GET /（不经过中间件）
+    ↓
+获取 HTML 源码
+    ↓
+解析 <script id="__NEXT_DATA__">
+    ↓
+可获取的静态数据：
+    ├─ 所有服务项的名称、URL、图标、描述
+    ├─ 所有书签的名称、URL
+    ├─ 所有小部件的配置（类型、参数）
+    ├─ 设置（布局、主题、背景图 URL、base 路径等）
+    └─ 翻译字典（i18n）
+
+无法获取的数据（只在 API 端点暴露，受中间件保护）：
+    ├─ 服务实时状态（容器运行状态、资源占用等）
+    ├─ 系统监控指标（CPU、内存、磁盘等）
+    ├─ 自定义 CSS/JS 文件内容
+    ├─ 配置文件哈希值
+    ├─ 内网 Ping 探测结果
+    └─ 无权触发 ISR 重新验证
+```
+
+这意味着：**即使中间件正确配置，`GET /` 仍然是信息泄露的通道**。如果部署场景中 services/bookmarks/widgets 的名称和 URL 属于敏感信息（例如暴露了内网服务拓扑），仅靠中间件的 Host 校验是不够的，还需要在反向代理层对 `GET /` 本身做访问控制，或者在 `getStaticProps` 中对嵌入 fallback 的数据做脱敏处理。
 
 ### 1.3 动态路由解析
 
@@ -742,24 +865,28 @@ useEffect(() => {
 路由匹配到 src/pages/index.jsx
     ↓
 [服务端取数] getStaticProps()
-    ├─ getSettings() 读取 settings.yaml
-    ├─ servicesResponse() 聚合 Docker/K8s/YAML 数据
-    ├─ bookmarksResponse() 读取书签
-    ├─ widgetsResponse() 读取小部件
-    └─ serverSideTranslations() 加载翻译
+    ├─ getSettings() → settings（providers 被排除，不进入客户端）
+    ├─ servicesResponse() → services（完整服务列表，含名称/URL/图标）
+    ├─ bookmarksResponse() → bookmarks（完整书签列表，含名称/URL）
+    ├─ widgetsResponse() → widgets（完整小部件配置）
+    └─ serverSideTranslations() → i18n 翻译字典
     ↓
 返回 pageProps: { initialSettings, fallback, _nextI18Next }
     ↓
 [页面渲染]
-    ├─ _document.jsx → HTML 骨架 + custom.css
+    ├─ _document.jsx → HTML 骨架 + custom.css（经 /api/config/，受中间件保护）
     ├─ _app.jsx → Providers（初始值为 undefined/默认值）
     ├─ Wrapper → 背景图（直接从 props 读取）
     ├─ Index → SWRConfig fallback 数据桥
     └─ Home → 业务内容（settings 此时为 {}）
     ↓
-[数据注入] pageProps 序列化为 __NEXT_DATA__
+[数据注入] pageProps 完整序列化为 __NEXT_DATA__
+    ├─ initialSettings：布局、主题、背景等设置
+    ├─ fallback["/api/services"]：完整服务列表 ← 安全关注点
+    ├─ fallback["/api/bookmarks"]：完整书签列表 ← 安全关注点
+    └─ fallback["/api/widgets"]：完整小部件配置 ← 安全关注点
     ↓
-HTTP 响应返回完整 HTML
+HTTP 响应返回 HTML（内含可被查看的明文业务数据）
     ↓
 [客户端]
     ├─ 浏览器解析 HTML，显示静态内容
@@ -769,20 +896,40 @@ HTTP 响应返回完整 HTML
     ├─ useEffect: setSettings(initialSettings) → Context 更新
     ├─ useEffect: setTheme(settings.theme) → 主题修正
     ├─ useEffect: setColor(settings.color) → 颜色修正
-    ├─ SWR 从 fallback 恢复缓存
+    ├─ SWR 从 fallback 恢复缓存（services/bookmarks/widgets 首次不请求 API）
     └─ 页面完全可交互
 ```
 
-### 7.2 客户端数据请求（需要经过中间件）
+### 7.2 客户端数据请求分类（与中间件的关系）
+
+**A. 有 fallback 缓存的请求——首次不经网络，后续 revalidate 经中间件**
 
 ```
-客户端 useSWR("/api/services") 发起请求
-    ↓
-[经过 middleware] Host 校验
-    ├─ 校验通过 → 正常返回数据
-    └─ 校验失败 → 返回 400 → SWR 报错
-    ↓
-SWR 更新缓存，触发重渲染
+useSWR("/api/services")  → fallback 有数据 → 首次不发请求
+                            ↓（窗口聚焦/revalidate 间隔）
+                          GET /api/services → 经过中间件 Host 校验
+                            ├─ 通过 → 更新缓存
+                            └─ 失败 → 继续使用 fallback 旧数据
+```
+
+**B. 无 fallback 缓存的请求——每次必须经中间件**
+
+```
+useSWR("/api/validate")  → fallback 无数据 → 立即发请求 → 经过中间件
+useSWR("/api/hash")      → fallback 为 false → 立即发请求 → 经过中间件
+useWidgetAPI(widget)     → 无 fallback → 立即发请求 → 经过中间件
+```
+
+**C. 有副作用的请求——必须经中间件**
+
+```
+fetch("/api/revalidate") → 经过中间件 Host 校验
+    ├─ 通过 → res.revalidate("/") 触发 ISR 重新生成
+    └─ 失败 → 配置更新无法生效
+
+GET /api/ping → 经过中间件 Host 校验
+    ├─ 通过 → 对内网主机发起 ICMP 探测
+    └─ 失败 → 探测被阻止
 ```
 
 ### 7.3 配置变更检测流程
@@ -798,8 +945,27 @@ hash 不同 → fetch("/api/revalidate")（经过中间件）
     ↓
 res.revalidate("/") 触发 ISR 重新生成
     ↓
-window.location.reload() 全量刷新页面
+window.location.reload() 全量刷新页面（获取新的 __NEXT_DATA__）
 ```
+
+### 7.4 攻击者视角——数据获取路径对比
+
+```
+路径 A：GET / （不经过中间件）
+    → HTML 源码 → __NEXT_DATA__ → 静态配置数据 ✅
+    → 无法获取实时动态数据 ❌
+    → 无法触发副作用操作 ❌
+
+路径 B：GET /api/services （经过中间件）
+    → Host 校验 → 失败则 400 ❌
+    → 即使成功，数据与路径 A 的 fallback 完全相同（冗余通道）
+
+路径 C：GET /api/services/proxy?... （经过中间件）
+    → Host 校验 → 失败则 400 ❌
+    → 成功则获取实时动态数据 ✅（这才是中间件真正保护的）
+```
+
+**结论：** 对静态配置数据而言，`GET /` 是无保护的泄露通道，中间件保护 `/api/services` 等端点只是"防君子不防小人"；对实时动态数据而言，中间件是唯一屏障。
 
 ---
 
