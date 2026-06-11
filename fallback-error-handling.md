@@ -236,53 +236,113 @@ const request = requestor.request(url, params, (response) => {  // response = �
 | ② pipe 已执行 | 步骤 4 `response.pipe(responseContent)` 此时 pipe 的目标是 unzip。`pipe()` 会调用 `readable.resume()`，**将原始 response 切换到 flowing 模式**，所有数据块会自动写入 unzip | 原始 response 的数据已经"被消费"，无法被二次读取或重新监听 |
 | ③ error 事件后 Transform 行为 | Node.js `zlib.createUnzip()` 在 emit `error` 后，内部状态变为 errored，后续 `_transform` 不再处理数据。按照 Stream 规范，error 后可继续 emit `end`/`close`，但数据完整性无法保证 | 若 data 数组只收到部分解压数据 → 最终 `Buffer.concat(data)` 是**残缺内容** |
 
-#### 实际后果（不同场景）
-```
-场景 A：响应头正确，但 body 完全不是 gzip 魔数（0x1f 8b）
-  → unzip 在收到第一块数据时立即 emit error
-  → data 数组：空数组
-  → 后续：unzip 可能 emit end（取决于内部实现）
-  → 最终 resolve：Buffer.concat([]) = 空 Buffer <Buffer >
-  → 上层拿到的是空内容，而不是原始压缩字节
+#### error / end / close 事件时序与 Promise resolve 的真实关系
 
-场景 B：gzip 数据中间截断（服务器断连）
-  → unzip 已解压部分数据写入 data[]
-  → 遇到截断数据 emit error
-  → 最终 resolve：部分解压成功的残缺字符串（可能是乱码）
-  → 上层 JSON.parse 失败，但不会拿到原始压缩字节
+代码中 Promise 的唯一 resolve 路径是 [utils/proxy/http.js#L59-L62](file:///d:/fz/0601/solo-dogfeeding/code/209-homepage/src/utils/proxy/http.js#L59-L62) 挂在 `responseContent`（即引用 B，unzip 对象）的 `end` 事件上：
 
-场景 C：gzip 完整，但校验和（CRC32）错误（传输中比特翻转）
-  → unzip 解压完所有数据 emit data
-  → 流结束时校验失败 emit error
-  → 最终 resolve：完整解压数据（zlib 通常在 end 前已把数据吐出）
-  → 这是唯一"碰巧正确"的场景
+```javascript
+responseContent.on("end", () => {
+  addCookieToJar(url, response.headers);
+  resolve([status, type, Buffer.concat(data), headers]);
+});
 ```
 
-#### 测试盲区验证
-[utils/proxy/http.test.js#L367-L398](file:///d:/fz/0601/solo-dogfeeding/code/209-homepage/src/utils/proxy/http.test.js#L367-L398) 中 `logs when gzip decoding emits an error` 用例：
+**关键问题**：真实 zlib Transform 在 emit `error` 后，会不会继续 emit `end`？如果不会，Promise 将 **永远 pending**（请求悬停、内存泄漏）。
+
+##### Node.js Stream 规范与 zlib 实际行为
+
+| 事件 | 触发条件 | zlib Transform error 后是否 emit |
+|------|----------|----------------------------------|
+| `error` | 解压失败（魔数错 / 截断 / CRC 失败）时由 zlib 内部 `this.destroy(err)` 触发 | ✅ 一定 emit |
+| `data` | 解压成功的字节块 | ❌ error 后 `_transform` 不再被调用，不会再有 data |
+| `end` | 上游 readable emit `end` → pipe 调用 `gunzip.end()` → Transform 清空缓冲区后 emit | ⚠️ **取决于 error 发生时机**（见下方 3 场景） |
+| `close` | Stream 及其底层资源（zlib ctx）已释放 | ✅ error 后一定 emit（通过 `destroy()` 触发） |
+
+Node.js `stream.Transform` 的核心规则：**`error` 事件本身不会自动触发 `end`**。`end` 只会在上游响应结束后，通过 `response.pipe()` 调用 `gunzip.end()` → 触发 `_flush()` 来触发。但如果 gunzip 已经被 `destroy(err)`，`_flush` 是否还能工作取决于实现。
+
+##### 真实时序对比（3 种失败场景 vs Promise resolve 结果）
+
+```
+═══ 场景 A：body 魔数错误（0x1f 8b 不对，第一块数据就炸）═══
+  T0  response push(body) → pipe → gunzip.write(firstChunk)
+       gunzip._transform: 魔数校验失败 → this.destroy(new Error("incorrect header check"))
+         └─ destroy() 内部：emit "error" → 关闭 zlib ctx → emit "close"
+  T1  error listener 执行: logger.error + 无效赋值 responseContent = response
+  T2  response.push(null) → response emit "end"
+       pipe 默认 end:true → 尝试 gunzip.end()，但 gunzip 已 destroyed
+         └─ 已 destroy 的流：_flush 不执行，不 emit "end"，只 emit "close"（已 emit 过）
+  结果：❌ Promise 永远 pending，end 事件从未触发
+
+
+═══ 场景 B：gzip 数据中间截断（已解压部分数据后炸）═══
+  T0  response push(chunk1) → gunzip.write(chunk1)
+       gunzip._transform 成功 → emit "data": "hello" → data.push("hello")
+  T1  response push(chunk2) → gunzip.write(chunk2)
+       gunzip._transform: 截断数据 zlib 内部返回 Z_DATA_ERROR → this.destroy(err)
+         └─ emit "error" → 关闭 zlib ctx → emit "close"
+  T2  error listener 执行: logger.error + 无效赋值
+  T3  response.push(null) → response emit "end"
+       pipe 调用 gunzip.end() → gunzip 已 destroyed → 跳过 _flush
+  结果：❌ Promise 永远 pending，data=["hello"] 残缺内容永远到不了 resolve
+
+
+═══ 场景 C：gzip 完整但 CRC32 校验和错误（解压完最后炸）═══
+  T0  response push(body) → gunzip.write(body) → 解压成功
+       gunzip._transform: 压缩数据全部处理完 → emit "data": "hello world"
+  T1  response.push(null) → response emit "end"
+       pipe 调用 gunzip.end() → gunzip._flush()
+         └─ _flush 内校验 trailer（CRC32+ISIZE）失败 → this.destroy(new Error("incorrect data check"))
+         └─ destroy() 执行：先 emit "end"（因为 _flush 正常返回了！）再 emit "error" → emit "close"
+       注意 Node.js zlib 实现：_flush 在校验失败前已先调用了 callback(null, buf)，所以 "end" 先于 "error"！
+  T2  end listener 触发: resolve([200, "application/json", Buffer("hello world"), ...])
+  T3  error listener 触发: logger.error + 无效赋值（此时 Promise 已 resolved，无影响）
+  结果：✅ Promise 正常 resolve，内容正确，但 error 日志也打了
+       这是唯一"碰巧成功"的场景，全靠 Node.js zlib 内部的 callback 调用顺序
+```
+
+**结论**：3 种真实失败场景中，**有 2 种会导致 Promise 永远 pending**（内存泄漏 + 请求悬挂）。只有 CRC32 尾部校验失败的场景（解压完成后才出错）会碰巧 resolve。
+
+#### 测试替身 PassThrough 如何遮蔽问题
+[utils/proxy/http.test.js#L367-L398](file:///d:/fz/0601/solo-dogfeeding/code/209-homepage/src/utils/proxy/http.test.js#L367-L398) 中的测试替身：
 
 ```javascript
 createUnzip: () => {
-  const pt = new PassThrough();           // 用 PassThrough 冒充 unzip
+  const pt = new PassThrough();     // ❌ PassThrough ≠ 真实 Gunzip
   pt.on("pipe", () => {
     queueMicrotask(() => {
       pt.emit("error", new Error("bad gzip"));
-      pt.end();                            // 手动 end 保证 Promise 不挂起
+      pt.end();                      // ❌ 手动调 end()，真实 zlib 不会帮你调
     });
   });
   return pt;
 }
-// 断言只检查：expect(logger.error).toHaveBeenCalled()
-// ❌ 未检查 data 是否正确回退到原始压缩字节
+await httpMod.httpProxy("http://example.com");   // await 能返回说明 Promise resolve 了
+expect(logger.error).toHaveBeenCalled();         // ❌ 只断言日志，没断言 data 内容
 ```
 
-测试用 **PassThrough（全透传）代替真实 zlib Transform**，且手动调用了 `end()`，回避了真实场景下"流是否会自然 emit end"的问题。断言也只验证了日志被打，**没有验证内容正确性**。
+**替身与真实 Gunzip 的 4 个关键差异：**
+
+| 行为维度 | PassThrough（测试替身） | 真实 zlib Gunzip | 对测试的影响 |
+|----------|------------------------|-----------------|-------------|
+| ① error 后是否 emit `end` | **手动 `pt.end()` 保证一定会 emit** | 场景 A/B：❌ 不 emit <br> 场景 C：✅ 碰巧 emit | 测试下 Promise 永远能 resolve，**掩盖了 2/3 的 Promise 悬挂 bug** |
+| ② data 是否透传 | PassThrough 把上游字节原样吐出 | Gunzip 解压失败后 data 为 0 或残缺字节 | 测试下 `data` 里是完整原始 body（透传），**掩盖了数据丢失/残缺问题** |
+| ③ destroy 行为 | PassThrough emit error 后流仍正常工作 | Gunzip emit error 后内部状态损毁，`_transform` 不再执行 | 测试替身能继续 `end()`，真实 Gunzip 已不可用 |
+| ④ mock response 的 body 投递 | `Readable.read()` 里一次性 push(body) + push(null)，**同步完成** | 真实响应是分 chunk 异步到达，error 发生时机不可控 | 测试保证 error 发生在 `end` 之前且 microtask 内手动补 end，**掩盖了时序敏感性** |
+
+**为什么这会误导开发者？** 测试用例 `logs when gzip decoding emits an error` 的 `await` 能正常返回，给人的印象是"gzip fallback 工作正常"，但实际上**生产环境中场景 A/B（魔数错 / 截断）会让 Promise 永远 pending**，造成请求悬挂和内存泄漏。
+
+#### 实际后果（不同场景 + Promise 结果）
+
+| 场景 | error 发生时机 | data 数组内容 | `end` 是否 emit | Promise 结果 | 上层看到什么 |
+|------|---------------|--------------|-----------------|-------------|-------------|
+| A 魔数错 | 第一块 `_transform` | `[]` 空 | ❌ 不 emit | ⏳ 永远 pending（悬挂） | 请求永不返回，SWR 超时或一直 loading |
+| B 中间截断 | 某块 `_transform` | 部分解压内容（如 `["hello"]`） | ❌ 不 emit | ⏳ 永远 pending（悬挂） | 请求永不返回 |
+| C CRC 校验错 | `_flush` 末尾 | 完整解压内容（如 `"hello world"`） | ✅ emit（先于 error） | ✅ 正常 resolve 正确内容 | 正常显示（error 只打了日志） |
 
 #### 恢复时机
-- **此 fallback 不可恢复**：当前实现下 `responseContent = response` 不产生任何实际效果。Promise 能否 resolve 取决于 unzip 在 error 后是否 emit end：
-  - PassThrough / 手动 end：能 resolve（内容可能是残缺/空）
-  - 真实 zlib Gunzip：通常会 emit end 跟随在 error 之后（Node.js zlib 实现了 `_flush` 后的清理），但内容无保证
-- **真正的恢复**在下一次 HTTP 请求（重试/刷新页面）时，会重新发起请求，不依赖上一次流状态
+- **场景 A/B（Promise 悬挂）：此请求无法恢复** — Promise 永远 pending，请求占用的 TCP 连接、zlib ctx、闭包内的 data 数组全部泄漏。只能等 SWR 超时、上游服务端超时断开、或 Node.js GC 在非常极端情况下回收。
+- **场景 C（CRC 失败）：自动恢复** — Promise 已 resolve 正确内容，下一次 SWR 轮询可能拿到正常响应。
+- **真正的全量恢复**在下一次 HTTP 请求（SWR `refreshInterval` / 手动刷新 / 自动重试）时，会重新 `createUnzip()` 创建全新的流对象，与上一次悬挂状态完全无关。
 
 ### 5.3 HTTP 请求异常兜底
 
