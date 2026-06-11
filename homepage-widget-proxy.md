@@ -97,7 +97,7 @@ const serviceProxyHandler = widget.proxyHandler || genericProxyHandler;
 ```javascript
 if (serviceProxyHandler instanceof Function) {
   // ★ 快速返回分支：跳过 mappings 处理，直接交给 handler
-  // 条件一：请求没有 endpoint 参数（完全自定义的代理，如 plex、pihole、deluge、freshrss）
+  // 条件一：请求没有 endpoint 参数（完全自定义的代理，如 pihole、deluge）
   // 条件二：handler 是 calendarProxyHandler（calendar 即使有 endpoint，也跳过 mappings，因为它的 endpoint 是 integration name）
   if (!req.query.endpoint || serviceProxyHandler === calendarProxyHandler) {
     return await serviceProxyHandler(req, res);  // ← 注意：不传 map 参数
@@ -110,7 +110,7 @@ if (serviceProxyHandler instanceof Function) {
 
 | 分支条件 | 场景示例 | 后续行为 |
 |---------|---------|---------|
-| `!req.query.endpoint` | Pi-hole、Deluge、FreshRSS 等完全自定义 proxy.js 的 Widget | **跳过所有 mappings 处理**，handler 自己负责全部逻辑，**map 参数为 undefined** |
+| `!req.query.endpoint` | Pi-hole、Deluge 等完全自定义 proxy.js 的 Widget | **跳过所有 mappings 处理**，handler 自己负责全部逻辑，**map 参数为 undefined** |
 | `serviceProxyHandler === calendarProxyHandler` | Calendar widget（endpoint 传入的是集成名称而非 API 路径） | 即使请求带了 endpoint 参数，**也跳过 mappings**，直接委托给 calendarProxyHandler 内部用 endpoint 去匹配 integrations 数组 |
 | 其他情况 | Sonarr、Radarr 等配置了 mappings 的标准 Widget | 继续执行下面的 endpoint 映射逻辑 |
 
@@ -514,7 +514,7 @@ export default function createUnifiProxyHandler({
 - `widget.version >= 6`（v6）：完全不同的流程——POST `/api/auth` 拿 `session.sid` → 缓存 sid（有效期为 API 返回的 validity 秒数）→ `X-FTL-SID` 请求头调业务 API → 手动字段映射，把 v6 响应格式转换为 v5 兼容格式返回前端
 - 前端组件不需要关心后端版本，数据接口统一
 
-#### 模式 C：登录态管理（401 自动重试）+ 多 API 聚合（走快速分支）
+#### 模式 C：登录态管理（401 自动重试）+ 多 API 聚合（FreshRSS 走 mapping 分支后进入自定义 proxy）
 
 **代表**：[freshrss/proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/freshrss/proxy.js)
 
