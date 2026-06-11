@@ -7,7 +7,7 @@
 │                        Next.js 应用层                            │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
 │  │  Pages SSR  │  │ API Routes  │  │     React Components    │  │
-│  │getStaticProps│ /api/theme   │  │ ResolvedIcon(核心)       │  │
+│  │getStaticProps│ custom.css/js │  │ ResolvedIcon(核心)       │  │
 │  └─────────────┘  └─────────────┘  └─────────────────────────┘  │
 ├─────────────────────────────────────────────────────────────────┤
 │                        Context 状态层                            │
@@ -62,11 +62,14 @@ images: {
 
 ```jsx
 <Head>
-  <link rel="manifest" href="/site.webmanifest?v=4" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <link rel="manifest" href="/site.webmanifest?v=4" crossOrigin="use-credentials" />
   <link rel="preload" href="/api/config/custom.css" as="style" />
   <link rel="stylesheet" href="/api/config/custom.css" />
 </Head>
 ```
+
+**manifest 链接跨域说明**：`<link rel="manifest">` 显式设置了 `crossOrigin="use-credentials"`，指示浏览器在请求 manifest.json 时携带凭证（cookies / HTTP auth），这对部署在需要鉴权的反向代理后的场景很重要。
 
 **用户自定义 CSS/JS**：通过 API Route 动态服务
 
@@ -82,23 +85,22 @@ const filePath = path.join(CONF_DIR, relativePath);
 **首页 Head 标签资源注入**：在 `src/pages/index.jsx` L409-L439
 
 ```jsx
-settings.favicon ? (
-  <>
-    <link rel="icon" href={settings.favicon} />
-    <link rel="apple-touch-icon" sizes="180x180" href={settings.favicon} />
-  </>
-) : (
-  <>
-    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png?v=4" />
-    <link rel="shortcut icon" href="/homepage.ico" />
-    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png?v=4" />
-    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png?v=4" />
-    <link rel="mask-icon" href="/safari-pinned-tab.svg?v=4" color="#1e9cd7" />
-  </>
-)
+<title>{initialSettings.title || "Homepage"}</title>
+<meta name="description" content={initialSettings.description || "..."} />
+{settings.disableIndexing && <meta name="robots" content="noindex, nofollow" />}
+{settings.base && <base href={settings.base} />}
+{/* favicon 处理：settings.favicon 优先，否则使用 public/ 下的静态文件 */}
+<meta name="msapplication-TileColor" content={themes[settings.color || "slate"][settings.theme || "dark"]} />
 <meta name="theme-color" content={themes[settings.color || "slate"][settings.theme || "dark"]} />
-<Script src="/api/config/custom.js" />
+<meta name="color-scheme" content="dark light" />
 ```
+
+viewport meta 不在 `_document.jsx`，而是在 `src/pages/_app.jsx` L80-L86 的 `<Head>` 中：
+```jsx
+<meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+```
+
+用户自定义 JS 通过 `next/script` 注入：`<Script src="/api/config/custom.js" />`
 
 **PWA manifest 动态生成**：`src/pages/site.webmanifest.jsx` L1-L46 通过 `getServerSideProps` 在服务端动态生成 manifest JSON，`theme_color` 和 `background_color` 取自 themes.js 对应当前色系+明暗模式的值。
 
@@ -244,8 +246,8 @@ img.onload → Canvas drawImage → canvas.toDataURL("image/x-icon")
 
 `src/utils/contexts/theme.jsx` L1-L46
 
-**初始化优先级**：
-1. 父组件传入 `initialTheme` prop
+**初始化优先级**（Provider 挂载时执行）：
+1. 父组件传入 `initialTheme` prop（当前 `_app.jsx` 未传）
 2. `localStorage["theme-mode"]` 持久化值
 3. 系统偏好：`window.matchMedia("(prefers-color-scheme: dark)")`
 4. 兜底默认：`"dark"`
@@ -279,8 +281,8 @@ const rawSetTheme = (rawTheme) => {
 
 `src/utils/contexts/color.jsx` L1-L45
 
-**初始化优先级**：
-1. 父组件传入 `initialTheme` prop
+**初始化优先级**（Provider 挂载时执行）：
+1. 父组件传入 `initialTheme` prop（当前 `_app.jsx` 未传）
 2. `localStorage["theme-color"]` 持久化值
 3. 兜底默认：`"slate"`
 
@@ -305,9 +307,9 @@ const rawSetColor = (rawColor) => {
 
 | 字段 | 用途 | 使用位置 |
 |------|------|---------|
-| `light` | 亮色模式下的主题色值 | HTML `<meta name="theme-color">`、PWA manifest、browserconfig.xml |
+| `light` | 亮色模式下的主题色值 | HTML `<meta name="theme-color">`/`msapplication-TileColor`、PWA manifest、browserconfig.xml |
 | `dark` | 暗色模式下的主题色值 | 同上 |
-| `iconStart` | 渐变起始色 | favicon.jsx 的 SVG 渐变（未接入） |
+| `iconStart` | 渐变起始色 | favicon.jsx 的 SVG 渐变（未接入页面） |
 | `iconEnd` | 渐变结束色 | 同上 |
 
 **CSS 变量注入文件**：`src/styles/theme.css`
@@ -361,39 +363,65 @@ darkMode: "class",
 
 ### 4.5 完整应用流程
 
-在 `src/pages/_app.jsx` L87-L96 中从外到内的 Provider 嵌套：
+**主题配置的数据来源**：
+- 配置文件：`config/settings.yaml` 中的 `theme` 和 `color` 字段
+- SSR 提取：`getStaticProps` → `getSettings()`（`src/utils/config/config.js`）直接在服务端读取 YAML → 得到 `initialSettings.color` / `initialSettings.theme`
+- ⚠️ `src/pages/api/theme.js` **未被任何页面调用**，仅在测试文件 `src/__tests__/pages/api/theme.test.js` 中被引用，不参与页面渲染流程
+
+**Provider 初始化（`src/pages/_app.jsx` L87-L96）**：
 
 ```
-ColorProvider → ThemeProvider → SettingsProvider → TabProvider → Page
+ColorProvider（无 initialTheme prop，走 localStorage → 默认 slate）
+  └─► ThemeProvider（无 initialTheme prop，走 localStorage → 系统偏好 → 默认 dark）
+       └─► SettingsProvider（接收 initialSettings prop）
+            └─► TabProvider
+                 └─► Wrapper（index.jsx 外层组件）
+                      └─► Home（index.jsx 内层组件）
 ```
 
-外层 Wrapper（`src/pages/index.jsx` L517-L593）负责同步 `<html>` 类名：
+**两层 `<html>` 类名同步**（确保首屏无闪烁 + 后续变更响应）：
 
-```javascript
-html.classList.toggle("dark", theme === "dark");
-html.classList.add(theme === "dark" ? "scheme-dark" : "scheme-light");
-
-const desiredThemeClass = `theme-${color || initialSettings.color || "slate"}`;
-html.classList.remove(...themeClassesToRemove);
-html.classList.add(desiredThemeClass);
-```
-
-**首页 settings → theme 同步**（`src/pages/index.jsx` L234-L247）：
+**① Wrapper 组件（`src/pages/index.jsx` L517-L563）**：挂载时和主题变化时直接操作 `document.documentElement.classList`
 
 ```javascript
 useEffect(() => {
-  if (settings.theme && theme !== settings.theme) setTheme(settings.theme);
-  if (settings.color && color !== settings.color) setColor(settings.color);
+  const html = document.documentElement;
+  html.classList.remove("dark", "scheme-dark", "scheme-light");
+  html.classList.toggle("dark", theme === "dark");
+  html.classList.add(theme === "dark" ? "scheme-dark" : "scheme-light");
+
+  const desiredThemeClass = `theme-${color || initialSettings.color || "slate"}`;
+  const themeClassesToRemove = Array.from(html.classList).filter(
+    (cls) => cls.startsWith("theme-") && cls !== desiredThemeClass,
+  );
+  if (themeClassesToRemove.length) html.classList.remove(...themeClassesToRemove);
+  if (!html.classList.contains(desiredThemeClass)) html.classList.add(desiredThemeClass);
+}, [theme, color, initialSettings.color /* 还有背景相关 */]);
+```
+
+Wrapper 中 theme 和 color 来自 Context（`useContext(ThemeContext/ColorContext)`），但 `initialSettings.color` 作为 Context 还未同步时的兜底值。
+
+**② Context 内部 rawSetTheme/rawSetColor**：每当 setTheme/setColor 被调用，useEffect 触发后也会同步 `<html>` 类名（见 4.1/4.2 节）。两处同步是冗余但安全的设计。
+
+**Home 组件 settings → Context 同步**（`src/pages/index.jsx` L234-L247）：
+
+```javascript
+useEffect(() => {
+  if (settings.theme && theme !== settings.theme) {
+    setTheme(settings.theme);
+  }
+  if (settings.color && color !== settings.color) {
+    setColor(settings.color);
+  }
 }, [settings, color, setColor, theme, setTheme]);
 ```
 
-**服务端 theme API**：`src/pages/api/theme.js` L1-L14：
-```javascript
-return res.status(200).json({
-  color: settings.color || "slate",
-  theme: settings.theme || "dark",
-});
-```
+这一步把来自 YAML 配置的主题设置"注入"到 Context，覆盖用户在 localStorage 中可能残留的旧值。
+
+**用户交互切换**：
+- 当 `settings.theme` 未设置时，页脚渲染 `ThemeToggle` 组件（`src/pages/index.jsx` L505）
+- 当 `settings.color` 未设置时，页脚渲染 `ColorToggle` 组件（`src/pages/index.jsx` L503）
+- Toggle 组件调用 Context 的 setTheme/setColor → 写入 localStorage + 同步 `<html>` 类名
 
 ### 4.6 背景图适配
 
@@ -403,7 +431,7 @@ return res.status(200).json({
 // settings.yaml 中的配置格式
 background: string | {
   image: string;
-  opacity: number;     // 0-100
+  opacity: number;     // 0-100，最终转换为 1 - opacity/100
   blur?: string;
   saturate?: number;
   brightness?: number;
@@ -562,11 +590,11 @@ export default function checkAndCopyConfig(config) {
 YAML 配置 / Docker K8s 自动发现
         │
         ▼
-  servicesResponse() / bookmarksResponse() / widgetsFromConfig()
-  [api-response.js / widget-helpers.js]
+  servicesResponse() / bookmarksResponse() / widgetsResponse()
+  [src/utils/config/api-response.js]
         │
         ▼
-  SWR Fallback (SSR 构建时预填)
+  getStaticProps() → SWR fallback (SSR 构建时预填)
         │
         ▼
   useSWR("/api/services") / useSWR("/api/bookmarks") / useSWR("/api/widgets")
@@ -595,29 +623,45 @@ YAML 配置 / Docker K8s 自动发现
 ### 6.2 主题切换数据流
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│ 用户操作: 点击 ThemeToggle / ColorToggle                     │
-│ 或 settings.yaml 中预设 theme/color                         │
-└──────────────────────────┬───────────────────────────────────┘
-                           ▼
-           setTheme() / setColor() [Context Provider]
-                           │
-            ┌──────────────┴──────────────┐
-            ▼                             ▼
-  localStorage["theme-mode"]     localStorage["theme-color"]
-  documentElement.classList     documentElement.classList
-  .dark / .light                .theme-{color}
-            │                             │
-            ▼                             ▼
-  globals.css 中 CSS 变量         theme.css 中 .theme-*
-  --bg-color / --scrollbar-*     12 级色阶变量 (--color-50 ~ 900)
-            │                             │
-            └──────────────┬──────────────┘
-                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ SSR 构建阶段:                                                    │
+│   getStaticProps() → getSettings() → initialSettings.color/theme│
+│   (直接读 config/settings.yaml，不经过任何 API)                  │
+└────────────────────────────┬────────────────────────────────────┘
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Provider 初始化 (_app.jsx):                                      │
+│   ColorProvider  → localStorage["theme-color"] 或 默认 "slate"  │
+│   ThemeProvider  → localStorage["theme-mode"]/系统偏好/默认 "dark"│
+│   SettingsProvider → 用 initialSettings 初始化 state            │
+└────────────────────────────┬────────────────────────────────────┘
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Wrapper 挂载 (index.jsx L517):                                   │
+│   useEffect → 同步 <html> 类名: .dark/.light + .theme-{color}   │
+│   (用 Context 值 + initialSettings.color 兜底)                   │
+└────────────────────────────┬────────────────────────────────────┘
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Home 组件同步 (index.jsx L234):                                  │
+│   useEffect: settings.theme/color → setTheme()/setColor()       │
+│   → Provider 内部 rawSet 函数再次同步 <html> 类名 + localStorage │
+└────────────────────────────┬────────────────────────────────────┘
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 用户交互切换 (仅当 settings 未预设 theme/color 时):               │
+│   ColorToggle / ThemeToggle → setColor/setTheme                 │
+│   → localStorage + <html> 类名同步                               │
+└────────────────────────────┬────────────────────────────────────┘
+                             ▼
+               theme.css / globals.css 中 CSS 变量生效
+                             │
+                             ▼
          Tailwind 原子类 bg-theme-700 / text-theme-200 / dark:...
          resolvedicon.jsx 中 mask 图标的 iconColor
          Logo Widget 降级 SVG 的 rgba(var(--color-logo-start/stop))
          ⚠️ favicon.jsx 未接入页面，不参与主题联动
+         ⚠️ /api/theme 未被任何页面调用，仅测试文件使用
 ```
 
 ---
@@ -627,12 +671,12 @@ YAML 配置 / Docker K8s 自动发现
 | 文件 | 职责 |
 |------|------|
 | `next.config.js` | Next.js 构建配置、远程图片白名单 |
-| `src/pages/_app.jsx` | 全局 Provider 嵌套、样式注入入口 |
-| `src/pages/_document.jsx` | SSR 文档模板、custom.css 预加载 |
-| `src/pages/index.jsx` | 首页主逻辑、SSR fallback、Head 资源注入 |
+| `src/pages/_app.jsx` | 全局 Provider 嵌套、viewport meta、SWR 全局配置、样式入口 |
+| `src/pages/_document.jsx` | SSR 文档模板、manifest（含 crossOrigin）、custom.css 预加载 |
+| `src/pages/index.jsx` | 首页主逻辑、Wrapper 层类名同步、getStaticProps、Head 资源注入 |
 | `src/pages/site.webmanifest.jsx` | PWA manifest 动态生成（含 theme_color） |
 | `src/pages/browserconfig.xml.jsx` | Windows 磁贴配置动态生成（含 TileColor） |
-| `src/pages/api/theme.js` | 服务端主题配置 API |
+| `src/pages/api/theme.js` | 主题配置 API（未接入页面，仅测试文件使用） |
 | `src/pages/api/config/[path].js` | custom.css/custom.js 动态服务 |
 | `src/components/resolvedicon.jsx` | 图标解析与渲染核心组件 |
 | `src/components/favicon.jsx` | 动态主题色 Favicon 生成（未接入页面） |
