@@ -111,7 +111,7 @@ apiData.MediaContainer.Directory[]               ← 库列表数组
 }
 ```
 
-> ⚠️ **类型不一致**：`streams` 直接赋值 `apiData.MediaContainer._attributes.size`，而 XML 属性在 `xml2json({ compact: true })` 后始终为字符串；`albums/movies/tv` 则通过 `parseInt(..., 10)` 转为数字。当 Plex 无活跃会话时 `apiData.MediaContainer` 可能不存在，`streams` 将保持 `undefined`。
+> ⚠️ **类型不一致**：`streams` 直接赋值 `apiData.MediaContainer._attributes.size`，XML 属性在 `xml2json({ compact: true })` 后始终为字符串；`albums/movies/tv` 则通过 `parseInt(..., 10)` 转为数字。当 Plex 无活跃会话时，API 仍返回带 `size="0"` 的完整 XML，`streams` 为字符串 `"0"`；仅当 API 调用失败或 XML 解析异常时 `streams` 才为 `undefined`。
 
 ### 2.3 Plex 字段映射
 
@@ -119,7 +119,7 @@ Plex 的字段映射完全在 `plexProxyHandler` **内部完成**，不依赖 `m
 
 | 输出字段 | API 来源 | 原始 XML 属性 | 取值方式 | 类型 |
 |---------|---------|-------------|---------|------|
-| `streams` | `/status/sessions` | `MediaContainer._attributes.size` | 直接赋值（proxy.js L84） | **string** 或 `undefined` |
+| `streams` | `/status/sessions` | `MediaContainer._attributes.size` | 直接赋值（proxy.js L84） | **string**（空闲时为 `"0"`，仅 API/解析异常时为 `undefined`） |
 | `movies` | `/library/sections/{movieKey}/all` | `MediaContainer._attributes[totalSize/size]` | `parseInt` 后累加（proxy.js L114） | **number** |
 | `tv` | `/library/sections/{showKey}/all` | 同上 | `parseInt` 后累加 | **number** |
 | `albums` | `/library/sections/{artistKey}/albums` | 同上 | `parseInt` 后累加 | **number** |
@@ -175,14 +175,14 @@ export default function Component({ service }) {
 
 ## 三、对比：同类媒体服务的协作差异
 
-Homepage 中有 4 个媒体服务 Widget，实现策略各有不同：
+Homepage 中有 4 个媒体服务 Widget，实现策略各有不同。下表按 Widget 维度横向对比：
 
-| Widget | API 格式 | Proxy 类型 | 映射方式 | 播放流展示 | 媒体计数展示 |
-|--------|---------|-----------|---------|-----------|-------------|
-| **Plex** | XML | 自定义 `plexProxyHandler` | Proxy 内部聚合 | ❌ 只显示数量 | ✅ 4 个 Block |
-| **Emby** | JSON | 通用 `genericProxyHandler` | `mappings` 声明式 | ✅ 进度条列表 | ✅ 4 个 Block（可选） |
-| **Jellyfin** | JSON | 自定义 `jellyfinProxyHandler`（加 Authorization 头） | `mappings` 声明式 + V1/V2 双版本 | ✅ 进度条列表 | ✅ 4 个 Block（可选） |
-| **Tautulli** | JSON（Plex 统计增强版） | 通用 `genericProxyHandler` | `mappings` 声明式 | ✅ 进度条列表 | ❌ |
+| Widget | API 格式 | Proxy 类型 | 映射方式 | 播放流展示 | 媒体计数展示 | 前端刷新频率 | 后端缓存 |
+|--------|---------|-----------|---------|-----------|-------------|------------|---------|
+| **Plex** | XML | 自定义 `plexProxyHandler` | Proxy 内部聚合（`unified`） | ❌ 只显示数量 | ✅ 4 个 Block（固定） | `5000ms`（统一） | `memory-cache`，libraries 6h，counts 10min |
+| **Emby** | JSON | 通用 `genericProxyHandler` | `mappings` 声明式 | ✅ 进度条列表 + 播放控制 | ✅ 4 个 Block（可选，`enableBlocks` 默认 false） | Sessions `5000ms` / Count `60000ms` | 无 |
+| **Jellyfin** | JSON | 自定义 `jellyfinProxyHandler`（加 Authorization 头） | `mappings` 声明式 + V1/V2 双版本 | ✅ 进度条列表 + 播放控制 | ✅ 4 个 Block（可选，`enableBlocks` 默认 false） | Sessions `5000ms` / Count `60000ms` | 无 |
+| **Tautulli** | JSON（Plex 统计增强版） | 通用 `genericProxyHandler` | `mappings` 声明式 | ✅ 进度条列表（无播放控制） | ❌ | `5000ms`（统一） | 无 |
 
 ### 3.1 Emby 典型映射模式：`src/widgets/emby/widget.js`
 
@@ -426,20 +426,20 @@ if (error) {
 
 ## 七、Plex "不显眼"的代码层面原因总结
 
-| 维度 | Plex | Emby/Jellyfin/Tautulli |
-|------|------|----------------------|
-| **流展示** | ❌ 只显示 streams 数字 | ✅ 有播放进度条、播放控制、标题滚动显示 |
-| **调用次数** | 1 次 `unified` 请求（proxy 内部聚合） | 2 次独立请求（Sessions + Count） |
-| **Proxy 复杂度** | 高（自定义 XML 处理 + 4 级缓存） | 低（通用 proxy 即可） |
-| **配置项** | 少（仅 fields/hideErrors 通用项） | 多（enableBlocks/enableNowPlaying/enableUser/showEpisodeNumber 等 6+） |
-| **渲染复杂度** | 4 Block 基础组件 | Block 列表 + 自定义 SessionEntry 组件 + 播放控制按钮 |
-| **Proxy 内部聚合** | ✅ 是 | ❌ 否，各自独立 endpoint |
-| **输出类型** | `streams` 为 string，其余为 number | 全部为 JSON 原生类型 |
+| 维度 | Plex | Emby/Jellyfin | Tautulli |
+|------|------|---------------|----------|
+| **流展示** | ❌ 只显示 streams 数字 | ✅ 有播放进度条、播放控制、标题滚动显示 | ✅ 有播放进度条、标题滚动显示 |
+| **调用次数** | 1 次 `unified` 请求（proxy 内部聚合 4~N 个 API） | 2 次独立请求（Sessions + Count） | 1 次请求（`get_activity`，不含计数） |
+| **Proxy 复杂度** | 高（自定义 XML 处理 + 4 键缓存） | 中（Jellyfin 需自定义 Header，Emby 通用 proxy 即可） | 低（通用 proxy 即可） |
+| **配置项** | 少（仅 fields/hideErrors 通用项） | 多（enableBlocks/enableNowPlaying/enableUser/showEpisodeNumber 等 6+） | 多（enableUser/showEpisodeNumber 等 3+） |
+| **渲染复杂度** | 4 Block 基础组件 | CountBlocks + 自定义 SessionEntry + 播放控制按钮 | 自定义播放条组件（无 Block） |
+| **Proxy 内部聚合** | ✅ 是 | ❌ 否，各自独立 endpoint | ❌ 否 |
+| **输出类型** | `streams` 为 string，其余为 number | 全部为 JSON 原生类型 | 全部为 JSON 原生类型 |
 
 从代码角度看，Plex Widget 的"不显眼"是**设计选择 + 技术限制的叠加**：
 - Plex 官方 API 返回 XML 且需要多库聚合，在 proxy 层做了大量复杂度隐藏
 - `/status/sessions` 虽然返回完整的 Session 列表，但 proxy 只取了 `_attributes.size`（活跃会话数量），丢弃了所有播放详情
-- 组件展示层保持了最简形式，与 Emby/Jellyfin 丰富的播放流 UI 形成鲜明对比
+- 组件展示层保持了最简形式，与 Emby/Jellyfin/Tautulli 丰富的播放流 UI 形成鲜明对比
 - 如果要让 Plex 也展示活跃播放流详情（类似 Tautulli），需要：
   1. 在 `plexProxyHandler` 中解析 `/status/sessions` 的完整 Session 详情（当前只用了 `_attributes.size`，见 proxy.js L84）
   2. 在 component 中增加类似 Emby 的 `SessionEntry` 渲染逻辑
@@ -562,10 +562,10 @@ t=6h     libraries 缓存过期，重新拉一次媒体库列表
 
 #### 8.2.2 关键配合要点
 
-1. **前端 5s × 后端 10min = 数据新鲜度不匹配**：
+1. **（Plex 特有）前端 5s × 后端 10min = 数据新鲜度不匹配**：
    - `streams` 字段真正做到了 5 秒级实时（因为 proxy 从不缓存它）
    - `movies/tv/albums` 每 5 秒从后端返回的都是同一个缓存值，直到 10 分钟过期才刷新
-   - 前端以为自己在"每 5 秒刷新全部数据"，但计数数据实际上最多 10 分钟才变一次
+   - 前端以为自己在"每 5 秒刷新全部数据"，但 Plex 的计数数据实际上最多 10 分钟才变一次
 
 2. **多实例缓存隔离**：
    - 缓存键格式为 `${cacheKey}.${service}.${index}`（proxy.js L87 等）
@@ -596,12 +596,12 @@ t=6h     libraries 缓存过期，重新拉一次媒体库列表
 
 | 字段 | Plex | Emby Count | Emby Sessions | Jellyfin Count | Tautulli |
 |---|---|---|---|---|---|
-| **电影数** | `movies: number`（parseInt） | `MovieCount: number`（原生 JSON） | — | `MovieCount: number` | — |
-| **剧集/节目** | `tv: number`（parseInt） | `SeriesCount: number` | — | `SeriesCount: number` | — |
-| **单集** | — | `EpisodeCount: number` | — | `EpisodeCount: number` | — |
-| **音乐/专辑** | `albums: number`（parseInt） | `SongCount: number` | — | `SongCount: number` | — |
-| **播放流数** | `streams: string`（xml2json） | — | `sessionsData.length`（JS 计算） | — | `sessions.length`（JS 计算） |
-| **流详情数组** | ❌ 无 | — | `session.NowPlayingItem` 对象 | — | `session` 对象 |
+| **电影数** | `movies: number`（`parseInt` 转换） | `MovieCount: number`（原生 JSON） | — | `MovieCount: number` | — |
+| **剧集/节目** | `tv: number`（`parseInt` 转换） | `SeriesCount: number`（原生 JSON） | — | `SeriesCount: number` | — |
+| **单集** | —（合并在 `tv` 中，未单独区分） | `EpisodeCount: number`（原生 JSON） | — | `EpisodeCount: number` | — |
+| **音乐/专辑** | `albums: number`（`parseInt` 转换） | `SongCount: number`（原生 JSON） | — | `SongCount: number` | — |
+| **播放流数** | `streams: string`（`xml2json` 直接赋值，空闲时为 `"0"`，仅 API 异常时为 `undefined`） | — | `sessionsData.length`（JS 运行时计算） | — | `sessions.length`（JS 运行时计算） |
+| **流详情数组** | ❌ 无（proxy 只取 `_attributes.size`，丢弃详情） | — | `session.NowPlayingItem` 对象 | — | `session` 对象 |
 
 #### 8.3.2 Plex 输出 JSON 样本
 
@@ -695,7 +695,7 @@ Jellyfin 的输出字段结构与 Emby 完全一致（MovieCount、SeriesCount �
 | **聚合方式** | Proxy 内部 4~N 个 API 聚合为 1 个 JSON | 2 个独立 endpoint，前端分别请求 | 1 个 endpoint 含全部 |
 | **类型一致性** | 不一致（streams 为 string，其余 number） | 一致（全是 JSON 原生类型） | 一致 |
 | **字段命名** | 简短英文单词（movies/tv） | PascalCase + Count 后缀 | snake_case |
-| **计数粒度** | movies + tv + albums（粗粒度，tv 是节目+单集混合） | Movie + Series + Episode + Song（细粒度） | 无计数字段 |
+| **计数粒度** | movies + tv + albums（粗粒度，tv 为 show 类型库条目总数，未区分剧集/单集） | Movie + Series + Episode + Song（细粒度，各字段明确分离） | 无计数字段 |
 | **流详情** | 丢弃，仅保留 size | 完整 NowPlayingItem + PlayState | 完整 sessions 数组 |
 
 ---
