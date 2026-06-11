@@ -553,3 +553,419 @@ const { data, error } = useWidgetAPI(widget, null, { refreshInterval });
 ### 9.3 WebSocket 实时更新
 
 对于需要实时更新的场景，可以考虑使用 Home Assistant 的 WebSocket API 替代轮询，减少不必要的请求。
+
+---
+
+## 十、自定义查询与字段过滤的交互关系
+
+### 10.1 两条配置通道的本质区别
+
+Home Assistant widget 存在两条影响"卡片最终展示内容"的配置通道，但它们**分处不同层级**，作用时机和影响范围完全不同：
+
+| 维度 | `custom` 自定义查询 | `fields` 字段过滤 |
+|------|---------------------|-------------------|
+| **作用层级** | 服务端（proxy.js） | 前端（Container） |
+| **影响对象** | 决定向 HA 发什么请求、返回哪些 `{label, value}` | 决定已返回的数据中哪些 Block 被渲染 |
+| **数据流位置** | 请求阶段（上游） | 渲染阶段（下游） |
+| **配置来源** | 原始 YAML（不经白名单过滤） | 经 `cleanServiceGroups` 白名单传递到前端 |
+| **默认值** | 3 个 template 查询（people_home / lights_on / switches_on） | `null`（不过滤，全部显示） |
+
+### 10.2 取舍机制：`fields` 优先于 `custom`
+
+[proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/widgets/homeassistant/proxy.js#L78-L89) 中的关键判断逻辑：
+
+```javascript
+let queries = defaultQueries;
+if (!widget.fields && widget.custom) {
+  // ...
+  queries = widget.custom.slice(0, 4);
+}
+```
+
+**条件分支解读：**
+
+```
+                widget.fields 存在？
+                     │
+          ┌──── 是 ──┴── 否 ────┐
+          │                      │
+   使用 defaultQueries    widget.custom 存在？
+   （3个默认模板查询）          │
+                          ┌─ 是 ─┴── 否 ──┐
+                          │                │
+                   使用 custom       使用 defaultQueries
+                   （最多4个自定义）   （3个默认模板查询）
+```
+
+**核心规则：`fields` 的存在会阻断 `custom` 的生效。**
+
+这是一个互斥设计：
+- 配了 `fields` → 服务端始终使用默认查询，前端 Container 负责过滤显示
+- 没配 `fields` 但配了 `custom` → 服务端使用自定义查询替代默认查询
+- 两个都没配 → 使用默认查询，前端显示全部 3 个 Block
+
+### 10.3 为什么 `fields` 会阻断 `custom`
+
+原因在于两条通道的数据格式匹配关系：
+
+1. **默认查询返回的 label** 是 i18n 键，如 `homeassistant.people_home`、`homeassistant.lights_on`
+2. **`fields` 过滤** 使用 `child.props.label` 与 `homeassistant.xxx` 进行匹配
+3. **`custom` 查询返回的 label** 由用户自定义，如 `sensor.temperature`、`Living Room`
+
+如果 `fields` 和 `custom` 同时生效，`fields` 中的值（如 `homeassistant.people_home`）将无法匹配 `custom` 查询返回的 label，导致所有 Block 被过滤掉，卡片内容为空。因此代码用 `!widget.fields` 做了互斥保护。
+
+### 10.4 四种配置组合的实际效果
+
+| 组合 | `fields` | `custom` | 服务端查询 | 前端展示 |
+|------|----------|----------|-----------|---------|
+| A（默认） | 无 | 无 | 3 个默认 template | 显示全部 3 个 Block |
+| B | 有 | 无 | 3 个默认 template | 只显示 fields 中列出的 Block |
+| C | 无 | 有 | 自定义查询（最多 4 个） | 显示全部自定义 Block |
+| D | 有 | 有 | 3 个默认 template | 只显示 fields 中列出的 Block（custom 被忽略！） |
+
+> ⚠️ **注意**：组合 D 是一个容易踩坑的场景——用户同时配了 `fields` 和 `custom`，期望自定义查询生效，但实际 `custom` 被完全忽略，只有默认查询 + fields 过滤在工作。
+
+### 10.5 返回数据到卡片内容的完整转化链
+
+```
+HA API 原始响应
+     │
+     ▼
+┌─────────────────────────────────────────────────┐
+│ proxy.js: output() 函数                         │
+│                                                 │
+│ Template 查询:                                  │
+│   HA 返回纯文本 → { label, value: text }        │
+│   例: { label: "homeassistant.people_home",     │
+│         value: "2 / 4" }                        │
+│                                                 │
+│ State 查询:                                     │
+│   HA 返回 JSON → formatOutput() 解析占位符      │
+│   例: { label: "Living Room",                   │
+│         value: "23.5 °C" }                      │
+└──────────────────────┬──────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────┐
+│ HTTP 响应: res.status(200).send([...])          │
+│ 返回 [{ label, value }, ...] 数组               │
+└──────────────────────┬──────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────┐
+│ useWidgetAPI: SWR 接收 JSON                     │
+│ data = [{ label, value }, ...]                  │
+└──────────────────────┬──────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────┐
+│ component.jsx: data?.map(d =>                   │
+│   <Block label={d.label} value={d.value} />     │
+│ )                                               │
+│ 每条数据生成一个 Block 子元素                     │
+└──────────────────────┬──────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────┐
+│ Container: fields 过滤                           │
+│                                                 │
+│ if (fields && type) {                           │
+│   visibleChildren = children.filter(child =>    │
+│     fields.some(field => {                      │
+│       fullField = field.includes(".")           │
+│         ? field                                 │
+│         : `${type}.${field}`                    │
+│       return fullField === child.props.label    │
+│     })                                          │
+│   )                                             │
+│ }                                               │
+│                                                 │
+│ 对于 HA widget:                                 │
+│   fields: ["people_home"]                       │
+│   → 匹配 "homeassistant.people_home"            │
+│   → 只保留匹配的 Block                          │
+└──────────────────────┬──────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────┐
+│ Block: 最终渲染                                  │
+│ <div> value (翻译后的 label) </div>              │
+│ label 通过 t() 翻译函数显示                      │
+└─────────────────────────────────────────────────┘
+```
+
+### 10.6 Container 字段过滤的匹配规则
+
+[Container](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/components/services/widget/container.jsx#L34-L63) 的过滤逻辑核心：
+
+```javascript
+visibleChildren = childrenArray?.filter((child) =>
+  fields.some((field) => {
+    let fullField = field;
+    if (!field.includes(".")) {
+      fullField = `${type}.${field}`;
+    }
+    let matches = fullField === (child?.props?.field || child?.props?.label);
+    // ...
+    return matches;
+  }),
+);
+```
+
+**对于 Home Assistant widget 的匹配规则：**
+
+| `fields` 中的值 | 自动补全为 | 匹配 `child.props.label` |
+|-----------------|-----------|------------------------|
+| `"people_home"` | `"homeassistant.people_home"` | `homeassistant.people_home` ✅ |
+| `"homeassistant.people_home"` | `"homeassistant.people_home"` | `homeassistant.people_home` ✅ |
+| `"lights_on"` | `"homeassistant.lights_on"` | `homeassistant.lights_on` ✅ |
+
+**关键细节：**
+- HA 的 `component.jsx` 创建 `<Block label={d.label} />` 时没有传 `field` prop
+- 因此 Container 匹配时使用 `child.props.label`，即 proxy.js 返回的 `label` 值
+- 如果 custom 查询的 label 是 `"Living Room"`，fields 中必须写完整的 `"homeassistant.Living Room"` 才能匹配——但这基本不可行，这就是互斥设计的根本原因
+
+---
+
+## 十一、错误与空值的传递路径
+
+### 11.1 错误传递的完整链路
+
+错误可以在多个层级产生，每层的传递方式不同：
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ 1. 服务端: proxy.js                                          │
+│                                                              │
+│ 场景 A: group/service 缺失                                   │
+│   → res.status(400).json({ error: "Invalid proxy service" })│
+│                                                              │
+│ 场景 B: widget 配置不存在                                    │
+│   → res.status(400).json({ error: "Invalid proxy service" })│
+│                                                              │
+│ 场景 C: custom JSON 解析失败                                 │
+│   → res.status(400).json({ error: "Error parsing widget..." })│
+│                                                              │
+│ 场景 D: HA API 请求失败 (httpProxy 返回 error)               │
+│   → res.status(status).send(data)                           │
+│   其中 data = { error: { message, url, rawError } }         │
+│                                                              │
+│ 场景 E: HA API 返回非 200 状态码                             │
+│   → results.map 中: { label: status, value: data.toString() }│
+│   注意: 这不会触发前端错误! 而是作为"正常数据"返回            │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│ 2. SWR + useWidgetAPI: 错误提取                              │
+│                                                              │
+│ return { data, error: data?.error ?? error }                 │
+│                                                              │
+│ 场景 A/B/C/D: HTTP 状态码非 200                              │
+│   → SWR 的 fetcher 抛出错误                                  │
+│   → error 非 null                                            │
+│                                                              │
+│ 场景 E: HTTP 200 但数据含非 200 状态码                       │
+│   → data = [{ label: 404, value: "..." }]                   │
+│   → error = null (SWR 认为请求成功)                          │
+│   → 卡片会正常渲染，但显示异常的 label/value                  │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│ 3. component.jsx: 错误分支                                   │
+│                                                              │
+│ if (error) {                                                 │
+│   return <Container service={service} error={error} />;      │
+│ }                                                            │
+│ → 有错误时不渲染任何数据 Block，只渲染 Error 组件             │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│ 4. Container: 错误展示决策                                   │
+│                                                              │
+│ if (error) {                                                 │
+│   if (settings.hideErrors || service.widget.hide_errors) {   │
+│     return null;  ← 全局或 widget 级别隐藏错误               │
+│   }                                                          │
+│   return <Error service={service} error={error} />;          │
+│ }                                                            │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 11.2 错误的界面表现
+
+[Error 组件](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/components/services/widget/error.jsx) 的渲染逻辑：
+
+```javascript
+// 错误对象归一化
+if (typeof error === "string") error = { message: error };
+else if (typeof error === "number") error = { message: `Error ${error}` };
+if (error?.data?.error) error = error.data.error;
+```
+
+最终在界面上显示一个可展开的红色详情面板，包含：
+- API 错误消息（`error.message`）
+- 请求 URL（`error.url`，已脱敏）
+- 原始错误（`error.rawError`）
+- 响应数据（`error.data`）
+
+### 11.3 空值与加载状态
+
+| data 状态 | Component / Block 行为 | 视觉效果 |
+|-----------|------------------------|---------|
+| `undefined`（SWR 首次加载中） | `data?.map` 不执行，Container 收到空 children | 容器存在但没有 Block，不会出现单个 Block 的脉冲动画 |
+| `null` | `data?.map` 不执行 | 容器存在但没有 Block |
+| `[]`（空数组） | map 无迭代 | 容器存在但没有 Block |
+| `[{ label, value: undefined }]` | 会创建 value 为 `undefined` 的 Block | value 区域显示 `"-"`，整个 Block 有 `animate-pulse` 脉冲动画 |
+| `[{ label, value: "" }]` | value 为空字符串 | value 区域显示空字符串（非 `"-"`） |
+
+**注意**：[Block](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/components/services/widget/block.jsx#L41-L48) 的加载脉冲动画只在单个 Block 的 `value === undefined` 时触发；SWR 首次加载阶段通常还没有 `data` 数组，因此不会先渲染出占位 Block。`null` 值会显示 `"-"` 但没有脉冲效果：
+
+```javascript
+className={classNames(
+  "bg-theme-200/50 ...",
+  value === undefined ? "animate-pulse" : "",  // 脉冲动画
+)}
+// ...
+<div className="font-thin text-sm">
+  {value === undefined || value === null ? "-" : value}  // 占位符
+</div>
+```
+
+### 11.4 服务端部分成功的特殊行为
+
+[proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/widgets/homeassistant/proxy.js#L91-L104) 的结果处理：
+
+```javascript
+const err = results.find((r) => r.result[2]?.error);
+if (err) {
+  return res.status(status).send(data);  // 全部失败
+}
+
+return res.status(200).send(
+  results.map((r) => {
+    const [status, , data] = r.result;
+    return status === 200
+      ? r.output(data)                         // 成功：正常 { label, value }
+      : { label: status, value: data.toString() };  // 非200：label=状态码
+  }),
+);
+```
+
+**这意味着：**
+- 3 个默认查询中，如果 1 个返回 404（实体不存在），但 `result[2]` 无 `error` 属性
+- 整体请求仍返回 200
+- 该查询在卡片上显示为 `label: 404, value: "Not Found"` 之类的文本
+- 用户看到的是一个显示异常的 Block，而不是错误提示
+
+---
+
+## 十二、定时刷新与配置重载的更新差异
+
+### 12.1 两种更新机制对比
+
+| 维度 | 定时刷新 (SWR refreshInterval) | 配置重载 (hash + revalidate) |
+|------|-------------------------------|------------------------------|
+| **触发条件** | 每 60 秒自动触发 | 配置文件内容变更时触发 |
+| **影响范围** | 单个 widget 的数据 | 整个页面 |
+| **更新内容** | 重新请求 `/api/services/proxy` | 重新请求 `/api/services`（服务列表）+ 页面硬刷新 |
+| **组件生命周期** | 不卸载，仅 data 更新 | 组件完全卸载并重新挂载 |
+| **SWR 缓存** | 保留（stale-while-revalidate） | 清空（页面刷新后 SWR 缓存丢失） |
+| **视觉反馈** | 无闪烁，数据静默替换 | 页面显示加载中 → 完整重新渲染 |
+| **触发文件** | [component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/widgets/homeassistant/component.jsx#L9) | [index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/pages/index.jsx#L110-L131) + [hash.js](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/pages/api/hash.js) + [revalidate.js](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/pages/api/revalidate.js) |
+
+### 12.2 定时刷新的精确行为
+
+```
+SWR refreshInterval: 60000 (60秒)
+     │
+     ├─ 每 60 秒 SWR 自动发起 revalidate
+     │   → fetch("/api/services/proxy?group=...&service=...&index=0")
+     │
+     ├─ 请求期间：
+     │   ├─ 旧数据仍然显示（stale-while-revalidate）
+     │   └─ 无加载指示器
+     │
+     ├─ 请求成功：
+     │   ├─ data 更新 → Component re-render
+     │   ├─ Block 的 value 更新
+     │   └─ 无视觉闪烁（React diff 更新）
+     │
+     └─ 请求失败：
+         ├─ error 变为非 null
+         ├─ Container 切换到 Error 组件
+         └─ 数据 Block 消失，显示错误面板
+         （下次 60 秒后如果恢复，error 变 null，数据恢复显示）
+```
+
+**关键点：**
+- SWR 的 `refreshInterval` 只在组件挂载后生效，触发的是同一个代理 URL 的重新验证
+- 代理接口每次执行都会通过服务端配置重新定位 widget，所以 `custom`、`url`、`key` 以及服务端用于取舍查询的 `fields` 可能在下一次代理请求中被感知
+- 前端已经拿到的 widget 对象不会因定时刷新而更新，因此 `fields` 的界面过滤、`hide_errors` 和高亮配置等前端行为仍要等服务列表重新获取或整页重载后才同步
+
+### 12.3 配置重载的精确行为
+
+```
+配置文件修改 (services.yaml, settings.yaml 等)
+     │
+     ▼
+hash.js 检测到文件内容变化
+→ 计算新的 SHA256 hash
+     │
+     ▼
+index.jsx 中的 useEffect 检测 hash 变化
+→ localStorage 中旧 hash !== 新 hash
+→ setStale(true) → 显示加载动画
+→ fetch("/api/revalidate") → Next.js ISR 重新生成页面
+→ window.location.reload() → 整页硬刷新
+     │
+     ▼
+页面重新加载
+→ getStaticProps 重新执行
+→ servicesResponse() 重新获取（含 cleanServiceGroups）
+→ 新的 SWR fallback 数据
+→ 组件完全重新挂载
+→ useWidgetAPI 重新发起首次请求
+```
+
+**关键点：**
+- 配置重载是"全有或全无"的——无法只重载某个 widget
+- `hash.js` 监控的文件列表：`docker.yaml`、`settings.yaml`、`services.yaml`、`bookmarks.yaml`、`widgets.yaml`、`custom.css`、`custom.js`
+- 页面挂载和 SWR 默认重新验证会读取 `/api/hash`，窗口聚焦时还会显式调用 `mutateHash()` 再查一次
+- 因此配置变更通常在页面初次加载、窗口重新聚焦或 SWR 重新验证 hash 时被发现，而不是 Home Assistant widget 的 60 秒数据刷新直接触发整页重载
+
+### 12.4 两种刷新分别触发哪些更新
+
+| 更新内容 | 定时刷新 (60s) | 配置重载 |
+|---------|:---:|:---:|
+| HA 实体状态值（如温度、开关数） | ✅ | ✅ |
+| 服务端查询配置（`custom` / `url` / `key` 变更） | ✅ | ✅ |
+| 服务端用于取舍 custom 的 `fields` 是否存在 | ✅ | ✅ |
+| 前端 `fields` 过滤配置变更 | ❌ | ✅ |
+| 前端 `hide_errors` 配置变更 | ❌ | ✅ |
+| 前端 `highlight` 高亮配置变更 | ❌ | ✅ |
+| 服务增减/重排 | ❌ | ✅ |
+| 新增/删除 widget | ❌ | ✅ |
+| `refreshInterval` 变更 | ❌ | ✅ |
+
+**解释：**
+- 定时刷新只重新调用 `/api/services/proxy`，服务端会重新读取原始服务配置，所以 `custom`、`url`、`key` 以及服务端判断 `fields` 是否存在的分支会在代理请求中更新
+- 但前端的 widget 对象来自 `/api/services`，定时刷新不会重新获取服务列表；因此 `fields` 真正过滤哪些 Block、错误是否隐藏、高亮规则等前端行为只能通过服务列表刷新或整页重载同步
+- 这造成了一个不对称：改 `custom` 可能在下一次代理刷新后生效；改 `fields` 可能先影响服务端查询取舍，但前端过滤规则要等配置重载后才和服务端一致
+
+### 12.5 窗口聚焦触发的双重效果
+
+当用户切回浏览器标签页时，两件事同时发生：
+
+1. **SWR 的 `revalidateOnFocus`（默认开启）**：
+   - 对 `/api/services/proxy` 发起 revalidate
+   - 相当于一次定时刷新，只更新数据值
+
+2. **`mutateHash()`**（[index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/pages/index.jsx#L104-L108) 手动调用）：
+   - 重新请求 `/api/hash`
+   - 如果 hash 变了，触发整页重载
+   - 如果 hash 没变，无额外效果
+
+所以窗口聚焦 = 数据刷新 + 配置变更检测，两者叠加确保了用户切回页面时总能看到最新状态。
