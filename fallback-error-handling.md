@@ -186,21 +186,103 @@ if (errorInfo) {
 
 **恢复时机**：每次 HTTP 请求都会重新执行整个解析链路，无需手动恢复。
 
-### 5.2 gzip 解压 Fallback
+### 5.2 gzip/deflate 解压 Fallback（⚠️ 实际存在逻辑缺陷）
 
-**异常来源**：某些服务返回的 gzip 响应不完整或格式错误，`zlib.createUnzip()` 触发 `error` 事件。
+**异常来源**：某些服务返回的 gzip/deflate 响应不完整或格式错误（截断、魔数错误、校验和失败），`zlib.createUnzip()` Transform 流触发 `error` 事件。
 
-**降级分支**：[utils/proxy/http.js#L47-L52](file:///d:/fz/0601/solo-dogfeeding/code/209-homepage/src/utils/proxy/http.js#L47-L52)
+#### 代码执行时序（按行号展开）
+[utils/proxy/http.js#L33-L62](file:///d:/fz/0601/solo-dogfeeding/code/209-homepage/src/utils/proxy/http.js#L33-L62)
 
 ```javascript
-responseContent.on("error", (e) => {
-  if (e) logger.error(e);
-  responseContent = response; // fallback：切回原始未解压流
+const request = requestor.request(url, params, (response) => {  // response = 原始 HTTP IncomingMessage
+  const data = [];                                               // 步骤 0：data 闭包数组
+  const contentEncoding = response.headers["content-encoding"]?.trim().toLowerCase();
+
+  let responseContent = response;                                // 步骤 1：responseContent = 原始 response（引用 A）
+  if (contentEncoding === "gzip" || contentEncoding === "deflate") {
+    responseContent = createUnzip({ ... });                      // 步骤 2：responseContent = unzip Transform（引用 B）
+
+    // zlib errors
+    responseContent.on("error", (e) => {                         // 步骤 3：在【引用 B 对象】上挂 error 监听
+      if (e) logger.error(e);
+      responseContent = response;                                // 步骤 E-1：修改变量引用（仅局部变量，无效！）
+    });
+    response.pipe(responseContent);                              // 步骤 4：response.pipe(unzip B) —— 原始数据永远流入 unzip！
+  }
+
+  responseContent.on("data", (chunk) => {                        // 步骤 5：在【引用 B 对象】上挂 data 监听
+    data.push(chunk);
+  });
+
+  responseContent.on("end", () => {                              // 步骤 6：在【引用 B 对象】上挂 end 监听
+    addCookieToJar(url, response.headers);
+    resolve([response.statusCode, response.headers["content-type"], Buffer.concat(data), response.headers]);
+  });
 });
-response.pipe(responseContent);
 ```
 
-**效果**：解压失败 → 直接使用原始响应体（可能是压缩的二进制，上层 JSON.parse 会再失败，但不会崩溃）。
+#### 问题 1：事件监听器挂在哪？
+- `responseContent` 在步骤 2 被赋值为 **unzip Transform 流对象（引用 B）**
+- 步骤 5 的 `responseContent.on("data", ...)` 和步骤 6 的 `responseContent.on("end", ...)` **注册在引用 B 上**，不是变量名上
+- 步骤 3 的 error 监听同样注册在引用 B 上
+- 关键点：**监听器是绑在对象实例上的，一旦绑定就与变量名无关**
+
+#### 问题 2：`responseContent = response` 能接管原始响应吗？
+**答案：不能。这是一个无效赋值，原因有三：**
+
+| 层级 | 原因 | 后果 |
+|------|------|------|
+| ① 监听器不迁移 | 步骤 E-1 只改了变量 `responseContent` 的指向，**引用 B 上已绑定的 data/end 监听器不会迁移到原始 response（引用 A）** | error 后触发的数据事件仍然只有 unzip 能收到，原始 response 没人监听 |
+| ② pipe 已执行 | 步骤 4 `response.pipe(responseContent)` 此时 pipe 的目标是 unzip。`pipe()` 会调用 `readable.resume()`，**将原始 response 切换到 flowing 模式**，所有数据块会自动写入 unzip | 原始 response 的数据已经"被消费"，无法被二次读取或重新监听 |
+| ③ error 事件后 Transform 行为 | Node.js `zlib.createUnzip()` 在 emit `error` 后，内部状态变为 errored，后续 `_transform` 不再处理数据。按照 Stream 规范，error 后可继续 emit `end`/`close`，但数据完整性无法保证 | 若 data 数组只收到部分解压数据 → 最终 `Buffer.concat(data)` 是**残缺内容** |
+
+#### 实际后果（不同场景）
+```
+场景 A：响应头正确，但 body 完全不是 gzip 魔数（0x1f 8b）
+  → unzip 在收到第一块数据时立即 emit error
+  → data 数组：空数组
+  → 后续：unzip 可能 emit end（取决于内部实现）
+  → 最终 resolve：Buffer.concat([]) = 空 Buffer <Buffer >
+  → 上层拿到的是空内容，而不是原始压缩字节
+
+场景 B：gzip 数据中间截断（服务器断连）
+  → unzip 已解压部分数据写入 data[]
+  → 遇到截断数据 emit error
+  → 最终 resolve：部分解压成功的残缺字符串（可能是乱码）
+  → 上层 JSON.parse 失败，但不会拿到原始压缩字节
+
+场景 C：gzip 完整，但校验和（CRC32）错误（传输中比特翻转）
+  → unzip 解压完所有数据 emit data
+  → 流结束时校验失败 emit error
+  → 最终 resolve：完整解压数据（zlib 通常在 end 前已把数据吐出）
+  → 这是唯一"碰巧正确"的场景
+```
+
+#### 测试盲区验证
+[utils/proxy/http.test.js#L367-L398](file:///d:/fz/0601/solo-dogfeeding/code/209-homepage/src/utils/proxy/http.test.js#L367-L398) 中 `logs when gzip decoding emits an error` 用例：
+
+```javascript
+createUnzip: () => {
+  const pt = new PassThrough();           // 用 PassThrough 冒充 unzip
+  pt.on("pipe", () => {
+    queueMicrotask(() => {
+      pt.emit("error", new Error("bad gzip"));
+      pt.end();                            // 手动 end 保证 Promise 不挂起
+    });
+  });
+  return pt;
+}
+// 断言只检查：expect(logger.error).toHaveBeenCalled()
+// ❌ 未检查 data 是否正确回退到原始压缩字节
+```
+
+测试用 **PassThrough（全透传）代替真实 zlib Transform**，且手动调用了 `end()`，回避了真实场景下"流是否会自然 emit end"的问题。断言也只验证了日志被打，**没有验证内容正确性**。
+
+#### 恢复时机
+- **此 fallback 不可恢复**：当前实现下 `responseContent = response` 不产生任何实际效果。Promise 能否 resolve 取决于 unzip 在 error 后是否 emit end：
+  - PassThrough / 手动 end：能 resolve（内容可能是残缺/空）
+  - 真实 zlib Gunzip：通常会 emit end 跟随在 error 之后（Node.js zlib 实现了 `_flush` 后的清理），但内容无保证
+- **真正的恢复**在下一次 HTTP 请求（重试/刷新页面）时，会重新发起请求，不依赖上一次流状态
 
 ### 5.3 HTTP 请求异常兜底
 
