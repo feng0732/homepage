@@ -542,13 +542,31 @@ return res.status(200).send(
 
 ### 9.2 刷新间隔可配置化
 
-目前 60 秒是硬编码的，可以从 widget 配置中读取：
+目前 60 秒是硬编码的。要真正让 refreshInterval 生效，需要改动**两处**（详细分析见第 12.1 节）：
+
+**第一处** — [service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/utils/config/service-helpers.js) 的 `cleanServiceGroups` 中，在 `type === "homeassistant"` 分支（或所有 widget 的通用段）把白名单解构出的 `refreshInterval` 赋到前端 widget 对象：
 
 ```javascript
-// component.jsx
-const refreshInterval = widget.refreshInterval || 60000;
-const { data, error } = useWidgetAPI(widget, null, { refreshInterval });
+// service-helpers.js cleanServiceGroups 中新增
+if (type === "homeassistant") {
+  if (refreshInterval) widget.refreshInterval = refreshInterval;
+}
 ```
+
+**第二处** — [component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/widgets/homeassistant/component.jsx#L9) 从 widget 读取而非使用字面量：
+
+```javascript
+// component.jsx 第 9 行
+const { data, error } = useWidgetAPI(
+  widget,
+  null,
+  { refreshInterval: widget.refreshInterval ?? 60000 },
+);
+```
+
+只改其中任一处都无效：
+- 只改第一处 → 前端 widget 有了值，但组件不用
+- 只改第二处 → 组件想读，但 widget.refreshInterval 为 undefined
 
 ### 9.3 WebSocket 实时更新
 
@@ -625,7 +643,62 @@ if (!widget.fields && widget.custom) {
 
 > ⚠️ **注意**：组合 D 是一个容易踩坑的场景——用户同时配了 `fields` 和 `custom`，期望自定义查询生效，但实际 `custom` 被完全忽略，只有默认查询 + fields 过滤在工作。
 
-### 10.5 返回数据到卡片内容的完整转化链
+### 10.5 两类配置归属与影响侧别逐字段核查
+
+这是本分析中最关键的发现——每一类配置在代码中通过**不同的路径**传递，影响着不同的执行层面：
+
+#### A. `custom` 自定义查询（纯服务端配置）
+
+| 核查项 | 证据 | 结论 |
+|--------|------|------|
+| 是否在 `cleanServiceGroups` 白名单中解构 | [service-helpers.js#L256-L261](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/utils/config/service-helpers.js#L256-L261)：白名单里只有 `fields, hideErrors, highlight, type`，**没有 `custom`** | 前端 widget 对象中 **不存在** `custom` 字段 |
+| 是否在前端组件中被引用 | `component.jsx`、`Container`、`Block` 中均无 `custom` 引用 | 前端完全不可见 |
+| 服务端读取路径 | `getServiceWidget` → `getServiceItem` → `servicesFromConfig()` → `parseServicesToGroups()`，这是**原始 YAML 解析结果**，没有经过 `cleanServiceGroups`，所以包含完整的 `custom` | 服务端 **可读** |
+| 服务端引用节点 | [proxy.js#L79](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/widgets/homeassistant/proxy.js#L79)：`if (!widget.fields && widget.custom)` | 只在服务端影响查询取舍 |
+| 定时刷新能否感知 `custom` 变更 | 每次代理请求都重新 `getServiceWidget()`，即重读原始 YAML | ✅ 定时刷新 **可以** 感知 |
+| 配置重载（hash）是否必须 | 不需要——改完 `custom`，最多等 60 秒下一次定时刷新即生效 | ❌ 不依赖配置重载 |
+
+**结论：`custom` 是 100% 的服务端配置，前端完全感知不到它的存在。**
+
+#### B. `fields` 字段过滤（前后端两端存在，影响两个不同层面）
+
+| 核查项 | 证据 | 结论 |
+|--------|------|------|
+| 是否在 `cleanServiceGroups` 白名单中解构 | [service-helpers.js#L258](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/utils/config/service-helpers.js#L258)：`fields` 在白名单中；[#L453](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/utils/config/service-helpers.js#L453)：`fields: fieldsList \|\| null` | 前端 widget 对象中 **存在** `fields` 字段 |
+| 服务端读取路径 | `getServiceWidget` 返回原始配置，包含完整的 `fields` | 服务端 **可读** |
+| 服务端引用节点（影响查询取舍） | [proxy.js#L79](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/widgets/homeassistant/proxy.js#L79)：`if (!widget.fields && widget.custom)` → `widget.fields` 只要不是 `null/false/undefined/""` 就会阻断 `custom` | 服务端层面：`fields` 决定用 defaultQueries 还是 custom |
+| 前端引用节点（影响展示过滤） | [container.jsx#L35-L63](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/components/services/widget/container.jsx#L35-L63)：`if (fields && type) { visibleChildren = childrenArray.filter(...) }` | 前端层面：`fields` 决定哪些 Block 被渲染 |
+| 定时刷新能否感知 `fields` 变更（服务端侧） | 代理请求每次重读原始 YAML，`fields` 变更（从有到无/从无到有）会影响 `!widget.fields` 分支判断 | ✅ 服务端的查询取舍 **可以** 在定时刷新中感知 |
+| 定时刷新能否感知 `fields` 变更（前端侧） | 前端 widget 对象来自 `/api/services`（`cleanServiceGroups` 处理结果），`useWidgetAPI` 只发代理请求，**不** 重新获取服务列表 | ❌ 前端的过滤规则 **不会** 在定时刷新中同步，必须等配置重载（整页刷新） |
+| 配置重载（hash）是否必须 | 服务端查询取舍：不需要；前端过滤规则：必须 | **不对称** |
+
+**结论：`fields` 是少数"跨两侧"的配置项——同一个字段，服务端和前端各读一份，做不同的事情。这是不对称行为的根源。**
+
+#### C. `refreshInterval` 刷新间隔（代码核查：完全不可配置）
+
+| 核查项 | 证据 | 结论 |
+|--------|------|------|
+| HA 组件是否从 `widget` 读取 | [component.jsx#L9](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/widgets/homeassistant/component.jsx#L9)：`useWidgetAPI(widget, null, { refreshInterval: 60000 })` —— 字面量 60000，**没有** 读取 `widget.refreshInterval` | 组件侧硬编码 |
+| `cleanServiceGroups` 是否为 HA 传递 `refreshInterval` | [service-helpers.js#L337-L338](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/utils/config/service-helpers.js#L337-L338) 白名单声明行注释：`// glances, customapi, iframe, prometheusmetric`；实际设置：仅 [#L532](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/utils/config/service-helpers.js#L532)（iframe）、[#L603](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/utils/config/service-helpers.js#L603)（glances）、[#L620](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/utils/config/service-helpers.js#L620)（customapi）、[#L679](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/utils/config/service-helpers.js#L679)（prometheusmetric）——**`homeassistant` 不在其中** | 即使 YAML 写了 `refreshInterval`，也不会传到前端 widget 对象 |
+| YAML 配了 `refreshInterval` 是否生效 | 两条通路都堵了：前端传不到、组件也不读 | ❌ **完全不可配置，永远是 60000ms（60 秒）** |
+| 配置重载能否改变 refreshInterval | 不能——重载了也还是硬编码 60000 | ❌ |
+| 其他 widget 如何做（参考） | glances：`const { ..., refreshInterval = defaultInterval } = widget;` 然后传入 useWidgetAPI；customapi：`const { ..., refreshInterval = 10000 } = widget;`；iframe：自己实现 `setInterval` 而非 SWR | HA 组件缺少这一层读取逻辑 |
+
+#### D. 三类配置横向对比汇总
+
+下表的“HA 代理实际使用”指 Home Assistant 代理处理器是否读取并影响请求逻辑；不是指原始 YAML 在服务端是否能被解析。
+
+| 配置项 | HA 代理实际使用 | 前端可见 | 服务端影响 | 前端影响 | 定时刷新可感知变更 | 需配置重载生效 | YAML 可配置 |
+|--------|:---:|:---:|---------|---------|:---:|:---:|:---:|
+| `custom` | ✅ | ❌ | 用自定义查询替代默认查询 | 无 | ✅ | ❌ | ✅ |
+| `fields` | ✅ | ✅ | 阻断 custom 生效（用默认查询） | 过滤 Block 展示 | 服务端✅/前端❌ | **仅前端侧需要** | ✅ |
+| `url` | ✅ | ❌ | HA 实例地址 | 无 | ✅ | ❌ | ✅ |
+| `key` | ✅ | ❌ | Bearer Token 鉴权 | 无 | ✅ | ❌ | ✅ |
+| `hideErrors` / `hide_errors` | ❌ | ✅ | 无 | 是否隐藏错误面板 | ❌ | ✅ | ✅ |
+| `highlight` | ❌ | ✅ | 无 | Block 颜色高亮 | ❌ | ✅ | ✅ |
+| `refreshInterval` | — | — | — | — | — | — | ❌（硬编码 60s） |
+
+### 10.6 返回数据到卡片内容的完整转化链
 
 ```
 HA API 原始响应
@@ -862,9 +935,52 @@ return res.status(200).send(
 
 ---
 
-## 十二、定时刷新与配置重载的更新差异
+## 十二、定时刷新、配置重载与 refreshInterval 的真实关系
 
-### 12.1 两种更新机制对比
+### 12.1 核心澄清：refreshInterval 对 HA 组件是硬编码，不可配置
+
+先给出明确结论，再分析两者的更新行为。
+
+**代码核查结论：Home Assistant 卡片的刷新间隔当前版本**（代码在 [component.jsx#L9](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/widgets/homeassistant/component.jsx#L9)）**中是硬编码的字面量 `60000`（60 秒），无法通过 YAML 配置改变。**
+
+两条通路都堵死了：
+
+1. **`cleanServiceGroups` 不为 HA 传递 `refreshInterval` 到前端**：
+   - 白名单解构行 [service-helpers.js#L337-L338](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/utils/config/service-helpers.js#L337-L338) 注释写的是 `// glances, customapi, iframe, prometheusmetric`
+   - 实际执行赋值的位置：`iframe`（#L532）、`glances`（#L603）、`customapi`（#L620）、`prometheusmetric`（#L679）——没有 `homeassistant` 分支
+   - 所以即便在 YAML 里写了 `refreshInterval: 10000`，前端 widget 对象中也**没有** 这个属性
+
+2. **HA 组件自身也不读取 `widget.refreshInterval`**：
+   ```javascript
+   // homeassistant/component.jsx 第 9 行
+   useWidgetAPI(widget, null, { refreshInterval: 60000 })
+   //                                        ^^^^^^^
+   //                                   字面量 60000，不是 widget.refreshInterval
+   ```
+
+**与其他 widget 的对比**（说明缺失了什么逻辑）：
+
+```
+customapi 组件（可配置 refreshInterval）:
+  const { mappings = [], refreshInterval = 10000, display = "block" } = widget;
+  const { data } = useWidgetAPI(widget, null, {
+    refreshInterval: Math.max(1000, refreshInterval),
+  });
+
+glances 组件（可配置 refreshInterval）:
+  const { ..., refreshInterval = defaultInterval } = widget;
+  useWidgetAPI(widget, "info", { refreshInterval, ... });
+
+homeassistant 组件（不可配置）:
+  useWidgetAPI(widget, null, { refreshInterval: 60000 });
+  //                                        ↑ 硬编码
+```
+
+> 💡 **要让 refreshInterval 可配置**，需同时改动两处：
+> 1. 在 `service-helpers.js` 的 `cleanServiceGroups` 中新增 `if (type === "homeassistant")` 分支，将 `refreshInterval` 赋到 widget 对象
+> 2. 在 `homeassistant/component.jsx` 第 9 行改为 `useWidgetAPI(widget, null, { refreshInterval: widget.refreshInterval ?? 60000 })`
+
+### 12.2 两种更新机制对比
 
 | 维度 | 定时刷新 (SWR refreshInterval) | 配置重载 (hash + revalidate) |
 |------|-------------------------------|------------------------------|
@@ -948,12 +1064,13 @@ index.jsx 中的 useEffect 检测 hash 变化
 | 前端 `highlight` 高亮配置变更 | ❌ | ✅ |
 | 服务增减/重排 | ❌ | ✅ |
 | 新增/删除 widget | ❌ | ✅ |
-| `refreshInterval` 变更 | ❌ | ✅ |
+| **`refreshInterval` 变更** | ❌ | ❌（**完全不可配置**，见 12.1） |
 
 **解释：**
 - 定时刷新只重新调用 `/api/services/proxy`，服务端会重新读取原始服务配置，所以 `custom`、`url`、`key` 以及服务端判断 `fields` 是否存在的分支会在代理请求中更新
 - 但前端的 widget 对象来自 `/api/services`，定时刷新不会重新获取服务列表；因此 `fields` 真正过滤哪些 Block、错误是否隐藏、高亮规则等前端行为只能通过服务列表刷新或整页重载同步
 - 这造成了一个不对称：改 `custom` 可能在下一次代理刷新后生效；改 `fields` 可能先影响服务端查询取舍，但前端过滤规则要等配置重载后才和服务端一致
+- **`refreshInterval` 特殊说明**：当前版本硬编码为 60 秒（第 12.1 节详述），改 YAML 的 `refreshInterval` 对 HA widget 没有任何效果，无论定时刷新还是配置重载都不能改变它
 
 ### 12.5 窗口聚焦触发的双重效果
 
