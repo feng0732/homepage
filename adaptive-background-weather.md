@@ -1325,3 +1325,368 @@ OpenMeteo 的策略意味着天气描述的翻译质量取决于项目自身的�
 │ (1000-1282)     │   │ (200-804)           │   │ (0-99 WMO)      │
 └─────────────────┘   └─────────────────────┘   └─────────────────┘
 ```
+---
+
+## 九、密钥与缓存边界深度剖析
+
+### 9.1 私有密钥清洗链路
+
+天气组件的 API 密钥不会暴露给前端，而是通过「清洗 → 索引回查」的机制在服务端安全获取。
+
+#### 9.1.1 完整清洗流程
+
+**第一步：读取原始配置 — [widgetsFromConfig()](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/utils/config/widget-helpers.js#L8-L27)**
+
+```javascript
+const widgetsArray = widgets.map((group, index) => ({
+  type: Object.keys(group)[0],
+  options: {
+    index,                              // 添加数组索引
+    ...group[Object.keys(group)[0]],   // 展开所有配置（含 apiKey 等敏感字段）
+  },
+}));
+```
+
+- 将 YAML 中的键值对转换为 `{ type, options }` 结构
+- **`index` 字段由 YAML 数组位置决定**，是后续回查的关键
+- 此时 `options` 中包含完整的敏感信息（`apiKey`、`password` 等）
+
+**第二步：清洗敏感字段 — [cleanWidgetGroups()](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/utils/config/widget-helpers.js#L29-L54)**
+
+```javascript
+// 要删除的私有字段
+["username", "password", "key", "apiKey"].forEach((pO) => {
+  if (optionKeys.includes(pO)) {
+    delete sanitizedOptions[pO];
+  }
+});
+
+// 非 search/glances 类型还要删除 url
+if (widget.type !== "search" && widget.type !== "glances" && optionKeys.includes("url")) {
+  delete sanitizedOptions.url;
+}
+
+// 重新添加 index
+return {
+  type: widget.type,
+  options: {
+    index,
+    ...sanitizedOptions,
+  },
+};
+```
+
+清洗规则：
+- **始终删除**：`username`、`password`、`key`、`apiKey`
+- **条件删除**：非 `search` / `glances` 类型的 `url`
+- **始终保留**：`index`（即使原始配置中没有，也会重新附加）
+
+**第三步：发送给前端 — [widgetsResponse()](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/utils/config/api-response.js#L73-L85)**
+
+```javascript
+export async function widgetsResponse() {
+  configuredWidgets = cleanWidgetGroups(await widgetsFromConfig());
+  return configuredWidgets;
+}
+```
+
+前端通过 `/api/widgets` 拿到的就是清洗后的数据，**不含任何密钥**。
+
+#### 9.1.2 索引回查机制
+
+当后端 API handler 需要获取密钥时，通过 `type + index` 回查原始配置：
+
+**回查函数 — [getPrivateWidgetOptions()](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/utils/config/widget-helpers.js#L56-L78)**
+
+```javascript
+export async function getPrivateWidgetOptions(type, widgetIndex) {
+  const widgets = await widgetsFromConfig();  // 重新读取原始配置！
+
+  const privateOptions = widgets.map((widget) => {
+    const { index, url, username, password, key, apiKey } = widget.options;
+    return {
+      type: widget.type,
+      options: { index, url, username, password, key, apiKey },  // 只提取私有字段
+    };
+  }) || {};
+
+  // 通过 type + index 定位具体 widget
+  return type !== undefined && widgetIndex !== undefined
+    ? privateOptions.find((o) => 
+        o.type === type && o.options.index === parseInt(widgetIndex, 10)
+      )?.options
+    : privateOptions;
+}
+```
+
+> **注意**：`getPrivateWidgetOptions()` 内部调用了 `widgetsFromConfig()`，这意味着**每次天气 API 请求都会重新读取一次 widgets.yaml 文件**。这是一个潜在的性能瓶颈。
+
+**回查链路**：
+
+```
+前端 SWR 请求 /api/widgets/weather?index=0&latitude=...
+         │
+         ▼
+后端 handler 调用 getPrivateWidgetOptions("weatherapi", "0")
+         │
+         ▼
+widgetsFromConfig() 重新读取 widgets.yaml
+         │
+         ▼
+遍历数组，找到 type === "weatherapi" 且 index === 0 的 widget
+         │
+         ▼
+返回其 apiKey 等私有字段
+```
+
+**索引的准确性**：
+- `index` 是 widget 在 `widgets.yaml` 数组中的位置（0-based）
+- `widgetsFromConfig()` 和 `cleanWidgetGroups()` 都会重新生成 index
+- 只要 YAML 数组顺序不变，index 就稳定
+- 但如果用户在中间插入/删除 widget，后面所有 widget 的 index 都会变化
+
+### 9.2 provider fallback 异常边界分析
+
+WeatherAPI 和 OpenWeatherMap 的 API handler 都有一套 `provider` 参数的 fallback 逻辑，其边界条件较为微妙。
+
+#### 9.2.1 完整决策树
+
+以 WeatherAPI 为例 — [weather.js#L10-L25](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/pages/api/widgets/weather.js#L10-L25)
+
+```
+有 apiKey（来自 widget 私有配置）?
+   ├─ 是 → 直接使用，跳过所有 provider 校验
+   └─ 否 → 继续判断
+            │
+            ├─ 连 provider 参数都没有 → 400 "Missing API key or provider"
+            │
+            ├─ 有 provider，但 provider !== "weatherapi" → 400 "Invalid provider for endpoint"
+            │
+            └─ provider === "weatherapi" → 尝试从 settings.providers.weatherapi 取
+                     │
+                     ├─ 取到了 → 使用
+                     └─ 没取到 → 400 "Missing API key"
+```
+
+#### 9.2.2 关键边界点
+
+| 场景 | 行为 | 代码位置 |
+|------|------|---------|
+| widget 内联 `apiKey` 存在 | **忽略 provider 参数**，直接使用内联 key | 第7-8行 |
+| 无内联 key，也无 `provider` 参数 | 返回 400 "Missing API key or provider" | 第10-12行 |
+| 无内联 key，`provider` 是错误值 | 返回 400 "Invalid provider for endpoint" | 第14-16行 |
+| 无内联 key，`provider` 正确，但 settings 中也没有 | 返回 400 "Missing API key" | 第18-25行 |
+| 有内联 key 但同时有错误的 provider | **正常工作**，因为第一步就取到了 key，不会校验 provider | 隐含逻辑 |
+
+**测试验证**：[weather.test.js](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/__tests__/pages/api/widgets/weather.test.js) 覆盖了上述四种主要场景。
+
+#### 9.2.3 provider 参数从哪来
+
+前端组件的 SWR 请求使用的是 `...options` 展开，`options` 来自 `widgets.yaml` 配置。由于 `provider` 不是敏感字段（不在清洗列表中），所以：
+
+- 如果用户在 `widgets.yaml` 中配置了 `provider: weatherapi`，它会被传递到后端
+- 如果没有配置，就不会传 `provider` 参数，此时必须依赖 widget 内联的 `apiKey`
+
+> **容易混淆的设计**：`provider` 参数的主要作用是**触发 fallback 到 settings.yaml 的全局密钥**，而不是"选择 provider 类型"。因为每个 API endpoint 只对应一种 provider（如 `/api/widgets/weather` 只处理 weatherapi）。
+
+### 9.3 静态地区与浏览器定位的优先级与覆盖
+
+#### 9.3.1 初始化顺序与状态变化
+
+以 OpenMeteo 组件为例 — [openmeteo.jsx#L58-L95](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/components/widgets/openmeteo/openmeteo.jsx#L58-L95)
+
+```javascript
+// 初始 state
+const [location, setLocation] = useState(false);  // false = 未获取
+
+// 渲染期同步设置（关键！在函数体中直接执行）
+if (!location && options.latitude && options.longitude) {
+  setLocation({ latitude: options.latitude, longitude: options.longitude });
+}
+
+// useEffect 中检查是否需要动态获取
+useEffect(() => {
+  if (!options.latitude && !options.longitude && typeof navigator !== "undefined") {
+    // 只有静态坐标不存在时，才会尝试浏览器定位
+    navigator.permissions?.query(...).then(...);
+  }
+}, [options.latitude, options.longitude, requestLocation]);
+```
+
+#### 9.3.2 执行时序详解
+
+**场景 A：有静态配置（latitude/longitude 在 widgets.yaml 中）**
+
+```
+首次渲染
+   │
+   ├─ useState(false) → location = false
+   │
+   ├─ 进入 if 判断：!false && options.latitude && options.longitude → true
+   │      └─ setLocation({ lat, lng })  ← 同步触发 state 更新
+   │         （注意：这是在渲染函数中调用 setState，容易造成一次额外渲染）
+   │
+   ├─ 此时 location 仍是 false（当次渲染中 state 不会立即更新）
+   │      └─ 走 if (!location) 分支 → 显示授权按钮？
+   │
+   ▼
+React 检测到 state 变化 → 触发第二次渲染
+   │
+   ├─ location = { lat, lng }  ← 有值了
+   │
+   ├─ 再次进入 if 判断：!location → false，跳过
+   │
+   ├─ 运行 useEffect：!options.latitude → false，直接跳过
+   │      └─ 不会请求浏览器定位
+   │
+   └─ 渲染内部 Widget 组件，发起 API 请求
+```
+
+> **注意**：首次渲染时 `location` 还是 `false`，所以会先渲染一次授权按钮，然后立即因为 state 更新而重渲染为天气数据。这会导致一次额外的初始渲染和可能的闪烁。
+
+**场景 B：无静态配置，依赖浏览器定位**
+
+```
+首次渲染
+   │
+   ├─ useState(false) → location = false
+   │
+   ├─ 进入 if 判断：!false && options.latitude → false（无配置）
+   │      └─ 不设置 location
+   │
+   ├─ if (!location) → true
+   │      └─ 显示授权按钮（ContainerButton）
+   │
+   ▼
+useEffect 执行
+   │
+   ├─ 条件：!options.latitude && !options.longitude → true
+   │
+   ├─ navigator.permissions.query()
+   │      ├─ "granted" → requestLocation() → 静默获取 → setLocation → 重渲染
+   │      └─ 其他状态 → 保持显示授权按钮，等用户点击
+   │
+   ▼
+用户点击授权按钮 → requestLocation() → 获取成功 → setLocation → 重渲染 → 显示天气
+```
+
+#### 9.3.3 优先级结论
+
+| 优先级 | 位置来源 | 触发条件 | 备注 |
+|-------|---------|---------|------|
+| 1（最高） | widgets.yaml 静态配置 | `options.latitude && options.longitude` 存在 | 直接使用，不会尝试浏览器定位 |
+| 2 | 浏览器定位（已授权） | 无静态配置 + 权限已授予 | 组件挂载后自动静默获取 |
+| 3（最低） | 浏览器定位（用户点击） | 无静态配置 + 权限未授予 | 用户点击授权按钮后触发 |
+
+**不会出现的情况**：静态配置 + 浏览器定位同时生效。因为有静态配置时，`useEffect` 的条件 `!options.latitude && !options.longitude` 为假，根本不会执行定位逻辑。
+
+### 9.4 客户端缓存键 vs 服务端缓存键
+
+#### 9.4.1 客户端 SWR 缓存键
+
+SWR 的缓存键就是请求的完整 URL，由 `useSWR(url)` 中的 `url` 决定。
+
+**WeatherAPI 客户端缓存键示例**：
+```
+/api/widgets/weather?lang=zh-Hans&latitude=39.9&longitude=116.4&units=metric&cache=5&provider=weatherapi&index=0&label=Beijing&format[maximumFractionDigits]=1
+```
+
+**OpenMeteo 客户端缓存键示例**：
+```
+/api/widgets/openmeteo?latitude=39.9&longitude=116.4&units=metric&cache=5&timezone=Asia%2FShanghai&index=0&label=Beijing&format[maximumFractionDigits]=1
+```
+
+**影响客户端缓存键的参数**：
+
+| 参数 | WeatherAPI | OpenWeatherMap | OpenMeteo | 说明 |
+|------|-----------|----------------|-----------|------|
+| `latitude` | ✅ | ✅ | ✅ | 纬度 |
+| `longitude` | ✅ | ✅ | ✅ | 经度 |
+| `lang` | ✅ | ✅ | ❌ | 语言（OpenMeteo 不传） |
+| `units` | ✅ | ✅ | ✅ | 单位 |
+| `cache` | ✅ | ✅ | ✅ | 缓存 TTL（仅传参，不影响键的语义） |
+| `provider` | ✅ | ✅ | ❌ | provider 标识 |
+| `index` | ✅ | ✅ | ✅ | widget 索引 |
+| `label` | ✅ | ✅ | ✅ | 显示标签（纯展示，但在 URL 中） |
+| `format` | ✅ | ✅ | ✅ | 数字格式配置 |
+| `timezone` | ❌ | ❌ | ✅ | 时区（仅 OpenMeteo） |
+
+> 注意：`label`、`format`、`cache` 这些不影响 API 响应内容的参数也会出现在缓存键中，意味着**不同显示配置会产生不同的缓存条目**，即使返回的天气数据完全一样。
+
+#### 9.4.2 服务端 cachedRequest 缓存键
+
+服务端缓存键是**第三方 API 的完整 URL**，由 API handler 构造。
+
+**WeatherAPI 服务端缓存键**：
+```
+http://api.weatherapi.com/v1/current.json?q=39.9,116.4&key=from-widget&lang=zh
+```
+
+**OpenWeatherMap 服务端缓存键**：
+```
+https://api.openweathermap.org/data/2.5/weather?lat=39.9&lon=116.4&appid=from-widget&units=metric&lang=zh
+```
+
+**OpenMeteo 服务端缓存键**：
+```
+https://api.open-meteo.com/v1/forecast?latitude=39.9&longitude=116.4&daily=sunrise,sunset&current_weather=true&temperature_unit=celsius&timezone=Asia/Shanghai
+```
+
+#### 9.4.3 两层缓存键的差异对比
+
+| 维度 | 客户端 SWR 缓存键 | 服务端 cachedRequest 缓存键 |
+|------|------------------|---------------------------|
+| **缓存位置** | 浏览器内存 | 服务器内存（memory-cache） |
+| **键构成** | 内部 API URL + 所有 options 参数 | 第三方 API 完整 URL |
+| **包含密钥** | ❌ 不含 | ✅ **包含**（apiKey/appid 在 URL 中） |
+| **包含 index** | ✅ 包含 | ❌ 不包含 |
+| **包含 label** | ✅ 包含 | ❌ 不包含 |
+| **包含 format** | ✅ 包含 | ❌ 不包含 |
+| **包含 cache** | ✅ 包含（作为参数值） | ❌ 不包含（只影响 TTL） |
+| **包含 provider** | ✅ 包含 | ❌ 不包含 |
+| **缓存失效** | 页面刷新、组件卸载 | 内存缓存过期（TTL）、服务重启 |
+| **缓存粒度** | 更细（每个显示配置一份） | 更粗（相同 API 参数共享） |
+
+#### 9.4.4 缓存穿透与重复请求
+
+**完整的请求链路与缓存检查点**：
+
+```
+用户刷新页面 / 聚焦窗口
+        │
+        ▼
+  SWR 触发 revalidate
+   （检查客户端缓存）
+        │
+        ├─ 命中且新鲜 → 直接返回（不发请求）
+        │
+        └─ 不命中 / 需 revalidate → 发起 fetch 请求
+                  │
+                  ▼
+           /api/widgets/openmeteo?...
+                  │
+                  ▼
+           后端 API handler
+                  │
+                  ▼
+           cachedRequest(apiUrl, cache)
+            （检查服务端缓存）
+                  │
+                  ├─ 命中 → 直接返回（不请求第三方）
+                  │
+                  └─ 不命中 → 请求第三方 API → 存入服务端缓存 → 返回
+                           │
+                           ▼
+                    存入 SWR 客户端缓存
+```
+
+**两层缓存的协作**：
+- SWR 缓存防止**重复的客户端请求**（如快速切标签页）
+- 服务端缓存防止**重复的第三方 API 请求**（如多用户访问同一地点）
+- 两层缓存的 TTL 独立：SWR 由 `refreshInterval`（未设置则永不主动过期，只在 revalidate 时更新），服务端由 `cache` 参数控制
+
+**潜在问题**：
+- 客户端缓存键包含 `label`、`format` 等展示参数，导致相同天气数据被多份缓存
+- `apiKey` 出现在服务端缓存键中，如果不同用户使用不同的 key（如多租户场景），即使查询同一地点也无法共享缓存
+- `getPrivateWidgetOptions()` 每次请求都重新读取文件，可能成为高并发下的瓶颈
+
