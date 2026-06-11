@@ -61,7 +61,7 @@ switch (config?.mode) {
 
 配置项中 `ingress`、`traefik`、`gateway` 三个布尔开关分别控制三种资源类型的采集。
 
-**`checkCRD(name, kc, logger)`** — 检查 CustomResourceDefinition 是否存在（用于 Traefik 和 Gateway API 检测），通过 `ApiextensionsV1Api.readCustomResourceDefinitionStatus` 查询，403 时提示 RBAC 权限不足。
+**`checkCRD(name, kc, logger)`** — 检查 CustomResourceDefinition 是否存在，仅用于 Traefik IngressRoute 采集前的 CRD 存在性判断。通过 `ApiextensionsV1Api.readCustomResourceDefinitionStatus` 查询，403 时提示 RBAC 权限不足。Gateway API 的 HTTPRoute 采集不使用此检查，而是直接按 namespace 查询，查询失败时静默返回 null。
 
 ### 2.3 注解常量定义
 
