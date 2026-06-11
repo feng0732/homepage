@@ -7,7 +7,7 @@
 │                        Next.js 应用层                            │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
 │  │  Pages SSR  │  │ API Routes  │  │     React Components    │  │
-│  │ getStaticProps │ /api/theme  │  │ ResolvedIcon / Favicon  │  │
+│  │getStaticProps│ /api/theme   │  │ ResolvedIcon(核心)       │  │
 │  └─────────────┘  └─────────────┘  └─────────────────────────┘  │
 ├─────────────────────────────────────────────────────────────────┤
 │                        Context 状态层                            │
@@ -48,12 +48,11 @@
 关键配置文件：[next.config.js](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/next.config.js#L1-L19)
 
 ```javascript
-// 允许的远程图片域名白名单
 images: {
   remotePatterns: [
     { protocol: "https", hostname: "cdn.jsdelivr.net" },
   ],
-  unoptimized: true, // 禁用Next.js图片优化，使用原始URL
+  unoptimized: true,
 }
 ```
 
@@ -71,39 +70,45 @@ images: {
 
 **用户自定义 CSS/JS**：通过 API Route 动态服务
 
-[pages/api/config/[path].js](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/api/config/%5Bpath%5D.js#L1-L34)
+[[path].js](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/api/config/%5Bpath%5D.js#L1-L34)
 
 ```javascript
-// 仅允许 custom.css 和 custom.js
+// 仅允许 custom.css 和 custom.js 两种文件
 if (!["custom.css", "custom.js"].includes(relativePath)) {
   return res.status(422).end("Unsupported file");
 }
-// 从 config/ 目录读取文件内容并返回对应 MIME 类型
 const filePath = path.join(CONF_DIR, relativePath);
 ```
 
-**首页 Head 标签资源注入**：在 [pages/index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx#L407-L439)
+**首页 Head 标签资源注入**：在 [index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx#L409-L439)
 
 ```jsx
-// 自定义 favicon 优先，否则使用默认 public/ 下的图标
+// favicon 处理：settings.favicon 配置优先，否则使用 public/ 下的静态文件
 settings.favicon ? (
-  <link rel="icon" href={settings.favicon} />
+  <>
+    <link rel="icon" href={settings.favicon} />
+    <link rel="apple-touch-icon" sizes="180x180" href={settings.favicon} />
+  </>
 ) : (
   <>
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png?v=4" />
     <link rel="shortcut icon" href="/homepage.ico" />
-    <link rel="mask-icon" href="/safari-pinned-tab.svg?v=4" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png?v=4" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png?v=4" />
+    <link rel="mask-icon" href="/safari-pinned-tab.svg?v=4" color="#1e9cd7" />
   </>
 )
-// 注入 meta theme-color，动态绑定当前主题色
 <meta name="theme-color" content={themes[settings.color || "slate"][settings.theme || "dark"]} />
-// 注入用户自定义 JS
 <Script src="/api/config/custom.js" />
 ```
 
+**PWA manifest 动态生成**：[site.webmanifest.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/site.webmanifest.jsx#L1-L46) 通过 `getServerSideProps` 在服务端动态生成 manifest JSON，`theme_color` 和 `background_color` 取自 themes.js 对应当前色系+明暗模式的值。
+
+**browserconfig.xml 动态生成**：[browserconfig.xml.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/browserconfig.xml.jsx#L1-L28) 同理动态生成，`<TileColor>` 取自 `themes[color][theme]`。
+
 ### 2.3 字体资源
 
-[src/styles/manrope.css](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/styles/manrope.css) 定义 Manrope 字体的 `@font-face` 规则，字体文件存放在 `src/styles/font/` 下（`.ttf` 和 `.woff2` 格式），通过构建打包到静态产物中。
+[manrope.css](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/styles/manrope.css) 定义 Manrope 字体的 `@font-face` 规则，字体文件存放在 `src/styles/font/` 下（`.ttf` 和 `.woff2` 格式），通过构建打包到静态产物中。
 
 ---
 
@@ -111,19 +116,18 @@ settings.favicon ? (
 
 ### 3.1 核心解析组件：ResolvedIcon
 
-所有服务卡片、书签、小组件的图标统一通过 [components/resolvedicon.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/resolvedicon.jsx#L1-L153) 解析渲染。
+[resolvedicon.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/resolvedicon.jsx#L1-L153) 是整个图标系统的统一入口，负责将字符串形式的图标标识解析为具体的渲染结果。
 
-**图标解析优先级（从上到下匹配）：**
+**图标解析优先级（从上到下依次匹配，先命中先返回）：**
 
 | 优先级 | 匹配规则 | 图标源 | 渲染方式 | 示例 |
 |--------|----------|--------|----------|------|
-| 1 | `http://` 或 `/` 开头 | 直接 URL / 本地路径 | `<Image />` | `https://example.com/logo.png` |
-| 2 | `sh-` 前缀 | selfhst/icons (GitHub+jsDelivr) | `<Image />` | `sh-plex.svg`、`sh-jellyfin.webp`、`sh-sonarr` |
-| 3 | `mdi-` 前缀 | @mdi/svg (Material Design Icons) | CSS mask + 主题色填充 | `mdi-home`、`mdi-cog#ff0000` |
-| 4 | `si-` 前缀 | simple-icons (品牌图标) | CSS mask + 主题色填充 | `si-github`、`si-docker#2496ed` |
-| 5 | `.svg` 后缀 | homarr-labs/dashboard-icons (svg/) | `<Image />` | `plex.svg` |
-| 6 | `.webp` 后缀 | homarr-labs/dashboard-icons (webp/) | `<Image />` | `plex.webp` |
-| 7 | `.png` 后缀 或 默认 | homarr-labs/dashboard-icons (png/) | `<Image />` | `plex.png`、`radarr` |
+| 1 | `http` 开头 或 `/` 开头 | 直接 URL / 本地路径 | Next `<Image />` | `https://example.com/logo.png`、`/icons/x.png` |
+| 2 | `sh-` 前缀 | selfhst/icons (GitHub+jsDelivr) | Next `<Image />` | `sh-plex.svg`、`sh-jellyfin.webp`、`sh-sonarr`（无后缀默认 png） |
+| 3 | `mdi-` / `si-` 前缀 | @mdi/svg 或 simple-icons (npm+jsDelivr) | CSS mask + 主题色填充 | `mdi-home`、`si-github`、`mdi-home-#ff00ff` |
+| 4 | `.svg` 后缀 | homarr-labs/dashboard-icons (svg/) | Next `<Image />` | `plex.svg` |
+| 5 | `.webp` 后缀 | homarr-labs/dashboard-icons (webp/) | Next `<Image />` | `plex.webp` |
+| 6 | 其他（含 `.png` 或无后缀） | homarr-labs/dashboard-icons (png/) | Next `<Image />` | `plex.png`、`radarr` |
 
 **图标集 CDN 基础 URL 映射**：
 
@@ -134,77 +138,102 @@ const iconSetURLs = {
 };
 // selfhst/icons
 `https://cdn.jsdelivr.net/gh/selfhst/icons@main/${extension}/${iconName}.${extension}`
-// dashboard-icons (svg/webp/png)
+// dashboard-icons (svg/webp/png 三种后缀对应不同子目录)
 `https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/${type}/${iconName}.${type}`
 ```
 
+**⚠️ 优先级判断细节**：prefix 提取逻辑为 `icon.split("-")[0]`（[L35](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/resolvedicon.jsx#L35)），因此只要图标字符串以 `mdi-` 或 `si-` 开头就会进入 mask 渲染分支，即使后续部分含有点号。而 `.svg` / `.webp` 后缀判断只在 `prefix in iconSetURLs` 不匹配时才走到。
+
 ### 3.2 MDI/SI 图标颜色映射机制
 
-**mdi-/si- 前缀图标不直接渲染 `<img>`，而是使用 CSS mask 技术实现动态变色**：
+**mdi-/si- 前缀图标不渲染 `<img>`，而是使用 CSS mask 技术实现动态着色**：
 
 ```jsx
-// resolvedicon.jsx L66-L96
+// resolvedicon.jsx L84-L95
 <div style={{
+  width, height,
+  maxWidth: "100%", maxHeight: "100%",
   background: `${iconColor}`,  // 颜色层
-  mask: `url(${iconSource}) no-repeat center / contain`,        // 图标形状遮罩
+  mask: `url(${iconSource}) no-repeat center / contain`,
   WebkitMask: `url(${iconSource}) no-repeat center / contain`,
 }} />
 ```
 
-**颜色决策流程**：
+**颜色决策流程（三级优先）**：
 
-1. **自定义十六进制颜色**：图标名尾部匹配 `#RRGGBB`，如 `mdi-home#ff5733`，直接使用该颜色
+1. **自定义十六进制颜色**：图标名尾部匹配 `#RRGGBB` 后缀
+   - 正则：`/[#][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9]$/i`（[L75](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/resolvedicon.jsx#L75)）
+   - **仅支持 6 位十六进制**，不支持 3 位简写（如 `#f00`），不支持 alpha 通道（如 `#ff000080`）
+   - 格式为图标名后追加连字符+hex：如 `mdi-home-#ff00ff`、`si-github-#2496ed`
+   - 匹配后从 iconName 中去除 `-{colorMatches[0]}` 部分，iconColor 直接使用 hex 字符串
 2. **settings.iconStyle === "theme"**：根据明暗模式选择色阶
    - 暗色模式：`rgb(var(--color-300) / var(--tw-text-opacity, 1))`
    - 亮色模式：`rgb(var(--color-900) / var(--tw-text-opacity, 1))`
-3. **默认 logo 渐变**：使用主题渐变色
+3. **默认（其他 iconStyle 值或未设置）**：使用主题渐变色
    - `linear-gradient(180deg, rgb(var(--color-logo-start)), rgb(var(--color-logo-stop)))`
 
-### 3.3 图标使用入口
+### 3.3 ResolvedIcon 的全部实际使用入口
 
-**Service 卡片**：[components/services/item.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/services/item.jsx#L44-L60)
+经代码搜索，[resolvedicon.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/resolvedicon.jsx) 在以下 **7 个组件**中被 import 和使用（不含测试文件）：
+
+| 组件 | 文件 | 使用方式 | 图标尺寸 |
+|------|------|---------|---------|
+| Service 卡片 | [services/item.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/services/item.jsx#L54-L58) | `<ResolvedIcon icon={service.icon} />` | 默认 32×32 |
+| Service 分组标题 | [services/group.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/services/group.jsx#L44-L47) | `<ResolvedIcon icon={layout.icon} />` | 默认 32×32（容器 w-7 h-7） |
+| Bookmark 卡片 | [bookmarks/item.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/bookmarks/item.jsx#L30-L42) | `<ResolvedIcon icon={bookmark.icon} alt={bookmark.abbr} />` | iconOnly 时 w-7 h-7；标准时 w-5 h-5 |
+| Bookmark 分组标题 | [bookmarks/group.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/bookmarks/group.jsx#L40-L43) | `<ResolvedIcon icon={layout.icon} />` | 默认 32×32（容器 w-7 h-7） |
+| 快速启动搜索结果 | [quicklaunch.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/quicklaunch.jsx#L307) | `<ResolvedIcon icon={r.icon} />` | 默认 32×32（容器 w-5） |
+| Logo 信息 Widget | [widgets/logo/logo.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/widgets/logo/logo.jsx#L15) | `<ResolvedIcon icon={options.icon} width={48} height={48} />` | 48×48 |
+| Glances 进程状态 | [glances/metrics/process.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/widgets/glances/metrics/process.jsx#L10-L17) | 状态映射静态图标如 `<ResolvedIcon icon="mdi-circle" width={32} height={32} />` | 32×32（容器 w-3 h-3） |
+| Glances 容器状态 | [glances/metrics/containers.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/widgets/glances/metrics/containers.jsx#L10-L14) | 同上，映射 running/healthy/paused/stopped | 32×32（容器 w-3 h-3） |
+
+**图标数据来源说明**：
+- `service.icon` / `bookmark.icon`：来自用户 YAML 配置（services.yaml / bookmarks.yaml）
+- `layout.icon`：来自 settings.yaml 中 layout 节点下分组级别的 `icon` 字段
+- `options.icon`：来自 widgets.yaml 中 logo 类型 widget 的 `icon` 字段
+- Glances 状态图标：代码内硬编码的 mdi- 前缀常量
+
+### 3.4 Logo Widget 的内联 SVG 降级
+
+[logo.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/widgets/logo/logo.jsx#L1-L75) 中，当 `options.icon` 未配置时，降级渲染内联 SVG 作为 Homepage 默认 logo。该 SVG 使用 CSS 变量 `rgba(var(--color-logo-start))` / `rgba(var(--color-logo-stop))` 作为填充色，**随主题色系自动变化**。
+
+### 3.5 react-icons 内联图标库
+
+项目依赖 [react-icons](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/package.json#L39) (`^5.6.0`)，用于 UI 内部元素图标（与 ResolvedIcon 无关，是打包时的内联 SVG）：
+
 ```jsx
-<ResolvedIcon icon={service.icon} />  // 默认 32x32
-```
+// services/group.jsx / bookmarks/group.jsx 中的折叠箭头
+import { MdKeyboardArrowDown } from "react-icons/md";
+<MdKeyboardArrowDown className="...text-theme-800 dark:text-theme-300..." />
 
-**Bookmark 卡片**：[components/bookmarks/item.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/bookmarks/item.jsx#L28-L45)
-```jsx
-// iconOnly 模式: 7x7
-<div className="w-7 h-7">
-  <ResolvedIcon icon={bookmark.icon} alt={bookmark.abbr} />
-</div>
-// 标准模式: 5x5
-<div className="shrink-0 w-5 h-5">
-  <ResolvedIcon icon={bookmark.icon} alt={bookmark.abbr} />
-</div>
-```
-
-### 3.4 react-icons 内联图标库
-
-除了 CDN 远程图标，项目还内置依赖 [react-icons](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/package.json#L39) (`^5.6.0`)，用于内部 UI 元素：
-
-```jsx
-// 示例：pages/index.jsx L17 使用错误图标
+// pages/index.jsx 中的错误图标
 import { BiError } from "react-icons/bi";
 <BiError className="float-right w-6 h-6" />
 ```
 
-### 3.5 动态 Favicon 生成
+### 3.6 动态 Favicon 组件（未接入页面）
 
-[components/favicon.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/favicon.jsx#L1-L114) 在客户端运行时，将 SVG 序列化 → Base64 → 绘制到 Canvas → 导出为 ICO 格式并注入 `<head>`，使其颜色跟随当前主题色系：
+[favicon.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/favicon.jsx#L1-L114) 定义了一个可跟随主题色系动态生成 favicon 的组件，其工作原理为：
 
-```javascript
-// 1. 从 ColorContext 获取主题色，渲染 SVG（含渐变）
-const { iconStart, iconEnd } = themes[color];
-// 2. XMLSerializer 将 SVG DOM 转为字符串
-const xml = new XMLSerializer().serializeToString(svg);
-// 3. Base64 编码，创建 Image 对象
-const svg64 = Buffer.from(xml).toString("base64");
-img.src = "data:image/svg+xml;base64," + svg64;
-// 4. Canvas 绘制后导出为 data URL，创建 <link rel="shortcut icon">
-canvas.getContext("2d").drawImage(img, 0, 0);
-link.href = canvas.toDataURL("image/x-icon");
 ```
+ColorContext.color → themes[color].iconStart/iconEnd
+        ↓
+渲染带渐变色的 <Svg> 组件
+        ↓
+XMLSerializer 序列化 SVG DOM → Base64 编码
+        ↓
+创建 <img> 加载 data:image/svg+xml;base64,...
+        ↓
+img.onload → Canvas drawImage → canvas.toDataURL("image/x-icon")
+        ↓
+创建 <link rel="shortcut icon"> 注入 document.head
+```
+
+**⚠️ 事实核查：该组件未被任何页面或布局实际 import 和渲染。** 全项目搜索仅 [favicon.test.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/favicon.test.jsx#L8) 引用了它。首页实际 favicon 处理逻辑在 [index.jsx L420-L432](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx#L420-L432)，使用的是：
+- 用户配置 `settings.favicon` 时的静态链接，或
+- public/ 目录下的静态图片文件
+
+**因此，当前页面的 favicon 不会随主题切换而更新。** favicon.jsx 是一个已实现但未接入的组件。
 
 ---
 
@@ -214,7 +243,7 @@ link.href = canvas.toDataURL("image/x-icon");
 
 ### 4.1 ThemeContext：明暗模式
 
-[utils/contexts/theme.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/utils/contexts/theme.jsx#L1-L46)
+[theme.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/utils/contexts/theme.jsx#L1-L46)
 
 **初始化优先级**：
 1. 父组件传入 `initialTheme` prop
@@ -233,7 +262,7 @@ const rawSetTheme = (rawTheme) => {
 };
 ```
 
-**CSS 变量联动**（[globals.css](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/styles/globals.css#L64-L74)）：
+**CSS 变量联动**（[globals.css L64-L74](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/styles/globals.css#L64-L74)）：
 ```css
 .light {
   --bg-color: var(--color-50);
@@ -249,7 +278,7 @@ const rawSetTheme = (rawTheme) => {
 
 ### 4.2 ColorContext：主题色系
 
-[utils/contexts/color.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/utils/contexts/color.jsx#L1-L45)
+[color.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/utils/contexts/color.jsx#L1-L45)
 
 **初始化优先级**：
 1. 父组件传入 `initialTheme` prop
@@ -258,6 +287,8 @@ const rawSetTheme = (rawTheme) => {
 
 **切换机制**：
 ```javascript
+let lastColor = false; // 模块级变量，追踪上一次色系用于精确移除旧类
+
 const rawSetColor = (rawColor) => {
   const root = window.document.documentElement;
   root.classList.remove(`theme-${lastColor}`);   // 移除旧色系类
@@ -269,18 +300,18 @@ const rawSetColor = (rawColor) => {
 
 ### 4.3 主题色值定义：themes.js 与 theme.css
 
-**色板数据文件**：[utils/styles/themes.js](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/utils/styles/themes.js#L1-L142)
+**色板数据文件**：[themes.js](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/utils/styles/themes.js#L1-L142)
 
-共定义 **23 个** 主题色系（white/slate/gray/zinc/neutral/stone/red/orange/amber/yellow/lime/green/emerald/teal/cyan/sky/blue/indigo/violet/purple/fuchsia/pink/rose），每个色系定义：
+共定义 **23 个** 主题色系（white/slate/gray/zinc/neutral/stone/red/orange/amber/yellow/lime/green/emerald/teal/cyan/sky/blue/indigo/violet/purple/fuchsia/pink/rose），每个色系定义 4 个字段：
 
-| 字段 | 用途 |
-|------|------|
-| `light` | 亮色模式下主题色（HTML meta） |
-| `dark` | 暗色模式下主题色（HTML meta） |
-| `iconStart` | Favicon 渐变起始色 / 图标渐变色起点 |
-| `iconEnd` | Favicon 渐变结束色 / 图标渐变色终点 |
+| 字段 | 用途 | 使用位置 |
+|------|------|---------|
+| `light` | 亮色模式下的主题色值 | HTML `<meta name="theme-color">`、PWA manifest、browserconfig.xml |
+| `dark` | 暗色模式下的主题色值 | 同上 |
+| `iconStart` | 渐变起始色 | favicon.jsx 的 SVG 渐变（未接入）；logo.jsx 降级 SVG 的渐变起始色不使用此值 |
+| `iconEnd` | 渐变结束色 | 同上 |
 
-**CSS 变量注入文件**：[styles/theme.css](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/styles/theme.css)
+**CSS 变量注入文件**：[theme.css](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/styles/theme.css)
 
 每个 `.theme-{name}` 类定义一套完整的 CSS 自定义属性（共 12 个变量）：
 
@@ -289,25 +320,25 @@ const rawSetColor = (rawColor) => {
   --color-50: 248 250 252;      /* 最浅色 */
   --color-100: 241 245 249;
   --color-200: 226 232 240;
-  --color-300: 203 213 225;     /* 暗色模式下的图标色 */
+  --color-300: 203 213 225;
   --color-400: 148 163 184;
   --color-500: 100 116 139;
   --color-600: 71 85 105;
   --color-700: 51 65 85;
   --color-800: 30 41 59;        /* 暗色模式下的背景色 */
-  --color-900: 15 23 42;        /* 亮色模式下的图标色 */
+  --color-900: 15 23 42;
   --color-logo-start: 148 163 184;  /* 图标渐变起始 */
   --color-logo-stop: 51 65 85;      /* 图标渐变结束 */
 }
 ```
 
-色值使用空格分隔的 **RGB 分量格式**（而非 `rgb()`），配合 Tailwind 的 alpha-value 语法使用：
+色值使用空格分隔的 **RGB 分量格式**（而非 `rgb()` 包裹），这是为了配合 Tailwind 的 `<alpha-value>` 语法使用。
+
+**white 主题的特殊处理**：[theme.css L1-L29](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/styles/theme.css#L1-L29) 中 `.theme-white` 定义了额外覆盖规则，对 `bg-theme-100/20` 和 `dark:bg-white/5` 等类做了硬编码颜色重写（因为白色色阶在半透明时视觉效果不对）。
 
 ### 4.4 Tailwind 主题映射
 
 [tailwind.config.js](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/tailwind.config.js#L17-L34)
-
-将 CSS 变量映射为 Tailwind 语义色：
 
 ```javascript
 colors: {
@@ -318,10 +349,10 @@ colors: {
     // ... 300 ~ 900
   },
 }
-darkMode: "class",  // 使用类名策略切换暗色
+darkMode: "class",
 ```
 
-**Tailwind v4 配置**：[globals.css](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/styles/globals.css#L1-L7)
+**Tailwind v4 配置**：[globals.css L1-L7](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/styles/globals.css#L1-L7)
 
 ```css
 @import 'tailwindcss';
@@ -331,13 +362,13 @@ darkMode: "class",  // 使用类名策略切换暗色
 
 ### 4.5 完整应用流程
 
-在 [_app.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/_app.jsx#L73-L98) 中从外到内的 Provider 嵌套：
+在 [_app.jsx L87-L96](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/_app.jsx#L87-L96) 中从外到内的 Provider 嵌套：
 
 ```
 ColorProvider → ThemeProvider → SettingsProvider → TabProvider → Page
 ```
 
-外层 Wrapper（[pages/index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx#L517-L593)）负责同步 `<html>` 类名：
+外层 Wrapper（[index.jsx L517-L593](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx#L517-L593)）负责同步 `<html>` 类名：
 
 ```javascript
 // 同步明暗类
@@ -350,7 +381,7 @@ html.classList.remove(...themeClassesToRemove);
 html.classList.add(desiredThemeClass);
 ```
 
-**首页 settings → theme 同步**（[pages/index.jsx L234-L247](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx#L234-L247)）：
+**首页 settings → theme 同步**（[index.jsx L234-L247](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx#L234-L247)）：
 
 ```javascript
 useEffect(() => {
@@ -359,7 +390,7 @@ useEffect(() => {
 }, [settings, color, setColor, theme, setTheme]);
 ```
 
-**服务端 theme API**：[pages/api/theme.js](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/api/theme.js#L1-L14) 提供 SSR 时的初始主题读取：
+**服务端 theme API**：[theme.js](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/api/theme.js#L1-L14) 提供 SSR 时的初始主题读取：
 ```javascript
 return res.status(200).json({
   color: settings.color || "slate",
@@ -369,13 +400,13 @@ return res.status(200).json({
 
 ### 4.6 背景图适配
 
-支持配置化背景（[pages/index.jsx L520-L575](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx#L520-L575)）：
+支持配置化背景（[index.jsx L520-L575](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx#L520-L575)）：
 
 ```javascript
 // settings.yaml 中的配置格式
 background: string | {
   image: string;
-  opacity: number;     // 0-100，转换为叠加层的透明度
+  opacity: number;     // 0-100，转换为叠加层的透明度 (1 - opacity/100)
   blur?: string;       // backdrop-blur 程度
   saturate?: number;   // backdrop-saturate
   brightness?: number; // backdrop-brightness
@@ -384,10 +415,12 @@ background: string | {
 
 DOM 结构：
 ```
-<div id="background">  /* fixed全屏，z-index:0，放置背景图 + 主题色遮罩 */
-<div id="page_wrapper">  /* 内容区容器 */
+<div id="background">       /* fixed 全屏，z-index:0，背景图 + 主题色叠加层 */
+<div id="page_wrapper">     /* 内容区容器 */
   <div id="inner_wrapper">  /* 应用 backdrop-filter 滤镜 */
 ```
+
+背景叠加使用 `linear-gradient(rgb(var(--bg-color) / ${opacity}), ...)` 在背景图之上覆盖一层半透明主题色。
 
 ---
 
@@ -397,20 +430,20 @@ DOM 结构：
 
 [SWR](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/package.json#L41) (`stale-while-revalidate`) 是项目统一的数据获取与缓存库。
 
-**全局配置**（[_app.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/_app.jsx#L75-L79)）：
+**全局配置**（[_app.jsx L75-L79](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/_app.jsx#L75-L79)）：
 ```jsx
 <SWRConfig value={{
   fetcher: (resource, init) => fetch(resource, init).then((res) => res.json()),
 }}>
 ```
 
-**SSR Fallback 预填充**：`getStaticProps` 构建时预取数据，通过 `fallback` 注入 SWR 缓存，避免客户端首屏二次请求（[pages/index.jsx L55-L77](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx#L55-L77)）：
+**SSR Fallback 预填充**：`getStaticProps` 构建时预取数据，通过 `fallback` 注入 SWR 缓存，避免客户端首屏二次请求（[index.jsx L55-L77](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx#L55-L77)）：
 
 ```javascript
 return {
   props: {
     fallback: {
-      "/api/services": services,   // 构建时获取的服务数据
+      "/api/services": services,
       "/api/bookmarks": bookmarks,
       "/api/widgets": widgets,
       "/api/hash": false,
@@ -419,7 +452,7 @@ return {
 };
 ```
 
-首页二次包裹（[L186-L191](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx#L186-L191)）：
+首页二次包裹（[index.jsx L186-L191](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx#L186-L191)）：
 ```jsx
 <SWRConfig value={{ fallback, fetcher: /* 同样的fetcher */ }}>
   <Home initialSettings={initialSettings} />
@@ -428,7 +461,7 @@ return {
 
 ### 5.2 配置变更检测：Hash 轮询
 
-通过 `/api/hash` 检测配置文件变化，窗口重新获得焦点时触发检查（[pages/index.jsx L100-L131](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx#L100-L131)）：
+通过 `/api/hash` 检测配置文件变化，窗口重新获得焦点时触发检查（[index.jsx L100-L131](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx#L100-L131)）：
 
 ```javascript
 const { data: hashData, mutate: mutateHash } = useSWR("/api/hash");
@@ -450,13 +483,13 @@ useEffect(() => {
 }, [hashData]);
 ```
 
-配合自定义 Hook：[utils/hooks/window-focus.js](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/utils/hooks/window-focus.js#L1-L26) 监听 `window.focus/blur` 事件。
+配合自定义 Hook：[window-focus.js](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/utils/hooks/window-focus.js#L1-L26) 监听 `window.focus/blur` 事件。
 
 ### 5.3 内存缓存：memory-cache
 
 服务端环境变量使用 [`memory-cache`](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/package.json#L29) 包做进程内缓存，避免每次配置读取都遍历 `process.env`：
 
-[utils/config/config.js L52-L62](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/utils/config/config.js#L52-L62)
+[config.js L52-L62](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/utils/config/config.js#L52-L62)
 ```javascript
 function getCachedEnvironmentVars() {
   let cachedVars = cache.get(cacheKey);
@@ -464,7 +497,7 @@ function getCachedEnvironmentVars() {
     cachedVars = Object.entries(process.env).filter(
       ([key]) => key.includes("HOMEPAGE_VAR_") || key.includes("HOMEPAGE_FILE_"),
     );
-    cache.put(cacheKey, cachedVars);  // 进程内常驻缓存
+    cache.put(cacheKey, cachedVars);
   }
   return cachedVars;
 }
@@ -473,7 +506,7 @@ function getCachedEnvironmentVars() {
 ### 5.4 组件懒加载：next/dynamic
 
 **Toggle 组件 SSR 禁用**（因为需要 localStorage，服务端无此 API）：
-[pages/index.jsx L30-L40](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx#L30-L40)
+[index.jsx L30-L40](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx#L30-L40)
 
 ```javascript
 const ThemeToggle = dynamic(() => import("components/toggles/theme"), { ssr: false });
@@ -481,7 +514,7 @@ const ColorToggle = dynamic(() => import("components/toggles/color"), { ssr: fal
 const Version     = dynamic(() => import("components/version"),          { ssr: false });
 ```
 
-**Widget 组件全量动态导入**：[widgets/components.js](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/widgets/components.js#L1-L167)
+**Widget 组件全量动态导入**：[components.js](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/widgets/components.js#L1-L167)
 
 将约 150+ 个 widget 组件全部通过 `next/dynamic` 懒加载，避免打包时全部纳入首屏 chunk，仅在实际使用该类型 widget 时才请求对应代码块：
 
@@ -489,25 +522,26 @@ const Version     = dynamic(() => import("components/version"),          { ssr: 
 const components = {
   adguard: dynamic(() => import("./adguard/component")),
   plex:    dynamic(() => import("./plex/component")),
-  sonarr:  dynamic(() => import("./sonarr/component")),
   // ... 约 150 个
 };
 ```
 
 ### 5.5 静态资源版本化（Cache Busting）
 
-public/ 下的静态资源通过 query 参数版本号绕过浏览器缓存（[pages/index.jsx L427-L431](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx#L427-L431)）：
+public/ 下的静态资源通过 query 参数版本号绕过浏览器缓存：
 
 ```html
 /apple-touch-icon.png?v=4
 /favicon-32x32.png?v=4
 /safari-pinned-tab.svg?v=4
 /site.webmanifest?v=4
+/android-chrome-192x192.png?v=2
+/mstile-150x150.png?v=2
 ```
 
 ### 5.6 配置文件自动初始化
 
-首次启动时自动从骨架模板复制到 config 目录（[utils/config/config.js L15-L50](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/utils/config/config.js#L15-L50)）：
+首次启动时自动从骨架模板复制到 config 目录（[config.js L15-L50](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/utils/config/config.js#L15-L50)）：
 
 ```javascript
 export default function checkAndCopyConfig(config) {
@@ -517,7 +551,6 @@ export default function checkAndCopyConfig(config) {
     const configSkeleton = join(process.cwd(), "src", "skeleton", config);
     copyFileSync(configSkeleton, configYaml);
   }
-  // 同时验证 yaml 语法有效性
   yaml.load(readFileSync(configYaml, "utf8"));
 }
 ```
@@ -531,29 +564,36 @@ export default function checkAndCopyConfig(config) {
 ### 6.1 图标渲染数据流
 
 ```
-services.yaml / bookmarks.yaml
+YAML 配置 / Docker K8s 自动发现
         │
         ▼
-  servicesResponse() / bookmarksResponse()
-  [api-response.js] ── 合并 Docker/K8s 自动发现 + 手动配置
+  servicesResponse() / bookmarksResponse() / widgetsFromConfig()
+  [api-response.js / widget-helpers.js]
         │
         ▼
-  SWR Fallback (SSR 构建时)
+  SWR Fallback (SSR 构建时预填)
         │
         ▼
-  useSWR("/api/services") ── /api/bookmarks
+  useSWR("/api/services") / useSWR("/api/bookmarks") / useSWR("/api/widgets")
         │
-        ▼
-  <Item service={...}>
-        │
-        ▼
-  <ResolvedIcon icon={service.icon} />
-        │
-        ├── http/ 开头 ──► <Image src="直接URL" />
-        ├── sh- 前缀 ──► jsDelivr + selfhst/icons
-        ├── mdi-/si- 前缀 ──► CSS mask + 主题色
-        │     └── ColorContext + ThemeContext ──► iconColor 计算
-        └── 默认 ──► dashboard-icons CDN
+        ├─► Service Item ──► <ResolvedIcon icon={service.icon} />
+        ├─► Service Group ──► <ResolvedIcon icon={layout.icon} />
+        ├─► Bookmark Item ──► <ResolvedIcon icon={bookmark.icon} />
+        ├─► Bookmark Group ──► <ResolvedIcon icon={layout.icon} />
+        ├─► QuickLaunch ──► <ResolvedIcon icon={r.icon} />
+        ├─► Logo Widget ──► <ResolvedIcon icon={options.icon} width={48} height={48} />
+        └─► Glances Metrics ──► <ResolvedIcon icon="mdi-circle" />
+               │
+               ▼
+        ResolvedIcon 解析逻辑
+               │
+               ├── http / 开头 ──► <Image src="直接URL" />
+               ├── sh- 前缀 ──► jsDelivr + selfhst/icons ──► <Image />
+               ├── mdi-/si- 前缀 ──► CSS mask + 主题色
+               │     ├── 尾部 #RRGGBB ──► 自定义hex色
+               │     ├── iconStyle=theme ──► --color-300(dark) / --color-900(light)
+               │     └── 默认 ──► logo 渐变
+               └── 其他 ──► dashboard-icons CDN ──► <Image />
 ```
 
 ### 6.2 主题切换数据流
@@ -580,7 +620,8 @@ services.yaml / bookmarks.yaml
                            ▼
          Tailwind 原子类 bg-theme-700 / text-theme-200 / dark:...
          resolvedicon.jsx 中 mask 图标的 iconColor
-         动态 Favicon (favicon.jsx) 的渐变颜色
+         Logo Widget 降级 SVG 的 rgba(var(--color-logo-start/stop))
+         ⚠️ favicon.jsx 未接入页面，不参与主题联动
 ```
 
 ---
@@ -595,10 +636,18 @@ services.yaml / bookmarks.yaml
 | [src/pages/index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/index.jsx) | 首页主逻辑、SSR fallback、Head 资源注入 |
 | [src/pages/api/theme.js](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/api/theme.js) | 服务端主题配置 API |
 | [src/pages/api/config/[path].js](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/api/config/%5Bpath%5D.js) | custom.css/custom.js 动态服务 |
+| [src/pages/site.webmanifest.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/site.webmanifest.jsx) | PWA manifest 动态生成（含 theme_color） |
+| [src/pages/browserconfig.xml.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/pages/browserconfig.xml.jsx) | Windows 磁贴配置动态生成（含 TileColor） |
 | [src/components/resolvedicon.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/resolvedicon.jsx) | 图标解析与渲染核心组件 |
-| [src/components/favicon.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/favicon.jsx) | 动态主题色 Favicon 生成 |
-| [src/components/services/item.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/services/item.jsx) | 服务卡片 (含图标使用) |
-| [src/components/bookmarks/item.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/bookmarks/item.jsx) | 书签卡片 (含图标使用) |
+| [src/components/favicon.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/favicon.jsx) | 动态主题色 Favicon 生成（⚠️未接入页面） |
+| [src/components/services/item.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/services/item.jsx) | 服务卡片（ResolvedIcon 入口之一） |
+| [src/components/services/group.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/services/group.jsx) | 服务分组标题（layout.icon 入口） |
+| [src/components/bookmarks/item.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/bookmarks/item.jsx) | 书签卡片（ResolvedIcon 入口之一） |
+| [src/components/bookmarks/group.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/bookmarks/group.jsx) | 书签分组标题（layout.icon 入口） |
+| [src/components/quicklaunch.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/quicklaunch.jsx) | 快速启动搜索（搜索结果图标入口） |
+| [src/components/widgets/logo/logo.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/components/widgets/logo/logo.jsx) | Logo 信息 Widget（48×48 图标 + 降级内联 SVG） |
+| [src/widgets/glances/metrics/process.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/widgets/glances/metrics/process.jsx) | Glances 进程状态图标映射 |
+| [src/widgets/glances/metrics/containers.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/widgets/glances/metrics/containers.jsx) | Glances 容器状态图标映射 |
 | [src/utils/contexts/theme.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/utils/contexts/theme.jsx) | 明暗模式 Context |
 | [src/utils/contexts/color.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/utils/contexts/color.jsx) | 主题色系 Context |
 | [src/utils/contexts/settings.jsx](file:///d:/fz/0601/solo-dogfeeding/code/211-homepage/src/utils/contexts/settings.jsx) | 用户设置 Context |
