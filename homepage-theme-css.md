@@ -45,7 +45,21 @@ color: slate   # 21 种色板之一
 
 ### 2.3 来源三：系统偏好
 
-仅对明暗模式有效，读取浏览器的 `prefers-color-scheme: dark` 媒体查询。
+仅对明暗模式（theme）有效。但需要特别注意：**代码只检测深色系统偏好，不检测浅色系统偏好。**
+
+`src/utils/contexts/theme.jsx` 第 10-12 行的判断逻辑：
+
+```js
+const userMedia = window.matchMedia("(prefers-color-scheme: dark)");
+if (userMedia.matches) {
+  return "dark";
+}
+```
+
+- 如果系统设置为**深色模式** → 返回 `"dark"`
+- 如果系统设置为**浅色模式** → 不返回 `"light"`，而是继续往下落到默认值
+
+因此系统浅色偏好在这个实现中**不会被采纳**，只有系统深色偏好会起作用（但结果恰好和默认值相同）。
 
 ### 2.4 默认兜底值
 
@@ -53,6 +67,8 @@ color: slate   # 21 种色板之一
 |------|-------|
 | theme | `dark` |
 | color | `slate` |
+
+没有 localStorage、没有配置固定值、系统也不是深色偏好时，最终落到默认值：`dark` + `slate`。
 
 ---
 
@@ -121,16 +137,18 @@ React 的 useEffect 按照**后序遍历**（深度优先，子组件先执行�
 
 浏览器接收到 HTML 后 React hydration。此时：
 
-**ThemeProvider state 初始化**（`src/utils/contexts/theme.jsx` 第 3-22 行）：
+**ThemeProvider state 初始化**（`src/utils/contexts/theme.jsx` 第 3-17 行）：
 
 ```
 getInitialTheme() 执行顺序：
-  ① localStorage["theme-mode"] → 有值则返回
+  ① localStorage["theme-mode"] → 有值则返回该值（dark 或 light）
   ② matchMedia("(prefers-color-scheme: dark)") → 匹配则返回 "dark"
-  ③ 返回默认 "dark"
+  ③ 其他情况 → 返回默认 "dark"
 ```
 
-**ColorProvider state 初始化**（`src/utils/contexts/color.jsx` 第 5-20 行）：
+注意：第 ② 步只检测**深色**系统偏好。如果系统是浅色，不会返回 `"light"`，而是直接落到第 ③ 步的默认值 `"dark"`。
+
+**ColorProvider state 初始化**（`src/utils/contexts/color.jsx` 第 5-15 行）：
 
 ```
 getInitialColor() 执行顺序：
@@ -138,7 +156,9 @@ getInitialColor() 执行顺序：
   ② 返回默认 "slate"
 ```
 
-此时 state 的值由 **localStorage → 系统偏好 → 默认值** 决定，**settings.yaml 的配置尚未参与**。
+色板没有系统偏好概念，只有 localStorage 和默认值两条路径。
+
+此时 state 的值由 **localStorage → （仅深色）系统偏好 → 默认值** 决定，**settings.yaml 的配置尚未参与**。
 
 ### 3.5 阶段三：第一轮 useEffect（挂载后执行）
 
@@ -298,15 +318,25 @@ useEffect(() => {
 │ 优先级 2：localStorage                                │
 │   条件：settings.yaml 未设置，但 localStorage 有值      │
 │   时机：Hydration 同步阶段                              │
+│   注意：可能保存 dark 或 light 任意一种                 │
 ├───────────────────────────────────────────────────────┤
-│ 优先级 3：系统偏好（仅 theme）                         │
-│   条件：localStorage 无值，系统设置为暗色模式            │
+│ 优先级 3：系统偏好（仅 theme，且仅深色生效）             │
+│   条件：localStorage 无值，系统设置为深色模式            │
 │   时机：Hydration 同步阶段                              │
+│   结果：返回 dark（与默认值相同）                       │
+│   ⚠️ 系统浅色偏好不会被采纳，直接落到默认值              │
 ├───────────────────────────────────────────────────────┤
 │ 优先级 4（最低）：默认值                               │
 │   theme → dark，color → slate                         │
+│   没有 localStorage、没有配置、系统非深色时落到这里      │
 └───────────────────────────────────────────────────────┘
 ```
+
+#### 系统偏好的实际效果分析
+
+由于默认值就是 `dark`，而系统深色偏好也返回 `dark`，两者结果相同。因此**系统偏好在这个实现中实际上不起作用**——无论系统是深色还是浅色，只要 localStorage 为空，最终都是 `dark`。
+
+只有当默认值改为 `light` 时，系统深色偏好才会产生实际的差异化效果。
 
 ### 3.10 FOUC（主题闪烁）问题
 
@@ -547,8 +577,10 @@ CSS 层叠优先级由 **来源 → 特异性 → 出现顺序** 共同决定。
 ### 主题来源优先级
 
 ```
-settings.yaml > localStorage > 系统偏好 > 默认值
+settings.yaml > localStorage > 系统深色偏好（=默认dark）> 默认值
 ```
+
+> 注意：系统浅色偏好不会被采纳，会直接落到默认值 dark。色板没有系统偏好。
 
 ### 初始化时序口诀
 
