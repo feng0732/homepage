@@ -14,25 +14,25 @@
 
 关键文件索引：
 
-| 层级 | 文件 | 作用 |
+| 层级 | 位置 | 作用 |
 |------|------|------|
-| 配置解析 | [service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/utils/config/service-helpers.js) | 解析 services.yaml，清洗 widget 字段白名单 |
-| Widget 注册 | [widgets.js](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/widgets/widgets.js) | 注册所有 widget 的 api 模板 + proxyHandler + mappings |
-| 组件注册 | [components.js](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/widgets/components.js) | 动态 import 所有 widget 的 React 渲染组件 |
-| 代理路由 | [proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/pages/api/services/proxy.js) | Next.js API 路由，分发请求到具体 proxyHandler |
-| 通用代理 | [generic.js](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/utils/proxy/handlers/generic.js) | 默认 proxyHandler，处理 HTTP 请求、鉴权、map 变换 |
-| API 辅助 | [api-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/utils/proxy/api-helpers.js) | URL 模板替换、代理 URL 构造 |
-| 前端 Hook | [use-widget-api.js](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/utils/proxy/use-widget-api.js) | 基于 SWR 封装，轮询拉取代理数据 |
-| 渲染容器 | [container.jsx](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/components/services/widget/container.jsx) | Widget 外层容器，处理 fields 过滤、错误隐藏、高亮上下文 |
-| 渲染块 | [block.jsx](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/components/services/widget/block.jsx) | 单个数据块（label + value），支持高亮样式 |
-| 服务卡片 | [item.jsx](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/components/services/item.jsx) | 服务级卡片，渲染 icon + 标题 + 多个 widget |
-| Widget 调度 | [widget.jsx](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/components/services/widget.jsx) | 根据 widget.type 从 components.js 查找并渲染 |
+| 配置解析 | `src/utils/config/service-helpers.js` | 解析 services.yaml，清洗 widget 字段白名单 |
+| Widget 注册 | `src/widgets/widgets.js` | 注册所有 widget 的 api 模板 + proxyHandler + mappings |
+| 组件注册 | `src/widgets/components.js` | 动态 import 所有 widget 的 React 渲染组件 |
+| 代理路由 | `src/pages/api/services/proxy.js` | Next.js API 路由，分发请求到具体 proxyHandler |
+| 通用代理 | `src/utils/proxy/handlers/generic.js` | 默认 proxyHandler，处理 HTTP 请求、鉴权、map 变换 |
+| API 辅助 | `src/utils/proxy/api-helpers.js` | URL 模板替换、代理 URL 构造 |
+| 前端 Hook | `src/utils/proxy/use-widget-api.js` | 基于 SWR 封装，轮询拉取代理数据 |
+| 渲染容器 | `src/components/services/widget/container.jsx` | Widget 外层容器，处理 fields 过滤、错误隐藏、高亮上下文 |
+| 渲染块 | `src/components/services/widget/block.jsx` | 单个数据块（label + value），支持高亮样式 |
+| 服务卡片 | `src/components/services/item.jsx` | 服务级卡片，渲染 icon + 标题 + 多个 widget |
+| Widget 调度 | `src/components/services/widget.jsx` | 根据 widget.type 从 components.js 查找并渲染 |
 
 ---
 
 ## 二、Plex Widget 专项分析
 
-### 2.1 Plex Widget 定义：[plex/widget.js](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/widgets/plex/widget.js)
+### 2.1 Plex Widget 定义：`src/widgets/plex/widget.js`
 
 ```javascript
 const widget = {
@@ -52,35 +52,35 @@ const widget = {
 - Plex **不使用** `genericProxyHandler`，而是自定义 `plexProxyHandler`（因为 Plex 返回 XML，且需要多接口聚合）
 - `mappings.unified.endpoint = "/"` 看起来是占位符，实际完全由 proxy 内部决定调用哪些真实 Plex API
 
-### 2.2 Plex 数据获取：[plex/proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/widgets/plex/proxy.js)
+### 2.2 Plex 数据获取：`src/widgets/plex/proxy.js`
 
 这是 Plex Widget 的核心，完成了「多接口聚合 + XML→JSON 转码 + 多级缓存」。
 
 #### 2.2.1 多接口调用时序
 
 ```
-plexProxyHandler(req, res)
-├─ 1. fetchFromPlexAPI("/status/sessions")   → 获取当前播放流数量（每次必调）
-├─ 2. 查缓存 libraries
-│   └─ 未命中 → fetchFromPlexAPI("/library/sections")   → 获取所有媒体库列表（缓存 6h）
-└─ 3. 查缓存 albums/movies/tv
+plexProxyHandler(req, res)                           ← proxy.js L64
+├─ 1. fetchFromPlexAPI("/status/sessions")           ← proxy.js L75，获取当前播放会话（每次必调）
+├─ 2. 查缓存 libraries                               ← proxy.js L87
+│   └─ 未命中 → fetchFromPlexAPI("/library/sections") ← proxy.js L90，获取所有媒体库列表（缓存 6h）
+└─ 3. 查缓存 albums/movies/tv                        ← proxy.js L97-L99
     └─ 未命中 → 遍历 movie/show/artist 类型库，并行调用：
-        ├─ /library/sections/{key}/all         → 电影/电视剧
-        └─ /library/sections/{key}/albums      → 音乐专辑
+        ├─ /library/sections/{key}/all                ← proxy.js L109，电影/电视剧
+        └─ /library/sections/{key}/albums             ← proxy.js L110，音乐专辑
         → 累加计数（缓存 10min）
 ```
 
 #### 2.2.2 XML 转 JSON
 
-Plex API 返回 XML，使用 `xml-js` 的 `xml2json()` 转码。转换后的数据结构：
+Plex API 返回 XML，在 `fetchFromPlexAPI`（proxy.js L35-L62）中通过 `xml-js` 的 `xml2json()` 转码，再 `JSON.parse` 得到对象。转换后的数据结构：
 
 ```
-apiData.MediaContainer._attributes.size          ← 流数量
+apiData.MediaContainer._attributes.size          ← 会话数量（字符串类型）
 apiData.MediaContainer.Directory[]               ← 库列表数组
   Directory[]._attributes = { key, type, title }
 ```
 
-注意 `fetchFromPlexAPI` 的请求头：
+注意 `fetchFromPlexAPI` 的请求头（proxy.js L44-L48）：
 ```javascript
 "X-Plex-Container-Start": "0",
 "X-Plex-Container-Size": "500",  // 最多拉 500 条，分页控制
@@ -96,35 +96,39 @@ apiData.MediaContainer.Directory[]               ← 库列表数组
 | `albums.{service}.{index}` | 专辑计数 | 10 分钟 |
 | `movies.{service}.{index}` | 电影计数 | 10 分钟 |
 | `tv.{service}.{index}` | 剧集计数 | 10 分钟 |
-| **streams** | 播放流数量 | **无缓存，每次重新获取** |
+| **streams** | 播放会话数量 | **无缓存，每次重新获取** |
 
 #### 2.2.4 最终输出数据结构
 
-代理层返回给前端的是已经聚合好的干净数据：
+代理层返回给前端的是已经聚合好的数据（proxy.js L130-L135）：
 
 ```javascript
 {
-  streams: 2,     // 当前活跃播放流
-  albums: 150,    // 专辑总数
-  movies: 800,    // 电影总数
-  tv: 3000        // 剧集/节目总数
+  streams: "2",   // 字符串，来自 xml2json 的 _attributes.size（proxy.js L84）
+  albums: 150,    // 数字，经 parseInt 转换（proxy.js L114）
+  movies: 800,    // 数字，经 parseInt 转换（proxy.js L114）
+  tv: 3000        // 数字，经 parseInt 转换（proxy.js L114）
 }
 ```
+
+> ⚠️ **类型不一致**：`streams` 直接赋值 `apiData.MediaContainer._attributes.size`，而 XML 属性在 `xml2json({ compact: true })` 后始终为字符串；`albums/movies/tv` 则通过 `parseInt(..., 10)` 转为数字。当 Plex 无活跃会话时 `apiData.MediaContainer` 可能不存在，`streams` 将保持 `undefined`。
 
 ### 2.3 Plex 字段映射
 
 Plex 的字段映射完全在 `plexProxyHandler` **内部完成**，不依赖 `mappings.map` 回调。映射关系表：
 
-| Plex XML 原始字段 | 聚合逻辑 | 输出字段 |
-|-------------------|---------|---------|
-| `/status/sessions` → `MediaContainer._attributes.size` | 直接读取 | `streams` |
-| `/library/sections/{movieKey}/all` → `MediaContainer._attributes[totalSize/size]` | 所有 movie 类型库累加 | `movies` |
-| `/library/sections/{showKey}/all` → `MediaContainer._attributes[totalSize/size]` | 所有 show 类型库累加 | `tv` |
-| `/library/sections/{artistKey}/albums` → 同上 | 所有 artist 类型库累加 | `albums` |
+| 输出字段 | API 来源 | 原始 XML 属性 | 取值方式 | 类型 |
+|---------|---------|-------------|---------|------|
+| `streams` | `/status/sessions` | `MediaContainer._attributes.size` | 直接赋值（proxy.js L84） | **string** 或 `undefined` |
+| `movies` | `/library/sections/{movieKey}/all` | `MediaContainer._attributes[totalSize/size]` | `parseInt` 后累加（proxy.js L114） | **number** |
+| `tv` | `/library/sections/{showKey}/all` | 同上 | `parseInt` 后累加 | **number** |
+| `albums` | `/library/sections/{artistKey}/albums` | 同上 | `parseInt` 后累加 | **number** |
+
+`sizeProp` 的选择逻辑（proxy.js L113）：Plex API 在某些版本返回 `totalSize`，某些版本返回 `size`，代码优先取 `totalSize`，不存在时回退到 `size`。
 
 > **设计意图**：Plex 需要多接口聚合 + XML 特殊处理，因此完全自定义 proxy，放弃了通用 `mappings.map` 机制。
 
-### 2.4 Plex 卡片渲染：[plex/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/widgets/plex/component.jsx)
+### 2.4 Plex 卡片渲染：`src/widgets/plex/component.jsx`
 
 ```jsx
 export default function Component({ service }) {
@@ -133,6 +137,21 @@ export default function Component({ service }) {
   const { data: plexData, error: plexAPIError } = useWidgetAPI(widget, "unified", {
     refreshInterval: 5000,  // 5 秒轮询
   });
+
+  if (plexAPIError) {
+    return <Container service={service} error={plexAPIError} />;
+  }
+
+  if (!plexData) {
+    return (
+      <Container service={service}>
+        <Block label="plex.streams" />
+        <Block label="plex.albums" />
+        <Block label="plex.movies" />
+        <Block label="plex.tv" />
+      </Container>
+    );
+  }
 
   return (
     <Container service={service}>
@@ -148,8 +167,9 @@ export default function Component({ service }) {
 **核心要点**：
 1. 只调用一次 `useWidgetAPI(widget, "unified")` → 对应 `mappings.unified`
 2. 渲染采用 **4 个 Block 横向排列** 的最基础样式，无自定义复杂 UI
-3. 数值使用 `t("common.number", { value })` 做本地化千分位格式化
+3. 数值使用 `t("common.number", { value })` 做本地化千分位格式化（该函数会自动处理字符串到数字的转换，因此 `streams` 为字符串时不会出错）
 4. 加载态：`value` 为 `undefined` 时 Block 自动显示骨架脉冲动画（`animate-pulse`）
+5. 三种渲染状态：error → Container 仅显示错误；无数据 → Block 无 value（脉冲加载）；有数据 → 正常显示
 
 ---
 
@@ -164,7 +184,7 @@ Homepage 中有 4 个媒体服务 Widget，实现策略各有不同：
 | **Jellyfin** | JSON | 自定义 `jellyfinProxyHandler`（加 Authorization 头） | `mappings` 声明式 + V1/V2 双版本 | ✅ 进度条列表 | ✅ 4 个 Block（可选） |
 | **Tautulli** | JSON（Plex 统计增强版） | 通用 `genericProxyHandler` | `mappings` 声明式 | ✅ 进度条列表 | ❌ |
 
-### 3.1 Emby 典型映射模式：[emby/widget.js](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/widgets/emby/widget.js)
+### 3.1 Emby 典型映射模式：`src/widgets/emby/widget.js`
 
 ```javascript
 mappings: {
@@ -190,7 +210,7 @@ useWidgetAPI(widget, "Count",    { refreshInterval: 60000 }) // 媒体库计数�
 - Plex 将多个 API 聚合为一个 `unified` endpoint，在 proxy 内部合并返回
 - Jellyfin/Emby 展示更丰富：播放进度条、播放/暂停控制按钮、转码指示图标
 
-### 3.2 Jellyfin 自定义 Header：[jellyfin/proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/widgets/jellyfin/proxy.js)
+### 3.2 Jellyfin 自定义 Header：`src/widgets/jellyfin/proxy.js`
 
 Jellyfin V2 API 要求特殊的 `Authorization: MediaBrowser ...` 头，因此自定义 proxy：
 
@@ -204,7 +224,7 @@ const headers = { Authorization: authHeader };
 
 ## 四、数据获取层深入：从 Hook 到代理 API
 
-### 4.1 useWidgetAPI Hook：[use-widget-api.js](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/utils/proxy/use-widget-api.js)
+### 4.1 useWidgetAPI Hook：`src/utils/proxy/use-widget-api.js`
 
 这是连接 React 组件与后端代理的核心 Hook，基于 `swr` 库实现：
 
@@ -222,12 +242,12 @@ export default function useWidgetAPI(widget, ...options) {
 }
 ```
 
-### 4.2 代理 URL 构造：[api-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/utils/proxy/api-helpers.js)
+### 4.2 代理 URL 构造：`src/utils/proxy/api-helpers.js`
 
-```javascript
+```
 formatProxyUrl(widget, "unified")
   → getURLSearchParams(widget, "unified")
-  → `/api/services/proxy?group=Media&service=Plex&index=0&endpoint=unified`
+  → /api/services/proxy?group=Media&service=Plex&index=0&endpoint=unified
 ```
 
 前端 **从不直接调用 Plex 等真实 API**，所有请求都通过 `/api/services/proxy` 中转，这是出于：
@@ -235,7 +255,7 @@ formatProxyUrl(widget, "unified")
 - **鉴权安全**：`key/token` 只在服务端使用，不下发到前端
 - **数据加工**：聚合、转码（XML→JSON）、缓存
 
-### 4.3 代理分发路由：[pages/api/services/proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/pages/api/services/proxy.js)
+### 4.3 代理分发路由：`src/pages/api/services/proxy.js`
 
 关键分发逻辑：
 
@@ -264,7 +284,7 @@ formatProxyUrl(widget, "unified")
 | `headers` | 自定义请求头 |
 | `body` | POST 请求体 |
 
-### 4.4 配置字段白名单：[service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/utils/config/service-helpers.js) `cleanServiceGroups()`
+### 4.4 配置字段白名单：`src/utils/config/service-helpers.js` `cleanServiceGroups()`
 
 这是一个**非常关键但容易忽略**的安全层。从 YAML 解析出的 widget 配置不会全部下发到前端，而是通过**白名单提取**：
 
@@ -298,7 +318,7 @@ cleanedService.widgets = cleanedService.widgets.map((widgetData, index) => {
 
 ## 五、卡片渲染层：Container + Block 体系
 
-### 5.1 Widget 渲染调度：[components/services/widget.jsx](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/components/services/widget.jsx)
+### 5.1 Widget 渲染调度：`src/components/services/widget.jsx`
 
 ```javascript
 export default function Widget({ widget, service }) {
@@ -308,9 +328,9 @@ export default function Widget({ widget, service }) {
 }
 ```
 
-调用链：[item.jsx](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/components/services/item.jsx#L188) → `service.widgets.map(w => <Widget widget={w} service={service} />)`
+调用链：`src/components/services/item.jsx` L188 → `service.widgets.map(w => <Widget widget={w} service={service} />)`
 
-### 5.2 Container：[container.jsx](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/components/services/widget/container.jsx)
+### 5.2 Container：`src/components/services/widget/container.jsx`
 
 Container 是所有 Widget 组件的外层，提供了 3 个横切能力：
 
@@ -345,7 +365,7 @@ if (error) {
 
 通过 `BlockHighlightContext.Provider` 下发高亮配置给内部所有 Block。
 
-### 5.3 Block：[block.jsx](file:///d:/fz/0601/solo-dogfeeding/code/198-homepage/src/components/services/widget/block.jsx)
+### 5.3 Block：`src/components/services/widget/block.jsx`
 
 最小渲染单元，结构为：
 
@@ -373,7 +393,7 @@ if (error) {
    │ ② useWidgetAPI(widget, "unified")          │                                            │
    │    GET /api/services/proxy                 │                                            │
    │    ?group=Media&service=Plex               │                                            │
-   │    &index=0&endpoint=unified               │───► handler(req, res)                       │
+   │    &index=0&endpoint=unified               │───► proxy.js handler(req, res)             │
    │                                            │    1. getServiceWidget() 取完整配置         │
    │                                            │       （含 url/key，敏感字段在服务端）       │
    │                                            │    2. widgets["plex"].proxyHandler          │
@@ -383,21 +403,21 @@ if (error) {
    │                                            │    4. plexProxyHandler(req, res)            │
    │                                            │       ├─ fetchFromPlexAPI("/status/...")─────┼───► GET /status/sessions
    │                                            │       │   headers: X-Plex-Token={key}        │◄──┐ XML Response
-   │                                            │       │   xml2json → size=2                  │   │
+   │                                            │       │   xml2json → size="2" (string)       │   │
    │                                            │       ├─ 查 libraries 缓存                  │   │
    │                                            │       │  (未命中) GET /library/sections ──────┼───► GET /library/sections
    │                                            │       │   → 缓存 6h                          │◄──┐
    │                                            │       ├─ 查 counts 缓存                      │   │
    │                                            │       │  (未命中) 并行 N 个 GET /sections/...─┼───► ...
-   │                                            │       │   → 缓存 10min                       │◄──┘
+   │                                            │       │   → parseInt 后累加, 缓存 10min      │◄──┘
    │                                            │       └─ 聚合 {streams, albums, movies, tv} │
    │                                            │                                            │
    │◄──────────── 200 JSON ────────────────────┤                                            │
-   │  { streams:2, movies:800, ... }            │                                            │
+   │  { streams:"2", movies:800, ... }          │                                            │
    │                                            │                                            │
    │ ③ SWR 收到 data，触发重渲染                │                                            │
    │    Container + 4 个 Block                  │                                            │
-   │    显示 4 个数值块                          │                                            │
+   │    t("common.number") 格式化显示            │                                            │
    │                                            │                                            │
    │ ④ 每 5s 刷新一次（refreshInterval:5000）    │──────── 同 ②，只重取 streams（缓存命中）─────┤
 ```
@@ -414,14 +434,16 @@ if (error) {
 | **配置项** | 少（仅 fields/hideErrors 通用项） | 多（enableBlocks/enableNowPlaying/enableUser/showEpisodeNumber 等 6+） |
 | **渲染复杂度** | 4 Block 基础组件 | Block 列表 + 自定义 SessionEntry 组件 + 播放控制按钮 |
 | **Proxy 内部聚合** | ✅ 是 | ❌ 否，各自独立 endpoint |
+| **输出类型** | `streams` 为 string，其余为 number | 全部为 JSON 原生类型 |
 
-从代码角度看，Plex Widget 的"不显眼"是**故意为之的设计选择**：
+从代码角度看，Plex Widget 的"不显眼"是**设计选择 + 技术限制的叠加**：
 - Plex 官方 API 返回 XML 且需要多库聚合，在 proxy 层做了大量复杂度隐藏
+- `/status/sessions` 虽然返回完整的 Session 列表，但 proxy 只取了 `_attributes.size`（活跃会话数量），丢弃了所有播放详情
 - 组件展示层保持了最简形式，与 Emby/Jellyfin 丰富的播放流 UI 形成鲜明对比
 - 如果要让 Plex 也展示活跃播放流详情（类似 Tautulli），需要：
-  1. 在 `plexProxyHandler` 中解析 `/status/sessions` 的完整 Session 详情（当前只用了 `size`）
+  1. 在 `plexProxyHandler` 中解析 `/status/sessions` 的完整 Session 详情（当前只用了 `_attributes.size`，见 proxy.js L84）
   2. 在 component 中增加类似 Emby 的 `SessionEntry` 渲染逻辑
-  3. 注意 Plex XML 的 Session 结构与 Emby JSON 结构不同，需要新的字段映射
+  3. 注意 Plex XML 的 Session 结构（`Video._attributes`）与 Emby JSON 结构（`NowPlayingItem`）不同，需要新的字段映射
 
 ---
 
@@ -431,26 +453,26 @@ if (error) {
 
 ```
 services.yaml
-  → servicesFromConfig() / servicesFromDocker() / servicesFromKubernetes()
-    → parseServicesToGroups()
-      → cleanServiceGroups()  ← 字段白名单清洗，widget 配置结构化
+  → service-helpers.js: servicesFromConfig() / servicesFromDocker() / servicesFromKubernetes()
+    → service-helpers.js: parseServicesToGroups()
+      → service-helpers.js: cleanServiceGroups()  ← 字段白名单清洗，widget 配置结构化
         → 前端拿到 service + widgets[]
 ```
 
 ### 8.2 数据请求链
 
 ```
-Component (e.g. plex/component.jsx)
-  → useWidgetAPI(widget, endpoint, { refreshInterval })
-    → formatProxyUrl() → /api/services/proxy?...&endpoint=XXX
-      → SWR useSWR() → 自动轮询 + 缓存
-        → pages/api/services/proxy.js handler
-          → getServiceWidget() → 取服务端完整配置（含 url/key）
-          → widgets[type] → 取 widget 定义
-          → mappings[endpoint] → 逻辑名→真实路径
+src/widgets/plex/component.jsx
+  → use-widget-api.js: useWidgetAPI(widget, endpoint, { refreshInterval })
+    → api-helpers.js: formatProxyUrl() → /api/services/proxy?...&endpoint=XXX
+      → use-widget-api.js: SWR useSWR() → 自动轮询 + 缓存
+        → src/pages/api/services/proxy.js: handler
+          → service-helpers.js: getServiceWidget() → 取服务端完整配置（含 url/key）
+          → widgets.js: widgets[type] → 取 widget 定义
+          → widget.mappings[endpoint] → 逻辑名→真实路径
           → proxyHandler(req, res, map) → 真实 API 调用
-            → httpProxy() → 实际 HTTP 请求
-            → validateWidgetData() → 数据校验
+            → http.js: httpProxy() → 实际 HTTP 请求
+            → validate-widget-data.js: validateWidgetData() → 数据校验
             → map?.(data) → 可选字段变换
           ← res.send(data)
 ```
@@ -458,11 +480,11 @@ Component (e.g. plex/component.jsx)
 ### 8.3 渲染链
 
 ```
-components/services/item.jsx
+src/components/services/item.jsx
   → service.widgets.map(widget)
-    → components/services/widget.jsx <Widget widget={w} service={service}>
-      → components[widget.type] → e.g. plex/component.jsx
-        → Container（字段过滤 + 错误处理 + 高亮）
-          → Block × N （或自定义组件，如 Emby 的 SessionEntry）
-            → t(label) 国际化 + t("common.number") 本地化
+    → src/components/services/widget.jsx: <Widget widget={w} service={service}>
+      → components.js: components[widget.type] → e.g. src/widgets/plex/component.jsx
+        → container.jsx: Container（字段过滤 + 错误处理 + 高亮）
+          → block.jsx: Block × N （或自定义组件，如 Emby 的 SessionEntry）
+            → next-i18next: t(label) 国际化 + t("common.number") 本地化
 ```
