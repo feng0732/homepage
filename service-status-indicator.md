@@ -311,7 +311,7 @@ if (data.status === "running") {
 | **useSWR 调用方式** | 直接调用 `useSWR(url)` | 直接调用 `useSWR(url)` |
 | **refreshInterval** | Ping/SiteMonitor: 30s; 其他: 无 | Docker/K8s/Proxmox: 无 |
 
-#### SWR 缓存共享机制
+#### SWR 缓存共享与挂载时的行为
 
 状态指示器与展开面板 widget 对同一服务使用**完全相同的 SWR URL key**：
 
@@ -321,10 +321,120 @@ if (data.status === "running") {
 | Kubernetes | `/api/kubernetes/status/{ns}/{app}?podSelector=` | `/api/kubernetes/status/{ns}/{app}?podSelector=` | ✅ 共享 |
 | Proxmox | `/api/proxmox/stats/{node}/{vmid}?type=` | `/api/proxmox/stats/{node}/{vmid}?type=` | ✅ 共享 |
 
-SWR 以 URL 为缓存 key，相同 URL 的请求会共享同一条缓存数据。这意味着：
-- 状态指示器首次挂载时发起请求，widget 展开时**不会重复请求**，直接复用缓存
-- 任何一方触发重新验证（如窗口聚焦），另一方也会同步更新
-- 但两者都没有设置 `refreshInterval`，因此**日常运行中不会主动刷新**
+SWR 以 URL 为缓存 key，相同 URL 的请求会共享同一条缓存数据。但理解以下行为至关重要：
+
+**SWR 默认配置（[\_app.jsx#L75-L79](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/pages/_app.jsx#L75-L79)）**：
+
+```javascript
+<SWRConfig
+  value={{
+    fetcher: (resource, init) => fetch(resource, init).then((res) => res.json()),
+  }}
+>
+```
+
+项目**未覆盖** SWR 的默认行为，因此：
+- `revalidateOnMount` 默认为 `true`
+- `dedupingInterval` 默认为 `2000` 毫秒
+- `revalidateOnFocus` 默认为 `true`
+
+**挂载时的精确行为**：
+
+1. **首次打开页面，状态指示器先挂载**
+   - SWR 缓存中无数据，立即发起网络请求获取状态
+   - 请求返回后数据写入缓存
+
+2. **用户点击展开面板，widget 首次挂载**
+   - widget 的 `useSWR` 使用完全相同的 URL key
+   - **先立即返回缓存中的旧数据**（SWR 的 stale-while-revalidate 机制）
+   - **然后再发起一次新的网络请求**进行重新验证（因为 `revalidateOnMount=true`）
+   - ⚠️ **并不是"不会重复请求"**，而是先展示缓存 + 后台重新请求
+   - 新请求返回后，状态指示器和 widget **都会同步更新**（共享缓存）
+
+3. **展开/折叠重复操作**
+   - 每次展开都是 widget 重新挂载，都会触发一次重新验证请求
+   - 如果两次展开间隔小于 `dedupingInterval`（2秒），请求会被去重合并
+
+4. **窗口聚焦时**
+   - 状态指示器始终存在（始终可见），会触发重新验证
+   - 重新验证的结果写入共享缓存，widget 下次展开时直接使用最新数据
+
+#### 展开面板的共用请求与额外资源请求差异
+
+各类型展开面板 widget 发起的请求数量不同，与状态指示器的关系也不同：
+
+**Docker 展开面板**（[widgets/docker/component.jsx#L13-L17](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/widgets/docker/component.jsx#L13-L17)）
+
+```javascript
+// ① 共用请求（与 Status 组件共享缓存）
+const { data: statusData } = useSWR(`/api/docker/status/${widget.container}/${widget.server || ""}`);
+// ② 额外资源请求（仅展开面板有，状态指示器无）
+const { data: statsData } = useSWR(`/api/docker/stats/${widget.container}/${widget.server || ""}`);
+```
+
+**Kubernetes 展开面板**（[widgets/kubernetes/component.jsx#L11-L17](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/widgets/kubernetes/component.jsx#L11-L17)）
+
+```javascript
+// ① 共用请求（与 KubernetesStatus 组件共享缓存）
+const { data: statusData } = useSWR(`/api/kubernetes/status/${widget.namespace}/${widget.app}?${podSelectorString}`);
+// ② 额外资源请求（仅展开面板有，状态指示器无）
+const { data: statsData } = useSWR(`/api/kubernetes/stats/${widget.namespace}/${widget.app}?${podSelectorString}`);
+```
+
+**Proxmox 展开面板**（[widgets/proxmoxvm/component.jsx#L11](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/widgets/proxmoxvm/component.jsx#L11)）
+
+```javascript
+// 唯一请求（与 ProxmoxStatus 组件共享缓存，同时提供 stats 数据）
+const { data, error } = useSWR(`/api/proxmox/stats/${widget.node}/${widget.vmid}?type=${widget.type || "qemu"}`);
+```
+
+**三者差异对比**：
+
+| 维度 | Docker | Kubernetes | Proxmox |
+|------|--------|-----------|---------|
+| **共用请求数量** | 1 个（status） | 1 个（status） | 1 个（stats 兼 status） |
+| **额外请求数量** | 1 个（stats） | 1 个（stats） | 0 个 |
+| **展开面板总请求数** | 2 个 | 2 个 | 1 个（复用 status 请求） |
+| **额外请求 API 端点** | `/api/docker/stats/...` | `/api/kubernetes/stats/...` | 无 |
+| **额外请求采集内容** | CPU / 内存 / 网络流量 | CPU / 内存 / CPU限制 / 内存限制 | 无（CPU/内存已在共用请求中返回） |
+| **状态指示器使用字段** | `data.status`, `data.health` | `data.status` | `data.status` |
+| **Widget 额外使用字段** | `statsData.stats.memory_stats`, `statsData.stats.networks`, `statsData.stats.cpu_stats` | `statsData.stats.mem`, `statsData.stats.cpu`, `statsData.stats.cpuLimit` | `data.cpu`, `data.mem` |
+
+**Proxmox 的特殊架构**：
+
+Proxmox 没有独立的 status API 和 stats API。状态指示器和展开面板 widget 共用**同一个** `/api/proxmox/stats/...` 端点（[proxmox/stats/[...service].js#L73-L77](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/pages/api/proxmox/stats/[...service].js#L73-L77)）：
+
+```javascript
+return res.status(200).json({
+  status: parsedData.data.status || "unknown",
+  cpu: parsedData.data.cpu,
+  mem: parsedData.data.mem,
+});
+```
+
+这个端点同时返回 `status`（状态指示器用）、`cpu` 和 `mem`（展开面板用）。因此：
+- Proxmox 状态指示器请求的数据量比 Docker/K8s 状态指示器大（额外包含 cpu/mem）
+- Proxmox 展开面板不会比状态指示器产生额外的 API 请求
+
+**展开时的资源开销总结**：
+
+假设首次加载页面时状态指示器已完成请求，用户点击展开卡片：
+
+| 类型 | 共用请求行为 | 额外请求行为 | 展开时新增网络请求数 |
+|------|------------|------------|------------------|
+| Docker | SWR 重新验证（复用缓存 + 后台刷新） | 首次请求 `/api/docker/stats/...` | 2 个（status 重验证 + stats 新请求） |
+| Kubernetes | SWR 重新验证（复用缓存 + 后台刷新） | 首次请求 `/api/kubernetes/stats/...` | 2 个（status 重验证 + stats 新请求） |
+| Proxmox | SWR 重新验证（复用缓存 + 后台刷新） | 无额外请求 | 1 个（唯一 URL 的重验证） |
+
+如果用户先展开再折叠，然后 2 秒内再次展开：
+
+| 类型 | 再次展开时的网络请求数 | 原因 |
+|------|---------------------|------|
+| Docker | 0 个 | 两次挂载间隔 < `dedupingInterval`（2s），请求被去重 |
+| Kubernetes | 0 个 | 同上 |
+| Proxmox | 0 个 | 同上 |
+
+但两者都没有设置 `refreshInterval`，因此**日常运行中不会主动刷新**（仅依赖挂载重验证、窗口聚焦、网络恢复）
 
 #### useWidgetAPI 与直接 useSWR 的区别
 
