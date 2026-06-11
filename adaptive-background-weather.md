@@ -786,3 +786,542 @@ const onPositionSuccess = (position) => {
   localStorage.setItem('weatherLocation', JSON.stringify(loc));
 };
 ```
+
+---
+
+## 八、三组天气数据源逐行对比分析
+
+本节按代码执行顺序，逐一剖析 WeatherAPI、OpenWeatherMap、OpenMeteo 三组数据源在地区参数获取、API 密钥 / 提供者解析、缓存刷新策略和渲染入口上的异同。
+
+### 8.1 渲染入口：Widget 映射到组件
+
+三个天气组件均通过 [widget.jsx](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/components/widgets/widget.jsx#L4-L17) 的 `widgetMappings` 注册，由 `dynamic()` 懒加载：
+
+```javascript
+const widgetMappings = {
+  weatherapi:      dynamic(() => import("components/widgets/weather/weather")),
+  openweathermap:  dynamic(() => import("components/widgets/openweathermap/weather")),
+  openmeteo:       dynamic(() => import("components/widgets/openmeteo/openmeteo")),
+};
+```
+
+映射关系：`widgets.yaml` 中的键名（如 `openmeteo`）→ `widgetMappings[type]` → 对应组件的 `default export`。
+
+三个组件在 [index.jsx#L42](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/pages/index.jsx#L42) 的 `rightAlignedWidgets` 中均被标记为右对齐，因此天气栏始终出现在信息栏右侧：
+
+```javascript
+const rightAlignedWidgets = ["weatherapi", "openweathermap", "weather", "openmeteo", "search", "datetime"];
+```
+
+### 8.2 地区参数获取
+
+三个组件的外层容器结构几乎完全一致，均采用相同的地区获取策略：
+
+#### 共同流程
+
+```
+组件挂载
+   │
+   ├─ 1. 检查 options.latitude / options.longitude（来自 widgets.yaml 静态配置）
+   │      └─ 有值 → setLocation({ latitude, longitude })  ← 渲染阶段同步执行
+   │
+   └─ 2. useEffect：无静态坐标时检查浏览器定位权限
+          └─ navigator.permissions.query({ name: "geolocation" })
+               ├─ "granted" → requestLocation() 静默获取
+               └─ 其他     → 显示授权按钮，等用户点击
+```
+
+#### 关键差异
+
+| 维度 | WeatherAPI | OpenWeatherMap | OpenMeteo |
+|------|-----------|----------------|-----------|
+| 外层组件名 | `WeatherApi` | `OpenWeatherMap` | `OpenMeteo` |
+| 静态配置字段 | `latitude` / `longitude` | `latitude` / `longitude` | `latitude` / `longitude` |
+| 额外地区字段 | 无 | 无 | `timezone`（传给 API） |
+| `ContainerButton` 附加类名 | 无 | 无 | `information-widget-openmeteo-location-button` |
+| 地理位置参数 | 完全相同 | 完全相同 | 完全相同 |
+
+> **结论**：三个组件的地区获取逻辑是**复制粘贴**的同一段代码，逻辑完全一致。唯一区别是 OpenMeteo 支持 `timezone` 参数。
+
+### 8.3 API 密钥 / 提供者解析
+
+这是三个数据源**差异最大**的部分。
+
+#### WeatherAPI — [weather.js](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/pages/api/widgets/weather.js#L1-L30)
+
+```javascript
+const { latitude, longitude, provider, cache, lang, index } = req.query;
+
+// 第一步：从 widgets.yaml 私有选项中取 apiKey
+const privateWidgetOptions = await getPrivateWidgetOptions("weatherapi", index);
+let { apiKey } = privateWidgetOptions;
+
+// 第二步：没有 apiKey 也没有 provider → 报错
+if (!apiKey && !provider) {
+  return res.status(400).json({ error: "Missing API key or provider" });
+}
+
+// 第三步：没有 apiKey 但有 provider → 只接受 "weatherapi"
+if (!apiKey && provider !== "weatherapi") {
+  return res.status(400).json({ error: "Invalid provider for endpoint" });
+}
+
+// 第四步：provider === "weatherapi" → 从 settings.yaml 全局 providers 取
+if (!apiKey && provider) {
+  const settings = getSettings();
+  apiKey = settings?.providers?.weatherapi;
+}
+
+// 第五步：还是没有 → 报错
+if (!apiKey) {
+  return res.status(400).json({ error: "Missing API key" });
+}
+```
+
+**密钥获取链路**：
+
+```
+widgets.yaml 中该 widget 的 apiKey 字段（私有选项）
+       │
+       │ 没找到
+       ▼
+前端传入 provider 参数 === "weatherapi" ?
+       │
+       │ 是
+       ▼
+settings.yaml 中 providers.weatherapi
+       │
+       │ 还没找到
+       ▼
+返回 400 错误
+```
+
+#### OpenWeatherMap — [openweathermap.js](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/pages/api/widgets/openweathermap.js#L1-L30)
+
+代码结构**与 WeatherAPI 完全相同**，仅字符串替换：
+
+```javascript
+const privateWidgetOptions = await getPrivateWidgetOptions("openweathermap", index);
+//                                        ^^^^^^^^^^^^^^^^
+if (!apiKey && provider !== "openweathermap") {
+//                           ^^^^^^^^^^^^^^^
+  return res.status(400).json({ error: "Invalid provider for endpoint" });
+}
+
+if (!apiKey && provider) {
+  const settings = getSettings();
+  apiKey = settings?.providers?.openweathermap;
+  //                             ^^^^^^^^^^^^^^^
+}
+```
+
+**密钥获取链路**：
+
+```
+widgets.yaml 中该 widget 的 apiKey 字段（私有选项）
+       │
+       │ 没找到
+       ▼
+前端传入 provider 参数 === "openweathermap" ?
+       │
+       │ 是
+       ▼
+settings.yaml 中 providers.openweathermap
+       │
+       │ 还没找到
+       ▼
+返回 400 错误
+```
+
+#### OpenMeteo — [openmeteo.js](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/pages/api/widgets/openmeteo.js#L1-L9)
+
+```javascript
+const { latitude, longitude, units, cache, timezone } = req.query;
+const degrees = units === "metric" ? "celsius" : "fahrenheit";
+const timezeone = timezone ?? "auto";
+const apiUrl = `https://api.open-meteo.com/v1/forecast?...`;
+return res.send(await cachedRequest(apiUrl, cache));
+```
+
+**无需 API 密钥**。Open-Meteo 是免费的开放 API，不需要注册和认证。因此整个 handler 不涉及任何密钥解析逻辑，代码极为精简。
+
+#### 三者对比
+
+| 维度 | WeatherAPI | OpenWeatherMap | OpenMeteo |
+|------|-----------|----------------|-----------|
+| 是否需要 API Key | **是** | **是** | **否** |
+| 密钥来源1：widgets.yaml 内联 | `apiKey` 字段 | `apiKey` 字段 | — |
+| 密钥来源2：settings.yaml 全局 | `providers.weatherapi` | `providers.openweathermap` | — |
+| provider 参数校验 | `"weatherapi"` | `"openweathermap"` | — |
+| 无密钥时行为 | 返回 400 | 返回 400 | — |
+| `getPrivateWidgetOptions` 的 type 参数 | `"weatherapi"` | `"openweathermap"` | — |
+
+### 8.4 API 请求构造与参数传递
+
+#### WeatherAPI
+
+**客户端 → 服务端请求**：[weather.jsx#L18-L20](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/components/widgets/weather/weather.jsx#L18-L20)
+
+```javascript
+useSWR(`/api/widgets/weather?${new URLSearchParams({ lang: i18n.language, ...options }).toString()}`);
+```
+
+传递的查询参数：`lang` + `options` 展开的全部字段（`latitude`, `longitude`, `units`, `cache`, `provider`, `index`, `label`, `format` 等）
+
+**服务端 → 第三方 API**：
+
+```
+http://api.weatherapi.com/v1/current.json?q={latitude},{longitude}&key={apiKey}&lang={lang}
+```
+
+注意 WeatherAPI 的坐标通过 `q` 参数传递，格式为 `lat,lon` 逗号分隔。
+
+#### OpenWeatherMap
+
+**客户端 → 服务端请求**：[openweathermap/weather.jsx#L18-L20](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/components/widgets/openweathermap/weather.jsx#L18-L20)
+
+```javascript
+useSWR(`/api/widgets/openweathermap?${new URLSearchParams({ lang: i18n.language, ...options }).toString()}`);
+```
+
+传递的查询参数与 WeatherAPI 相同。
+
+**服务端 → 第三方 API**：
+
+```
+https://api.openweathermap.org/data/2.5/weather?lat={latitude}&lon={longitude}&appid={apiKey}&units={units}&lang={lang}
+```
+
+注意 OpenWeatherMap 坐标通过 `lat` / `lon` 两个独立参数传递，且传入了 `units` 参数。
+
+#### OpenMeteo
+
+**客户端 → 服务端请求**：[openmeteo.jsx#L18](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/components/widgets/openmeteo/openmeteo.jsx#L18)
+
+```javascript
+useSWR(`/api/widgets/openmeteo?${new URLSearchParams({ ...options }).toString()}`);
+```
+
+**注意**：OpenMeteo **不传 `lang` 参数**！这是唯一不传语言参数的天气组件。Open-Meteo API 本身不提供多语言描述，因此不需要语言参数。
+
+**服务端 → 第三方 API**：
+
+```
+https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&daily=sunrise,sunset&current_weather=true&temperature_unit={celsius|fahrenheit}&timezone={timezone|auto}
+```
+
+OpenMeteo 额外请求了 `daily=sunrise,sunset` 日出日落数据，用于客户端计算昼夜状态。
+
+#### 三者对比
+
+| 维度 | WeatherAPI | OpenWeatherMap | OpenMeteo |
+|------|-----------|----------------|-----------|
+| 客户端传 `lang` | **是** (`i18n.language`) | **是** (`i18n.language`) | **否** |
+| 坐标参数格式 | `q=lat,lon` | `lat=x&lon=y` | `latitude=x&longitude=y` |
+| 传 units 参数 | 否（API 自带公/英制字段） | **是** (`units=metric/imperial`) | **是** (`temperature_unit=celsius/fahrenheit`) |
+| 请求日出日落 | 否（API 返回 `is_day` 字段） | 否（API 返回 `sys.sunrise`/`sys.sunset`） | **是** (`daily=sunrise,sunset`) |
+| 第三方 API 域名 | `api.weatherapi.com` | `api.openweathermap.org` | `api.open-meteo.com` |
+
+### 8.5 缓存与刷新机制
+
+三个数据源共享**完全相同**的双层缓存架构，但细节有差异。
+
+#### 第一层：客户端 SWR 缓存
+
+三个组件都直接使用 `useSWR(url)` 调用，**均未设置 `refreshInterval`**，因此：
+
+- 不会定时自动刷新天气数据
+- 刷新触发条件仅依赖 SWR 默认行为：
+  - 窗口重新获得焦点（`revalidateOnFocus: true`，默认开启）
+  - 网络恢复（`revalidateOnReconnect: true`，默认开启）
+  - 组件重新挂载
+
+**SWR 请求 URL 差异**：
+
+| 组件 | SWR 请求 URL 模式 |
+|------|------------------|
+| WeatherAPI | `/api/widgets/weather?lang=zh&latitude=xx&longitude=xx&...` |
+| OpenWeatherMap | `/api/widgets/openweathermap?lang=zh&latitude=xx&longitude=xx&...` |
+| OpenMeteo | `/api/widgets/openmeteo?latitude=xx&longitude=xx&...`（无 lang） |
+
+SWR 的缓存键就是完整 URL，因此不同参数组合会生成不同的缓存条目。
+
+#### 第二层：服务端内存缓存
+
+三个 API handler 都调用同一个 `cachedRequest(url, cache)` 函数。
+
+**WeatherAPI 调用**：[weather.js#L29](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/pages/api/widgets/weather.js#L29)
+
+```javascript
+return res.send(await cachedRequest(apiUrl, cache));
+```
+
+**OpenWeatherMap 调用**：[openweathermap.js#L29](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/pages/api/widgets/openweathermap.js#L29)
+
+```javascript
+return res.send(await cachedRequest(apiUrl, cache));
+```
+
+**OpenMeteo 调用**：[openmeteo.js#L9](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/pages/api/widgets/openmeteo.js#L9)
+
+```javascript
+return res.send(await cachedRequest(apiUrl, cache));
+```
+
+`cachedRequest` 的 `cache` 参数来自客户端查询参数 `req.query.cache`，对应 `widgets.yaml` 中的 `cache` 配置项。`duration` 参数的单位是**分钟**，默认值为 `5`（5 分钟）。
+
+缓存键为完整的第三方 API URL，因此：
+- 同一地点 + 同一 API 的请求会命中缓存
+- 不同 `lang` 参数的 WeatherAPI 请求会生成不同缓存条目（因为 URL 不同）
+
+#### 缓存刷新完整链路
+
+```
+用户切换标签页 / 重新聚焦窗口
+        │
+        ▼
+SWR 检测到 focus 事件 → 发起 revalidate
+        │
+        ▼
+fetch("/api/widgets/openmeteo?latitude=50&longitude=30&...")
+        │
+        ▼
+API handler 取出 cache 参数
+        │
+        ▼
+cachedRequest(apiUrl, cache)
+        │
+        ├─ 内存缓存命中 → 直接返回（不请求第三方）
+        │
+        └─ 内存缓存未命中 / 过期 → 请求第三方 API → 存入缓存 → 返回
+```
+
+### 8.6 数据解析与渲染
+
+三个组件的内部 `Widget` 函数组件负责解析 API 返回数据并渲染，**数据结构差异导致解析逻辑完全不同**。
+
+#### WeatherAPI — [weather.jsx#L15-L54](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/components/widgets/weather/weather.jsx#L15-L54)
+
+```javascript
+// 天气状况代码
+const condition = data.current.condition.code;
+
+// 昼夜判断：API 直接返回 is_day 布尔值
+const timeOfDay = data.current.is_day ? "day" : "night";
+
+// 温度：API 同时返回公制和英制
+const value = options.units === "metric" ? data.current.temp_c : data.current.temp_f;
+
+// 天气描述：API 返回多语言 condition.text
+<SecondaryText>{data.current.condition.text}</SecondaryText>
+
+// 图标映射：使用 condition-map.js（WeatherAPI 代码体系 1000-1282）
+<WidgetIcon icon={mapIcon(condition, timeOfDay)} />
+```
+
+**API 返回数据结构（关键字段）**：
+```json
+{
+  "current": {
+    "temp_c": 22.5,
+    "temp_f": 72.5,
+    "is_day": 1,
+    "condition": {
+      "code": 1003,
+      "text": "Partly cloudy"
+    }
+  }
+}
+```
+
+#### OpenWeatherMap — [openweathermap/weather.jsx#L15-L50](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/components/widgets/openweathermap/weather.jsx#L15-L50)
+
+```javascript
+// 天气状况代码
+const condition = data.weather[0].id;
+
+// 昼夜判断：比较当前时间戳与日出日落时间戳
+const timeOfDay = data.dt > data.sys.sunrise && data.dt < data.sys.sunset ? "day" : "night";
+
+// 温度：API 根据 units 参数返回对应单位的温度
+const value = data.main.temp;
+
+// 天气描述：API 返回多语言 weather[0].description
+<SecondaryText>{data.weather[0].description}</SecondaryText>
+
+// 图标映射：使用 owm-condition-map.js（OWM 代码体系 200-804）
+<WidgetIcon icon={mapIcon(condition, timeOfDay)} />
+
+// 错误检测：检查 cod === 401（认证失败）
+if (data?.cod === 401) return <Error />;
+```
+
+**API 返回数据结构（关键字段）**：
+```json
+{
+  "main": { "temp": 22.5 },
+  "weather": [{ "id": 801, "description": "few clouds" }],
+  "dt": 1718000000,
+  "sys": { "sunrise": 1717970000, "sunset": 1718020000 }
+}
+```
+
+#### OpenMeteo — [openmeteo.jsx#L15-L55](file:///d:/fz/0601/solo-dogfeeding/code/203-homepage/src/components/widgets/openmeteo/openmeteo.jsx#L15-L55)
+
+```javascript
+// 天气状况代码
+const condition = data.current_weather.weathercode;
+
+// 昼夜判断：比较当前时间字符串与日出日落字符串（ISO 格式）
+const timeOfDay =
+  data.current_weather.time > data.daily.sunrise[0] &&
+  data.current_weather.time < data.daily.sunset[0]
+    ? "day" : "night";
+
+// 温度：API 根据 temperature_unit 返回对应单位
+const value = data.current_weather.temperature;
+
+// 天气描述：使用 i18n 翻译键 wmo.{code}-{day|night}
+<SecondaryText>{t(`wmo.${data.current_weather.weathercode}-${timeOfDay}`)}</SecondaryText>
+
+// 图标映射：使用 openmeteo-condition-map.js（WMO 代码体系 0-99）
+<WidgetIcon icon={mapIcon(condition, timeOfDay)} />
+```
+
+**API 返回数据结构（关键字段）**：
+```json
+{
+  "current_weather": {
+    "temperature": 22.5,
+    "weathercode": 3,
+    "time": "2024-06-10T14:00"
+  },
+  "daily": {
+    "sunrise": ["2024-06-10T05:30"],
+    "sunset": ["2024-06-10T21:00"]
+  }
+}
+```
+
+#### 渲染差异对比
+
+| 维度 | WeatherAPI | OpenWeatherMap | OpenMeteo |
+|------|-----------|----------------|-----------|
+| 温度字段 | `current.temp_c` / `temp_f` | `main.temp` | `current_weather.temperature` |
+| 昼夜判断 | `current.is_day`（API 直接返回） | `dt > sys.sunrise && dt < sys.sunset` | `time > daily.sunrise[0] && time < daily.sunset[0]` |
+| 天气代码字段 | `current.condition.code` | `weather[0].id` | `current_weather.weathercode` |
+| 天气描述来源 | API 返回 `condition.text` | API 返回 `weather[0].description` | **i18n 翻译键** `wmo.{code}-{day\|night}` |
+| 图标映射文件 | `condition-map.js` | `owm-condition-map.js` | `openmeteo-condition-map.js` |
+| 天气代码体系 | WeatherAPI (1000-1282) | OWM (200-804) | WMO (0-99) |
+| 认证失败检测 | `data?.error` | `data?.cod === 401` | `data?.error` |
+| 容器 CSS 类名 | `information-widget-weather` | `information-widget-openweathermap` | `information-widget-openmeteo` |
+
+### 8.7 昼夜判断逻辑对比
+
+三种 API 对"当前是白天还是黑夜"的判断方式差异显著：
+
+**WeatherAPI**：最简单，API 直接返回 `is_day: 1 | 0`
+```javascript
+const timeOfDay = data.current.is_day ? "day" : "night";
+```
+
+**OpenWeatherMap**：通过 Unix 时间戳比较
+```javascript
+const timeOfDay = data.dt > data.sys.sunrise && data.dt < data.sys.sunset ? "day" : "night";
+```
+
+**OpenMeteo**：通过 ISO 时间字符串比较
+```javascript
+const timeOfDay =
+  data.current_weather.time > data.daily.sunrise[0] &&
+  data.current_weather.time < data.daily.sunset[0]
+    ? "day" : "night";
+```
+
+> OpenMeteo 的字符串比较在此场景下是可靠的，因为 ISO 格式时间字符串的字典序与时间序一致。
+
+### 8.8 天气描述多语言策略对比
+
+| 数据源 | 描述来源 | 多语言支持方式 |
+|--------|---------|---------------|
+| WeatherAPI | API 返回 `condition.text` | API 本身支持 `lang` 参数，返回对应语言的描述 |
+| OpenWeatherMap | API 返回 `weather[0].description` | API 本身支持 `lang` 参数，返回对应语言的描述 |
+| OpenMeteo | **不返回描述文本** | 使用 i18n 翻译键 `wmo.{code}-{day\|night}`，描述文本在前端本地化文件中维护 |
+
+OpenMeteo 的策略意味着天气描述的翻译质量取决于项目自身的本地化文件，而非第三方 API。这种方式的优势是：即使 API 不支持某语言，前端仍可自行提供翻译。
+
+### 8.9 完整数据流对比图
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                        widgets.yaml 配置                             │
+│                                                                      │
+│  - weatherapi:          - openweathermap:       - openmeteo:         │
+│      latitude: 39.9        latitude: 39.9          latitude: 39.9   │
+│      longitude: 116.4      longitude: 116.4        longitude: 116.4 │
+│      apiKey: xxx           apiKey: xxx             timezone: ...     │
+│      cache: 5              cache: 5                units: metric     │
+│                             units: metric            cache: 5        │
+│                             provider: ...                            │
+└────────┬───────────────────────┬───────────────────────┬─────────────┘
+         │                       │                       │
+         ▼                       ▼                       ▼
+┌─────────────────┐   ┌─────────────────────┐   ┌─────────────────┐
+│ WeatherApi 组件  │   │ OpenWeatherMap 组件  │   │ OpenMeteo 组件   │
+│ (weather.jsx)   │   │ (weather.jsx)       │   │ (openmeteo.jsx) │
+│                 │   │                     │   │                 │
+│ 地区获取 ──────  │   │ 地区获取 ──────      │   │ 地区获取 ──────  │
+│ (同三份代码)     │   │ (同三份代码)         │   │ (同三份代码)     │
+└────────┬────────┘   └─────────┬───────────┘   └────────┬────────┘
+         │                      │                        │
+         ▼                      ▼                        ▼
+  useSWR(               useSWR(                  useSWR(
+   /api/widgets/         /api/widgets/            /api/widgets/
+    weather?              openweathermap?          openmeteo?
+     lang=zh              lang=zh                  (无lang)
+     &lat=...             &lat=...                 &lat=...
+     &lon=...             &lon=...                 &lon=...
+     &cache=5             &units=...               &units=...
+     &provider=...        &cache=5                 &timezone=...
+     &index=...           &provider=...            &cache=5
+                          &index=...               &index=...
+  )                     )                        )
+         │                      │                        │
+         ▼                      ▼                        ▼
+┌─────────────────┐   ┌─────────────────────┐   ┌─────────────────┐
+│ weather.js      │   │ openweathermap.js    │   │ openmeteo.js     │
+│                 │   │                     │   │                 │
+│ 1.取 widget     │   │ 1.取 widget          │   │ 无需密钥         │
+│   私有 apiKey   │   │   私有 apiKey        │   │                 │
+│ 2.无 → 取       │   │ 2.无 → 取            │   │ 直接构造 API URL │
+│   providers.    │   │   providers.          │   │                 │
+│   weatherapi    │   │   openweathermap      │   │                 │
+│ 3.仍无 → 400    │   │ 3.仍无 → 400         │   │                 │
+└────────┬────────┘   └─────────┬───────────┘   └────────┬────────┘
+         │                      │                        │
+         ▼                      ▼                        ▼
+  cachedRequest(          cachedRequest(           cachedRequest(
+   weatherapi_url,         owm_url,                 openmeteo_url,
+   cache_min               cache_min                cache_min
+  )                       )                        )
+         │                      │                        │
+         ▼                      ▼                        ▼
+┌─────────────────┐   ┌─────────────────────┐   ┌─────────────────┐
+│ WeatherAPI      │   │ OpenWeatherMap API   │   │ Open-Meteo API  │
+│ API 响应        │   │ 响应                 │   │ 响应            │
+│                 │   │                     │   │                 │
+│ current.temp_c  │   │ main.temp           │   │ current_weather │
+│ current.temp_f  │   │ weather[0].id       │   │   .temperature  │
+│ current.is_day  │   │ weather[0].desc     │   │   .weathercode  │
+│ current.cond.   │   │ sys.sunrise/sunset  │   │   .time         │
+│   code / text   │   │ dt                  │   │ daily.sunrise   │
+│                 │   │                     │   │ daily.sunset    │
+└────────┬────────┘   └─────────┬───────────┘   └────────┬────────┘
+         │                      │                        │
+         ▼                      ▼                        ▼
+┌─────────────────┐   ┌─────────────────────┐   ┌─────────────────┐
+│ condition-map   │   │ owm-condition-map   │   │ openmeteo-      │
+│ .js             │   │ .js                 │   │ condition-map.js│
+│ (1000-1282)     │   │ (200-804)           │   │ (0-99 WMO)      │
+└─────────────────┘   └─────────────────────┘   └─────────────────┘
+```
