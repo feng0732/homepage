@@ -451,9 +451,9 @@ DOM 结构：
 
 ## 五、加载与缓存策略
 
-### 5.1 数据层缓存：SWR
+### 5.1 客户端数据缓存：SWR
 
-`package.json` 中 `swr` (`stale-while-revalidate`) 是项目统一的数据获取与缓存库。
+`package.json` 中 `swr` (`stale-while-revalidate`) 是项目统一的客户端数据获取与缓存库。
 
 **全局配置**（`src/pages/_app.jsx` L75-L79）：
 ```jsx
@@ -461,6 +461,12 @@ DOM 结构：
   fetcher: (resource, init) => fetch(resource, init).then((res) => res.json()),
 }}>
 ```
+
+全局未设置 `dedupingInterval`、`revalidateOnFocus`、`revalidateIfStale`、`revalidateOnReconnect`，均使用 SWR 默认值（`dedupingInterval: 2000ms`、`revalidateOnFocus: true`、`revalidateIfStale: true`、`revalidateOnReconnect: true`），即：
+- 相同 URL 的并发请求在 2 秒内自动去重
+- 浏览器标签页重新获得焦点时自动重新验证
+- 挂载组件时如果缓存已过期则自动重新验证
+- 网络恢复连接时自动重新验证
 
 **SSR Fallback 预填充**：`getStaticProps` 构建时预取数据，通过 `fallback` 注入 SWR 缓存，避免客户端首屏二次请求（`src/pages/index.jsx` L55-L77）：
 
@@ -484,7 +490,43 @@ return {
 </SWRConfig>
 ```
 
-### 5.2 配置变更检测：Hash 轮询
+### 5.2 Widget 定时刷新：SWR refreshInterval
+
+Widget 通过 `useWidgetAPI`（`src/utils/proxy/use-widget-api.js` L1-L16）统一请求数据，该 Hook 封装了 SWR 并支持传入 `refreshInterval` 实现定时轮询：
+
+```javascript
+export default function useWidgetAPI(widget, ...options) {
+  const config = {};
+  if (options && options[1]?.refreshInterval) {
+    config.refreshInterval = options[1].refreshInterval;
+  }
+  let url = formatProxyUrl(widget, ...options);
+  if (options[0] === "") url = null;
+  const { data, error, mutate } = useSWR(url, config);
+  return { data, error: data?.error ?? error, mutate };
+}
+```
+
+`refreshInterval` 由各 Widget 组件自行设定，典型值如下：
+
+| 场景 | Widget | refreshInterval | 说明 |
+|------|--------|-----------------|------|
+| 实时播放状态 | plex / tautulli / tracearr | 5000ms (5s) | 正在播放时持续轮询 |
+| 实时播放状态 | jellyfin / emby | 5000ms (5s) | enableNowPlaying 时；否则 60000ms |
+| 系统监控 | glances | 1500ms (1.5s) | 默认值，用户可通过 YAML 覆盖 |
+| 容器编排 | kubernetes / longhorn | 1500ms (1.5s) | |
+| 下载器 | jdownloader | 30000ms (30s) | |
+| 智能家居 | homeassistant | 60000ms (60s) | |
+| 日历 | calendar (ical) | 300000ms (5min) | |
+| 站点监控 | site-monitor / ping | 30000ms (30s) | |
+| 自定义 API | customapi | 10000ms (10s)，最小 1000ms | 用户可通过 YAML 配置 |
+| Prometheus | prometheusmetric | 10000ms (10s)，最小 1000ms | 用户可通过 YAML 配置 |
+| iframe | iframe | 用户配置，最小 1000ms | 使用 setInterval 自实现，不走 SWR |
+| 系统资源 | resources (cpu/memory/disk/network/uptime/cputemp) | `settings.refresh` 配置 | 来自 settings.yaml 全局设置 |
+
+**Glances 的用户可配置刷新**：`src/widgets/glances/metrics/*.jsx` 中，`refreshInterval` 从 widget 配置读取，并用 `Math.max(defaultInterval, refreshInterval)` 确保不低于默认值（通常 1500ms 或 3000ms）。
+
+### 5.3 配置变更检测：Hash 轮询
 
 通过 `/api/hash` 检测配置文件变化，窗口重新获得焦点时触发检查（`src/pages/index.jsx` L100-L131）：
 
@@ -508,11 +550,14 @@ useEffect(() => {
 
 配合自定义 Hook：`src/utils/hooks/window-focus.js` L1-L26 监听 `window.focus/blur` 事件。
 
-### 5.3 内存缓存：memory-cache
+### 5.4 服务端进程内缓存：memory-cache
 
-服务端环境变量使用 `package.json` 中 `memory-cache` 包做进程内缓存：
+`memory-cache` 包提供 Node.js 进程内键值对缓存，支持 TTL 过期。项目中有 **3 类独立用途**：
 
-`src/utils/config/config.js` L52-L62
+#### 5.4.1 环境变量缓存
+
+`src/utils/config/config.js` L52-L62：缓存 `process.env` 中 `HOMEPAGE_VAR_*` / `HOMEPAGE_FILE_*` 变量的过滤结果，无 TTL（进程生命周期内有效）：
+
 ```javascript
 function getCachedEnvironmentVars() {
   let cachedVars = cache.get(cacheKey);
@@ -526,7 +571,134 @@ function getCachedEnvironmentVars() {
 }
 ```
 
-### 5.4 组件懒加载：next/dynamic
+#### 5.4.2 HTTP 代理通用响应缓存
+
+`src/utils/proxy/http.js` L85-L109：`cachedRequest()` 函数对外部 API 响应做短期缓存，TTL 为 `duration * 60 * 1000` 毫秒（`duration` 默认 5 分钟）：
+
+```javascript
+export async function cachedRequest(url, duration = 5, ua = "homepage") {
+  const cached = cache.get(url);
+  if (cached) return cached;
+  let [, , data] = await httpProxy(url, { headers: { "User-Agent": ua, Accept: "application/json" } });
+  if (Buffer.isBuffer(data)) data = JSON.parse(Buffer.from(data).toString());
+  cache.put(url, data, duration * 1000 * 60);
+  return data;
+}
+```
+
+#### 5.4.3 Widget 代理 Token/Session 缓存
+
+**这是服务端缓存的主线**：约 15 个 Widget 的代理处理器（proxy.js）使用 `memory-cache` 缓存认证令牌/会话，避免每次 API 请求都重新登录。
+
+**统一缓存模式**：
+
+```
+1. cache.get(key) → 命中则直接使用
+2. 未命中 → 调用外部 login API → cache.put(key, token/session, TTL)
+3. 后续请求携带缓存凭证 → 若返回 401/403 → cache.del(key) → 重新登录
+```
+
+**缓存键命名规范**：`{proxyName}__{tokenType}.{service}`，如 `omadaProxyHandler__session.g.svc.0`
+
+**各 Widget 的 Token/Session 缓存详情**：
+
+| Widget | 缓存键 | 缓存内容 | TTL | 失效策略 |
+|--------|--------|---------|-----|---------|
+| omada | `__session.group.svc.idx` | `{ token, cookieHeader }` | 55 分钟 | 401/403/`errorCode>0` 时 `cache.del()` 重登录 |
+| npm | `__token.svc` | JWT token | `expiration - 5分钟` | 403 时 `cache.del()` 重登录 |
+| pihole | `__sessionSID.svc` | SID 字符串 | `validity * 1000`（服务端返回的有效期） | 登录失败时 `cache.del()` |
+| kavita | `__sessionToken.svc` | access token | 无 TTL（进程内永久） | 无 token 时触发登录 |
+| homebridge | `__sessionToken.svc` | access token | `expiresIn * 1000 - 5分钟` | 无 token 时触发登录 |
+| homebox | `__sessionToken.svc` | token 字符串 | `expiresAtDate - Date.now()` | 无 token 时触发登录 |
+| freshrss | `__sessionToken.svc` | auth token | 无 TTL | 无 token 时触发登录 |
+| dispatcharr | `__token.svc` | access token | 无 TTL | 401/认证失败时 `cache.del()` |
+| crowdsec | `__sessionToken.svc` | JWT token | 服务端返回的 `ttl` 毫秒 | 401 时 `cache.del()` |
+| plex | `__libraries/libraries` | 媒体库列表 | 6 小时 | — |
+| plex | `__albums/movies/tv` | 专辑/电影/剧集 | 10 分钟 | — |
+| qnap | `__sessionToken.svc` | SID token | 无 TTL | 无 token 时触发登录 |
+| transmission | `__headers.svc` | CSRF token (X-Transmission-Session-Id) | 无 TTL | 409 响应时更新 |
+| pyload | `__sessionId.svc` | session cookie | 23 小时 | 认证失败时 `cache.del()` |
+| pyload | `__isNg.svc` | 是否 ng 版本 | 无 TTL | — |
+| beszel | `__token.svc` | JWT token | `expiration - 5分钟` | 认证失败时 `cache.del()` |
+| booklore | `__token.svc` | JWT token | `expiration - 5分钟` | 认证失败时 `cache.del()` |
+| synology | （handler 内部管理） | SID | 服务端返回的 TTL | 401/404 时重新登录 |
+| unifi | （handler 内部管理） | CSRF token + cookie | 900 秒 | — |
+
+### 5.5 Cookie Jar：跨请求 Cookie 持久化
+
+`src/utils/proxy/cookie-jar.js` L1-L40 使用 `tough-cookie` 库维护一个全局 `CookieJar` 实例，在服务端代理请求中自动管理 Cookie：
+
+- **`setCookieHeader(url, params)`**：请求前从 Jar 中提取匹配 URL 的 Cookie 写入 `headers.Cookie`
+- **`addCookieToJar(url, headers)`**：响应后将 `Set-Cookie` 头存入 Jar，设置 `maxAge: 3600s`
+- **重定向处理**：`http.js` 中 `beforeRedirect` 钩子在每次重定向时同步更新 Cookie
+
+这个 Cookie Jar 与 `memory-cache` 的 Token 缓存互补：Cookie Jar 管理 HTTP 层面的 Cookie 传递，Token 缓存管理应用层面的认证令牌。
+
+### 5.6 HTTP Agent 连接复用
+
+`src/utils/proxy/http.js` L228-L250 使用 `Map` 缓存 HTTP Agent 实例，启用 `keepAlive: true`，避免每次代理请求都建立新 TCP 连接：
+
+```javascript
+const agentCache = new Map();
+
+function getAgent(protocol, disableIpv6) {
+  const cacheKey = `${protocol}:${disableIpv6 ? "ipv4" : "auto"}`;
+  const cachedAgent = agentCache.get(cacheKey);
+  if (cachedAgent) return cachedAgent;
+  const agent = protocol === "https:"
+    ? new https.Agent({ keepAlive: true, ...agentOptions, rejectUnauthorized: false })
+    : new http.Agent({ keepAlive: true, ...agentOptions });
+  agentCache.set(cacheKey, agent);
+  return agent;
+}
+```
+
+支持 `HOMEPAGE_PROXY_DISABLE_IPV6=true` 环境变量禁用 IPv6。同时包含 DNS 回退机制：`dns.lookup` 失败时自动尝试 `dns.resolve`（c-ares），解决 Alpine/musl 环境 DNS 解析问题。
+
+### 5.7 代理请求链路总览
+
+```
+浏览器 Widget 组件
+    │
+    ▼
+useWidgetAPI(widget, endpoint, { refreshInterval })  [客户端]
+    │  → useSWR("/api/services/proxy?group=&service=&endpoint=", config)
+    │     → SWR 缓存 + refreshInterval 定时轮询
+    ▼
+/api/services/proxy  [服务端 API Route]
+    │  → getServiceWidget() 获取 widget 配置
+    │  → 查找 widgets[type].proxyHandler
+    ▼
+┌────────────────────────────────────────────────────────────────┐
+│ ProxyHandler (3 类):                                           │
+│                                                                │
+│ ① genericProxyHandler                                         │
+│    → 直接 httpProxy(url, { headers })                          │
+│    → 无额外缓存                                                │
+│                                                                │
+│ ② credentialedProxyHandler                                    │
+│    → 根据 widget.type 注入不同认证头 (Bearer/Basic/X-API-Key)  │
+│    → httpProxy(url, { headers, withCredentials: true })        │
+│    → 无额外缓存，凭证从 YAML 配置直接读取                      │
+│                                                                │
+│ ③ 自定义 ProxyHandler (如 omada/npm/pihole/plex 等)            │
+│    → cache.get(tokenKey) → 命中则使用缓存 token/session        │
+│    → 未命中 → login() → cache.put(tokenKey, token, TTL)        │
+│    → httpProxy(url, { headers: { Authorization: token } })     │
+│    → 401/403 → cache.del(tokenKey) → 重新 login()             │
+│    → 部分还使用 cachedRequest() 做响应级短期缓存               │
+└────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+httpProxy(url, params)  [底层 HTTP 客户端]
+    │  → getAgent() 复用 keep-alive Agent
+    │  → addCookieHandler() 自动携带/存储 Cookie
+    │  → DNS 回退机制
+    ▼
+外部服务 API
+```
+
+### 5.8 组件懒加载：next/dynamic
 
 **Toggle 组件 SSR 禁用**（因为需要 localStorage，服务端无此 API）：
 `src/pages/index.jsx` L30-L40
@@ -549,7 +721,7 @@ const components = {
 };
 ```
 
-### 5.5 静态资源版本化（Cache Busting）
+### 5.9 静态资源版本化（Cache Busting）
 
 `public/` 下的静态资源通过 query 参数版本号绕过浏览器缓存：
 
@@ -562,7 +734,7 @@ const components = {
 /mstile-150x150.png?v=2
 ```
 
-### 5.6 配置文件自动初始化
+### 5.10 配置文件自动初始化
 
 首次启动时自动从骨架模板复制到 config 目录（`src/utils/config/config.js` L15-L50）：
 
@@ -699,4 +871,11 @@ YAML 配置 / Docker K8s 自动发现
 | `src/utils/config/config.js` | 配置文件加载、环境变量替换、骨架复制 |
 | `src/utils/config/api-response.js` | 服务/书签/Widget 数据聚合响应 |
 | `src/utils/hooks/window-focus.js` | 窗口焦点 Hook（配置刷新触发） |
+| `src/utils/proxy/use-widget-api.js` | Widget API 请求 Hook（封装 SWR + refreshInterval） |
+| `src/utils/proxy/api-helpers.js` | 代理 URL 格式化、参数解析、错误 URL 脱敏 |
+| `src/utils/proxy/http.js` | 底层 HTTP 客户端（keep-alive Agent、cachedRequest、Cookie 管理、DNS 回退） |
+| `src/utils/proxy/cookie-jar.js` | 跨请求 Cookie 持久化（tough-cookie 全局 Jar） |
+| `src/utils/proxy/handlers/generic.js` | 通用代理处理器（Basic Auth + 直接转发） |
+| `src/utils/proxy/handlers/credentialed.js` | 凭证代理处理器（按 widget.type 注入不同认证头） |
+| `src/pages/api/services/proxy.js` | 服务代理 API Route（映射 endpoint → proxyHandler） |
 | `src/widgets/components.js` | 150+ Widget 组件 dynamic import 映射 |
