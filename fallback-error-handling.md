@@ -401,6 +401,173 @@ expect(logger.error).toHaveBeenCalled();         // ❌ 只断言日志，没断
 
 **悬挂场景的泄漏面**：未 resolve 的 Promise 持有闭包（`data` 数组、`url`、`params`）→ 整个 `handleRequest` 作用域无法 GC；TCP socket 在 Node.js 超时前也无法正常回收。`end` 事件永不触发 → `addCookieToJar` 也不会被调用 → 重定向 Cookie 可能丢失（但悬挂场景下请求本身也没结束）。
 
+#### 前端 SWR 侧：Promise 挂起后的自动恢复机制分析
+
+服务端 `handleRequest` Promise 挂起后，前端 SWR（v2.4.1）是否能自动发起新请求、是否有超时退出、`refreshInterval` 是否会被卡住，取决于以下 5 个机制的交互。
+
+##### 配置总览：代码中实际生效的 SWR 参数
+
+**全局层（`_app.jsx` + `index.jsx` 双重 SWRConfig）**
+- [\_app.jsx#L75-L79](file:///d:/fz/0601/solo-dogfeeding/code/209-homepage/src/pages/_app.jsx#L75-L79)：全局 fetcher = `fetch(resource, init).then(res => res.json())`
+- [index.jsx#L186](file:///d:/fz/0601/solo-dogfeeding/code/209-homepage/src/pages/index.jsx#L186)：补充 SSR fallback 数据
+- **注意：全局完全没有配置 `timeout` / `dedupingInterval` / `onErrorRetry` / `errorRetryInterval`** — 全部使用 SWR v2.4.1 的默认值
+
+**Hook 层（useWidgetAPI，每个 widget 调用）**
+- [use-widget-api.js#L6-L14](file:///d:/fz/0601/solo-dogfeeding/code/209-homepage/src/utils/proxy/use-widget-api.js#L6-L14)：仅注入可选的 `refreshInterval`（由各 widget 提供，范围 1500ms ~ 300000ms，无配置则 undefined）
+- SWR key 格式：`/api/services/proxy?group=xxx&service=xxx&index=n&endpoint=yyy`（见 [api-helpers.js#L43-L49](file:///d:/fz/0601/solo-dogfeeding/code/209-homepage/src/utils/proxy/api-helpers.js#L43-L49)）
+
+**SWR v2.4.1 默认关键参数（对照代码未覆盖的部分）**
+
+| 参数 | 默认值 | 对悬挂 Promise 的影响 |
+|------|--------|----------------------|
+| `dedupingInterval` | **2000 ms** | 同一 key 2s 内重复 hook 挂载 → 复用同一个 pending fetcher，**不会发新请求** |
+| `onErrorRetry` | 内置指数退避策略（5次，5000ms 上限） | ⚠️ **仅在 fetcher throw / Promise reject 时触发**，对既不 resolve 也不 reject 的 pending Promise **完全无效** |
+| `errorRetryInterval` | 指数退避 `min(~~(5000 * (Math.random() + 1)), 5000)` 起 | 同上，仅对已确定是 error 的情况生效 |
+| `focusThrottleInterval` | **5000 ms** | 窗口聚焦触发重验证的节流 |
+| `loadingTimeout` | **undefined** | 无内置 loading 超时转 error 的机制 |
+| `keepPreviousData` | false | key 切换时不保留旧 data |
+| **fetch API（浏览器内置）** | 无默认超时（仅受操作系统 TCP keepalive 限制，通常分钟级 ~ 小时级） | 悬挂的 fetch 请求将在 TCP 层面长时间不结束 |
+
+##### 5 个恢复机制逐个分析
+
+```
+═══════════════════════════════════════════════════════════════════════════
+机制 1：onErrorRetry 自动重试
+═══════════════════════════════════════════════════════════════════════════
+前提条件：SWR 观察到 fetcher Promise reject（或 throw）
+问题    ：悬挂 Promise 既不 resolve 也不 reject → 永远不满足前提
+结论    ：❌ 完全无效。悬挂场景下 onErrorRetry 永远不会被调用，
+          因为它的触发点是 Promise.then 的 rejected 分支
+
+═══════════════════════════════════════════════════════════════════════════
+机制 2：refreshInterval 周期轮询（各 widget 配置 1.5s ~ 5min）
+═══════════════════════════════════════════════════════════════════════════
+SWR v2 内部实现：softRevalidate → 检查是否有 inFlightRequest
+  if (CONCURRENT_PENDING 请求存在) → return，不发起新 fetcher
+  else → startRequest（启动新 fetcher）
+
+关键代码逻辑（SWR 内部）：
+  const tick = () => {
+    if (!getCache().keyMatch(key, cache)) return clearInterval(timer)
+    if (!stateRef.current.isLoading) {    // ← 关键判断
+      // 只有 !isLoading 才会发新请求
+      softRevalidate({ dedupe: false, ... })
+    }
+  }
+  timer = setInterval(tick, intervalMs)
+
+问题    ：Promise 悬挂期间 isLoading === true（因为有 in-flight fetcher）
+          → refreshInterval 每次 tick 都被跳过
+结论    ：❌ **在 Promise 挂起期间，refreshInterval 完全不会触发新请求**
+          直到当前悬挂的 Promise 被外部方式结束（网络超时断开 / 页面关闭）
+
+═══════════════════════════════════════════════════════════════════════════
+机制 3：dedupingInterval（默认 2000ms）
+═══════════════════════════════════════════════════════════════════════════
+SWR v2 去重逻辑：
+  new hook(key, fn) 挂载时：
+    if (Map[key] 存在正在执行的 fetcher && 启动 < 2000ms 前)
+      → 复用该 Promise，不发新
+    else
+      → 启动新 fetcher，覆盖旧 Map 条目
+
+两种分情况：
+  ① 页面刚加载 2s 内进入悬挂：
+     → 后续同 key 的其他 hook（如果有）会复用悬挂 Promise
+     → 2s 后如果 Promise 仍 pending：超出 dedupingInterval 窗口
+        → 新 hook 挂载会认为过期 → 启动新 fetcher
+        → ✅ 2秒后会有一次自动发新请求的机会！
+  ② 加载完毕 2s 后才进入悬挂（如 refreshInterval 发起的某次轮询）：
+     → 去重窗口已经过去，下次该 widget re-render（或其他 hook 变化）
+        → 若重新调用 useSWR → 认为没有有效 in-flight → 启动新 fetcher
+        → ✅ 理论上也能触发新请求（但取决于 React 渲染节奏）
+
+额外关键问题：SWR 的 Map 里挂着的悬挂 Promise 会被手动 abort 吗？
+  → SWR v2 默认**不提供 AbortController 集成**，代码也没传 signal
+  → 旧的悬挂 Promise 永远在跑，只是不再被新 hook 引用
+  → 内存泄漏 + TCP 连接泄漏持续存在
+
+结论    ：⚠️ 部分有效。dedupingInterval 过期后（2s + α），
+          若触发了新的 useSWR 调用（re-render），可能会启动新请求；
+          但同时旧的悬挂 Promise 仍在后台继续运行不退出。
+
+═══════════════════════════════════════════════════════════════════════════
+机制 4：浏览器 fetch / TCP 层超时
+═══════════════════════════════════════════════════════════════════════════
+代码中的 fetcher：fetch(url)，无任何 AbortController / signal / timeout
+
+浏览器行为：
+  fetch 本身**不设超时**。HTTP 请求在以下情况才会被浏览器终止：
+    ① TCP 连接被 RST 包打断（对端重启 / 防火墙强制断开）
+    ② 操作系统 TCP keepalive 超时（默认 Windows 2h，Linux 数小时）
+    ③ 浏览器标签页内存/性能保护强制终止（罕见，且不可控）
+
+反向代理 / Next.js Node.js 服务端：
+  → Next.js 自身 HTTP 服务器通常有默认超时（Node http 默认无，但 Next 可能设置 30s）
+  → 但 handleRequest 的 Promise 挂起在 zlib 流的 end 事件上，
+     即使 socket 被服务端关闭，zlib 的 Transform 也不一定 emit end
+     （取决于 socket close 时 gunzip 是否走了正常 finish 路径）
+
+结论    ：❌ 在分钟~小时级别的时间尺度内，基本可以视为"永不超时"。
+          只有极端网络条件下才会被动终止，且终止时是否 reject / resolve
+          取决于具体路径，不可靠。
+
+═══════════════════════════════════════════════════════════════════════════
+机制 5：mutate() / 窗口聚焦 / SWR 手动重验证
+═══════════════════════════════════════════════════════════════════════════
+a) mutate(key, newData, { revalidate: true })
+   → mutate 强制启动新 fetcher，**不检查 isLoading**（除非 dedupe）
+   → 但若前一个 Promise 2s 内挂起且仍在 deduping 窗口，仍可能命中去重
+   → 实测：mutate(key) 会取消去重（dedupe=false 默认），✅ 能强制发起新请求
+
+b) 窗口聚焦（focus/reconnect）
+   → SWR 内置 focusThrottleInterval=5000ms 的节流
+   → 触发的 softRevalidate 同样检查 isLoading
+   → ❌ isLoading=true（悬挂中）时不发新请求
+
+c) localStorage hash 变更 → 强制 reload
+   → [index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/209-homepage/src/pages/index.jsx)
+   中 useWindowFocus 监控 hash，不一致时 setStale → 调用 /api/revalidate
+   → 最终 `window.location.reload()` 整页刷新
+   → ✅ 能完全恢复（但这是配置变更触发的 reload，非 gzip 错误专属）
+
+结论    ：✅ mutate() 能强制恢复；整页 reload 能完全恢复。
+          其他聚焦 / 重连自动机制与 refreshInterval 同命运，被 isLoading 卡住。
+```
+
+##### 结论决策矩阵：A / C 悬挂场景下 SWR 侧真实行为
+
+| 时间段 | 恢复机制 | 是否生效 | 用户看到什么 |
+|--------|---------|:---:|-------------|
+| 0 ~ 2s | dedupingInterval 窗口内 | ❌ 卡住 | widget 骨架屏 `animate-pulse` + `"-"` 占位 |
+| 2s 时 | dedupingInterval 过期 | ⚠️ 条件生效 | 如果 widget 恰好 re-render → 触发全新 fetcher；否则仍卡住 |
+| 2s ~ 无限 | refreshInterval | ❌ 被 isLoading 拦住 | 骨架屏持续，轮询全部跳过，**没有新请求发出** |
+| 任意时刻 | 用户点击 / 路由切换 → 组件卸载重挂载 | ✅ 生效 | 组件卸载 → SWR 卸载该 key hook → 再挂载 → 全新 fetcher 启动 |
+| 任意时刻 | 窗口聚焦 + 配置 hash 变更 | ✅ 生效（整页 reload） | 显示 stale 加载动画 → `/api/revalidate` → 页面整体刷新 |
+| 任意时刻 | 用户手动 F5 刷新 | ✅ 生效 | 完整恢复 |
+| 分钟/小时级 | TCP 超时断开 | ⚠️ 不可靠 | 如果 socket 断开时 Promise 碰巧 resolve/reject → SWR 进入下一状态；否则继续挂 |
+| 永久悬挂 | 内存/连接泄漏 | - | 用户无感知，但浏览器 tab 内存持续增长，Node 服务端句柄泄漏 |
+
+##### 最终结论：能不能自动恢复？
+
+**短答案：在没有人工干预的情况下，概率 ≈ 很低。**
+
+只有以下几种会**自动**触发新请求的路径：
+1. **2s 内 + 组件重渲染**（概率低，需要 React 因其他 state 变更而重渲染该 widget）
+2. **用户交互导致组件卸载重挂载**（tab 切换 / 展开收起等，视产品行为而定）
+3. **配置 hash 变更导致整页 reload**（这是 YAML 文件修改触发的，与 gzip 错误无关）
+
+**不会自动恢复的情况：**
+- `refreshInterval` 轮询（被 `isLoading === true` 挡住）
+- `onErrorRetry` 重试（永远不触发，因为 Promise 没 reject）
+- 窗口聚焦 / 网络重连（同 refreshInterval，被 isLoading 卡住）
+- 浏览器 fetch 超时（分钟~小时级以上才可能发生，且不保证能 resolve/reject）
+
+**悬挂请求的泄漏情况：**
+- 旧的悬挂 Promise 在 SWR cache 里，2s deduping 后就不再被引用，但自身闭包还持有 → **`handleRequest` 作用域内内存泄漏**
+- 对应的 HTTP 连接：服务端 gunzip 流没结束，TCP socket 没关闭 → **Node 服务端句柄泄漏**
+- 这些泄漏在整页 reload / tab 关闭之前不会被清理
+
 ### 5.3 HTTP 请求异常兜底
 
 **异常来源**：
