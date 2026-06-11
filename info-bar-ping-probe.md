@@ -208,7 +208,7 @@ const { data, error } = useSWR(
 
 ### 7.1 SWR 版本与全局配置
 
-项目使用 SWR v2.4.1（见 [package.json](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/package.json#L41)）。
+项目使用 **SWR v2.4.1**（见 [package.json](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/package.json#L41)，npm 记录该版本发布于 2025 年 3 月）。
 
 SWR 的全局配置有两层：
 
@@ -226,7 +226,7 @@ SWR 的全局配置有两层：
 <SWRConfig value={{ fallback, fetcher: (resource, init) => fetch(resource, init).then((res) => res.json()) }}>
 ```
 
-两层配置均只声明了 `fetcher` 和（页面级的）`fallback`，**未显式覆盖任何 SWR 行为开关**，因此所有组件均采用 SWR v2 的**默认值**。
+两层配置均只声明了 `fetcher` 和（页面级的）`fallback`，**未显式覆盖任何 SWR 行为开关**，因此所有组件均采用 SWR v2.4.1 的**默认值**。
 
 Ping/SiteMonitor 组件自身的 SWR 调用（[ping.jsx](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/src/components/services/ping.jsx#L6-L8)、[site-monitor.jsx](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/src/components/services/site-monitor.jsx#L6-L8)）：
 ```jsx
@@ -234,16 +234,16 @@ const { data, error } = useSWR(url, { refreshInterval: 30000 });
 ```
 只显式设置了 `refreshInterval: 30000`，其余也走 SWR 默认。
 
-### 7.2 SWR v2 与探测相关的默认行为
+### 7.2 SWR v2.4.1 与探测相关的默认行为
 
-下表列出与 Ping / SiteMonitor 探测请求直接相关的 SWR v2 默认行为（基于 SWR v2.1.4 源码 `useSWRHandler` 中的决策逻辑，参考 UNPKG 分发代码）：
+下表列出与 Ping / SiteMonitor 探测请求直接相关的 SWR v2.4.1 默认行为（参考 SWR GitHub 源码 `src/index/use-swr.ts`、`src/_internal/` 及测试用例 `test/use-swr-refresh.test.tsx`）：
 
 | SWR 选项 | 默认值 | 含义 | 对 Ping/SiteMonitor 的影响 |
 |---|---|---|---|
 | `revalidateOnFocus` | `true` | 页面重新获得焦点时触发重新验证 | 切回标签页或窗口时，会立即触发一次探测请求 |
 | `revalidateOnReconnect` | `true` | 网络恢复在线时触发重新验证 | 网络断开→恢复后，立即触发一次探测请求 |
-| `refreshWhenHidden` | `false` | 页面隐藏时是否允许按 `refreshInterval` 发起请求 | 切到后台标签页时，定时器到期后**跳过**请求 |
-| `refreshWhenOffline` | `false` | 浏览器离线时是否允许按 `refreshInterval` 发起请求 | 断网时，定时器到期后**跳过**请求 |
+| `refreshWhenHidden` | `false` | 页面隐藏时是否允许按 `refreshInterval` 发起请求 | 切到后台标签页时，**停止调度下一次 setTimeout** |
+| `refreshWhenOffline` | `false` | 浏览器离线时是否允许按 `refreshInterval` 发起请求 | 断网时，**停止调度下一次 setTimeout** |
 | `focusThrottleInterval` | `5000` (ms) | 焦点重验的最小间隔（节流） | 5 秒内连续获得焦点，最多只触发 1 次额外探测 |
 | `dedupingInterval` | `2000` (ms) | 相同 key 请求的去重窗口 | 2 秒内同一服务的多次请求会合并为一次 |
 | `revalidateIfStale` | `true` | 有陈旧缓存数据时组件挂载是否重验 | 组件再次挂载且缓存存在旧数据时，仍会重新发起探测 |
@@ -251,7 +251,7 @@ const { data, error } = useSWR(url, { refreshInterval: 30000 });
 
 #### 7.2.1 `revalidateOnMount` 的确切含义
 
-SWR v2 中 `revalidateOnMount` 的默认值是 **`undefined`**，而非简单的 `true` 或 `false`。其真实决策逻辑（来自 SWR 源码 `useSWRHandler` 的 `shouldStartRequest` 判断链）如下：
+SWR v2.4.1 中 `revalidateOnMount` 的默认值是 **`undefined`**，而非简单的 `true` 或 `false`。其真实决策逻辑（来自 SWR 源码 `useSWRHandler` 的 `shouldStartRequest` 判断链）如下：
 
 ```
 组件挂载时，是否发起首次请求？
@@ -272,28 +272,87 @@ SWR v2 中 `revalidateOnMount` 的默认值是 **`undefined`**，而非简单的
 - **路由切换后回到页面**（组件卸载又重新挂载，缓存中有旧数据即 "stale 数据"）：`revalidateIfStale` 默认 `true` → **true** → 组件挂载立即重新探测，旧数据先展示，新结果回来后替换。
 - 简言之：在本项目的默认配置下，Ping/SiteMonitor 组件**每次挂载都会立即发起一次探测请求**。
 
-#### 7.2.2 页面隐藏或离线时：定时器与跳过请求的关联
+#### 7.2.2 轮询机制：递归 setTimeout 而非固定 setInterval
 
-`refreshWhenHidden=false` 和 `refreshWhenOffline=false` 的作用方式需要澄清——**它们不是暂停定时器，而是定时器到期后检查条件再决定是否跳过请求**。
+SWR v2.4.1 的 `refreshInterval` 轮询**不是用固定节奏的 `setInterval` 实现，而是用递归 `setTimeout` 实现**。其核心流程（参考 `test/use-swr-refresh.test.tsx` 中的时序断言与 deepwiki SWR 2.4 revalidation 流程图）：
 
-SWR 内部使用 `setInterval` 注册 `refreshInterval` 计时器，计时器在组件挂载时启动、卸载时清除，不因页面隐藏或离线而暂停。但在每次计时器回调被触发时，SWR 会先调用内部的 `isActive()` 函数：
+```
+组件挂载
+  │
+  ├─ 发起首次请求（由 revalidateOnMount 决策）
+  │     │
+  │     ▼
+  │  请求完成（无论成功失败）
+  │     │
+  │     └─ 调用 next() 安排下一次
+  │           │
+  │           └─ setTimeout(execute, 30000)  ← 递归调度①
+  │
+  ▼
+30 秒后 execute 被触发
+  │
+  ├─ 检查 isActive() = isVisible() && isOnline()
+  │
+  ├─ isActive() === true（可见且在线）
+  │     │
+  │     ├─ 调用 soft-revalidate → 发起探测请求
+  │     │     │
+  │     │     └─ 请求完成 → 调用 next()
+  │     │              │
+  │     │              └─ setTimeout(execute, 30000)  ← 递归调度②
+  │     │
+  │     └─ isActive() === false（隐藏或离线）
+  │           │
+  │           └─ 不发起请求，也**不安排下一次 setTimeout**  ← 关键：暂停调度
+  │
+  ▼
+事件触发（页面重新聚焦或网络重连）
+  │
+  ├─ revalidateOnFocus / revalidateOnReconnect → 立即发起请求
+  │     │
+  │     └─ 请求完成 → next() → setTimeout(execute, 30000)  ← 恢复调度③
+  │
+  ▼
+递归 setTimeout 的关键特征：
+  • 两次请求之间的间隔是"完成→下一次开始"的间隔，不是"开始→开始"的间隔
+  • 若一次请求耗时较长，下一次也从完成时才开始计时 30 秒
+  • 支持 refreshInterval(data) 动态计算下一次间隔
+```
+
+#### 7.2.3 页面隐藏或离线时：停止调度 vs 跳过请求
+
+配合上述递归 `setTimeout` 机制，`refreshWhenHidden=false` 和 `refreshWhenOffline=false` 的真实作用需要重新理解——它们不是"定时器到期后跳过"，而是"**到期后检查、不满足则彻底停止调度下一次 setTimeout**"。
+
+SWR 内部通过 `isActive()` 综合判断：
 
 ```js
 // SWR 源码中的 isActive
 const isActive = () => getConfig().isVisible() && getConfig().isOnline();
 ```
 
-- `isVisible()` 通过 `document.visibilityState !== 'hidden'` 或 `!document.hidden` 判断（当 `refreshWhenHidden=false` 时，页面隐藏会使 `isVisible()` 返回 false）。
-- `isOnline()` 通过 `navigator.onLine` 判断（当 `refreshWhenOffline=false` 时，离线会使 `isOnline()` 返回 false）。
+- `isVisible()` 通过 `document.visibilityState !== 'hidden'`（当 `refreshWhenHidden=false` 时，页面隐藏返回 false）。
+- `isOnline()` 通过 `navigator.onLine`（当 `refreshWhenOffline=false` 时，离线返回 false）。
 
-当 `isActive()` 返回 false 时，SWR 会**跳过本次定时请求**，但 `setInterval` 本身不会被清除，仍会按 30 秒的节奏继续触发回调——只是每次都被跳过。
+递归 setTimeout 在 `execute` 回调中的决策：
+
+```
+每次 setTimeout 到期 → execute() 被触发
+  │
+  ├─ isActive() === true
+  │   → 发起请求 → 请求完成 → setTimeout(execute, 30000)  ← 继续循环
+  │
+  └─ isActive() === false
+      → 不发起请求
+      → **不调用 setTimeout(...)**  ← 调度就此停止，循环被打破
+```
 
 对 Ping / SiteMonitor 的实际影响：
-- 页面隐藏或离线期间：每隔 30 秒仍有一次回调 → 检查 `isActive()` → false → **跳过请求**，不消耗网络。
+- 页面隐藏或离线期间：当最后一次 `setTimeout` 到期时，发现 `isActive()=false` → **不再安排下一次 setTimeout** → 后续没有任何到期回调，也不消耗 CPU/网络。
 - 页面重新可见或重新在线：
-  - **不等下一个 30 秒到点**，而是立刻由 `revalidateOnFocus` 或 `revalidateOnReconnect` 事件驱动一次即时请求。
-  - 下一次 30 秒定时请求仍按**原有的时间节奏**发生（因为 interval 从未暂停）。例如在第 5 秒切后台，第 35 秒 interval 触发但被跳过，第 40 秒切回前台会立刻请求，第 65 秒 interval 又会再次请求。
-- 这与"定时器暂停、从恢复时重新计时"的行为**不同**。
+  - 因为之前的调度已经停止，没有"下一次 30 秒到期"在等了。
+  - **立即由 `revalidateOnFocus` 或 `revalidateOnReconnect` 事件驱动一次即时请求**。
+  - 该请求完成后，`next()` 会重新调用 `setTimeout(execute, 30000)` → 恢复 30 秒轮询循环。
+- 这意味着：每次隐藏或离线 → 恢复后，**第一次请求的时间与恢复事件完全同步，后续的 30 秒节奏从那次请求完成时重新开始计算**。这与"固定 setInterval 持续运行、每次到期时跳过请求"的行为有本质区别。
 
 ### 7.3 各场景下的探测行为详解
 
@@ -301,65 +360,69 @@ const isActive = () => getConfig().isVisible() && getConfig().isOnline();
 
 ```
 时间轴 (秒)
-0          30         60         90         …
-│          │          │          │
-├─ 组件挂载，立即请求 ─┤          │          │
-│  (revalidateOnMount 默认 → true) │         │          │
-│          ├─ refreshInterval 触发 ─┤          │
-│          │          ├─ refreshInterval 触发 ─┤
-│          │          │          │
-▼          ▼          ▼          ▼
-请求间隔精确 30 秒
+0                ~0.1s 完成    30.1s          60.2s          90.3s
+│                  │            │              │              │
+├─ 组件挂载，立即请求 ─┤            │              │              │
+│  (revalidateOnMount → true) │              │              │
+│                  ├─ next() → setTimeout(execute, 30000)  │              │
+│                               ├─ 到期 → isActive=true → 发起请求 (第 2 次)
+│                               │              ├─ 到期 → 第 3 次请求
+│                               │              │              ├─ 第 4 次请求
+▼                               ▼              ▼              ▼
+"完成→下一次开始"间隔 30 秒（请求耗时 ~0.1s，开始时间略有漂移）
 ```
 
-- `revalidateOnMount` 未显式设置 → 默认决策链兜底返回 **true** → 组件首次挂载立即发请求。
-- `refreshInterval=30000` → 之后每隔 30 秒周期性请求。
-- `isActive()` 返回 true（可见 + 在线）→ 每次定时器到期都真实发起请求。
+- `revalidateOnMount` 未显式设置 → 默认决策链兜底返回 **true** → 组件首次挂载立即发请求（第 1 次）。
+- 请求完成后调用 `next()` → `setTimeout(execute, 30000)`，开始递归调度。
+- 每次 setTimeout 到期时 `isActive()` 返回 true（可见 + 在线）→ 发起请求 → 请求完成后再次 `setTimeout(execute, 30000)`，循环继续。
+- **注意**：两次请求的"开始间隔"为 `30s + 请求耗时`，不是精确 30 秒。
 
 #### 场景 2：页面被切到后台（隐藏）
 
 ```
-前台       切到后台                           切回前台
-   │           │                                │
-   ├─ 请求 ───┤ 第35s interval到期              ├─ 立即请求 (revalidateOnFocus)
-   │           │  → isActive()=false → 跳过    │  + focusThrottle 5s 节流
-   │           │  第65s interval到期→ 跳过 …   │
-   │           │                                │
-   ▼           ▼                                ▼
-          refreshWhenHidden=false           focusThrottleInterval=5s
-          → 后台期间 interval 仍运行          → 5 秒内重复切回最多发 1 次
-            但每次到期都检查 isActive()
-            不可见则跳过，不消耗网络
+前台       切到后台                                   切回前台
+   │           │                                        │
+   ├─ 请求 ①完成  │ 第30s setTimeout到期                ├─ 立即请求 ② (revalidateOnFocus)
+   │           │   → isActive()=false → 不请求         │  + focusThrottle 5s 节流
+   │           │   → 不再安排下一次 setTimeout           │  + 请求完成 → setTimeout(30s) ③
+   │           │   → 调度停止，后续无任何回调             │
+   │           │                                        │
+   ▼           ▼                                        ▼
+          refreshWhenHidden=false                   focusThrottleInterval=5s
+          → setTimeout到期时发现不可见              → 5 秒内重复切回最多发 1 次
+            就停止安排下一次（而非"每次都跳过"）      → 重新恢复 30s 递归调度
 ```
 
-- `refreshWhenHidden=false` → 标签页隐藏（如最小化、切到其他 Tab）时，`setInterval` **仍按 30 秒节奏持续触发**，但每次回调中 `isActive()` 因 `isVisible()=false` 返回 false → **跳过本次请求**。
+- `refreshWhenHidden=false` → 当某次 `setTimeout` 到期时若 `isVisible()=false`：
+  - **不发起请求**，也**不调用 `setTimeout(...)` 安排下一次** → 递归调度链就此断裂。
+  - 页面隐藏期间没有任何定时器在运行，完全不消耗 CPU。
 - 重新切回前台：
-  - `revalidateOnFocus=true` → 立即触发一次额外的探测请求（不等下一个 30 秒到点）。
-  - `focusThrottleInterval=5000` → 如果用户在 5 秒内快速切出又切回，SWR 会节流，最多发 1 次焦点重验请求，避免探测风暴。
-  - 30 秒定时器**没有重新计时**，仍按原有节奏继续。例如在第 5 秒切后台，第 35 秒和第 65 秒的 interval 都会到期但被跳过，第 40 秒切回前台会立刻触发一次焦点请求，第 65 秒的 interval 又会再次触发请求。
+  - `revalidateOnFocus=true` → 立即触发一次即时请求（第 2 次，完全同步于切回动作，不是"到点"）。
+  - `focusThrottleInterval=5000` → 5 秒内频繁切出/切回，最多只发 1 次焦点重验请求。
+  - 该请求完成后 → `next()` → `setTimeout(execute, 30000)` → **重新建立递归调度链**，新的 30 秒节奏从此时开始。
 
 **注意**：项目中存在一个 `useWindowFocus` hook（[window-focus.js](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/src/utils/hooks/window-focus.js)），但它只被 `Index` 组件用于检测窗口聚焦后主动 `mutateHash()`（检测配置变更），**与 Ping / SiteMonitor 的 SWR 行为无关**。Ping/SiteMonitor 的聚焦重验完全由 SWR 内部默认机制驱动。
 
 #### 场景 3：浏览器离线（断网）
 
 ```
-在线         离线                                重新在线
-   │           │                                   │
-   ├─ 请求 ───┤ 第35s interval到期                  ├─ 立即请求 (revalidateOnReconnect)
-   │           │  → isActive()=false → 跳过        │
-   │           │  第65s interval到期→ 跳过 …       │
-   │           │                                   │
-   ▼           ▼                                   ▼
+在线         离线                                       重新在线
+   │           │                                           │
+   ├─ 请求 ①完成  │ 第30s setTimeout到期                    ├─ 立即请求 ② (revalidateOnReconnect)
+   │           │   → isActive()=false → 不请求             │  + 请求完成 → setTimeout(30s) ③
+   │           │   → 不再安排下一次 setTimeout               │
+   │           │   → 调度停止，后续无任何回调                │
+   │           │                                           │
+   ▼           ▼                                           ▼
           refreshWhenOffline=false
-          → 离线期间 interval 仍运行
-            但每次到期都检查 isActive()
-            不在线则跳过，不消耗网络
+          → setTimeout到期时发现离线
+            就停止安排下一次
 ```
 
-- `refreshWhenOffline=false` → `navigator.onLine === false` 期间，`setInterval` 仍按 30 秒节奏触发，但 `isActive()` 因 `isOnline()=false` 返回 false → **跳过本次请求**。
+- `refreshWhenOffline=false` → `navigator.onLine === false` 时，若某次到期检查发现 `isOnline()=false`，同样**停止调度下一次 `setTimeout`**。
 - 网络恢复（`online` 事件）时：
-  - `revalidateOnReconnect=true` → 立即触发一次探测请求，尽快反映恢复后的真实状态。
-  - 30 秒定时器**没有重新计时**，仍按原有节奏继续。
+  - `revalidateOnReconnect=true` → 立即触发一次请求（第 2 次）。
+  - 请求完成后 → `next()` → 重新建立 30 秒递归调度。
 
 #### 场景 4：多个相同服务（SWR 去重）
 
@@ -373,7 +436,7 @@ const isActive = () => getConfig().isVisible() && getConfig().isOnline();
 - 因此：
   - 首屏渲染时 Ping / SiteMonitor 组件没有缓存数据 → 进入 "加载中" 灰色状态。
   - 客户端 hydration 后组件挂载：`revalidateOnMount` 为 `undefined` → 决策链最终返回 **true**（有 `revalidateIfStale=true` 默认兜底）→ 立即发起第一次探测请求。
-  - 30 秒 `setInterval` 在组件挂载 effect 中启动，从挂载时刻起每 30 秒触发一次回调。
+  - 第一次请求完成后 → `next()` → `setTimeout(execute, 30000)` → 递归轮询开始建立。
 
 ### 7.4 完整时序图
 
@@ -387,74 +450,77 @@ const isActive = () => getConfig().isVisible() && getConfig().isOnline();
     │
     ├─ Ping 组件挂载
     │   └─ revalidateOnMount=undefined → 决策链返回 true
-    │      → 立即 GET /api/ping?…  (第 1 次)
-    │   └─ setInterval 启动（每 30s 触发回调）
+    │      → 立即 GET /api/ping?…  (第 1 次请求)
+    │   └─ 第 1 次请求完成 → next() → setTimeout(execute, 30000)  ← 建立递归调度
     │
     ├─ SiteMonitor 组件挂载
     │   └─ revalidateOnMount=undefined → 决策链返回 true
-    │      → 立即 GET /api/siteMonitor?…  (第 1 次)
-    │   └─ setInterval 启动（每 30s 触发回调）
+    │      → 立即 GET /api/siteMonitor?…  (第 1 次请求)
+    │   └─ 第 1 次请求完成 → next() → setTimeout(execute, 30000)  ← 建立递归调度
     │
-    │  【第 5 秒 - 用户切到其他标签页 - 页面隐藏】
-    │
-    │  【第 30 秒 - interval 回调到期】
-    │   └─ isActive()=false（isVisible=false）→ 跳过请求
-    │
-    │  【第 60 秒 - interval 回调到期】
-    │   └─ isActive()=false → 跳过请求
+    │  【第 ~30 秒 - setTimeout 到期 - 用户已切后台 - 页面隐藏】
+    │   └─ execute() 被触发 → isActive()=false（isVisible=false）
+    │      → 不发起请求
+    │      → 不调用 next()、不安排下一次 setTimeout  ← 递归调度链断裂！
+    │      → 从此没有定时器在运行
     │
     │  【第 70 秒 - 切回前台 - 页面重新聚焦】
     │   ├─ revalidateOnFocus=true
-    │   │   → 立即 GET /api/ping?…  (第 2 次，不等 30s)
-    │   │   → 立即 GET /api/siteMonitor?…  (第 2 次)
+    │   │   → 立即 GET /api/ping?…  (第 2 次请求)
+    │   │   → 立即 GET /api/siteMonitor?…  (第 2 次请求)
     │   ├─ focusThrottleInterval=5s → 5 秒内切回不重复请求
-    │   └─ setInterval 继续按原节奏（第 90 秒再次回调）
+    │   └─ 第 2 次请求完成 → next() → setTimeout(execute, 30000)  ← 重新建立调度
     │
-    │  【第 90 秒 - interval 回调到期】
-    │   └─ isActive()=true → GET /api/ping?…  (第 3 次)
-    │                        → GET /api/siteMonitor?…  (第 3 次)
+    │  【第 100 秒 - setTimeout 到期 - 可见在线】
+    │   └─ isActive()=true
+    │      → GET /api/ping?…  (第 3 次请求)
+    │      → GET /api/siteMonitor?…  (第 3 次请求)
+    │      → 请求完成 → next() → setTimeout(execute, 30000)  ← 继续循环
     │
     │  【网络短暂断开又恢复】
-    │   ├─ 离线期间 interval 到期 → isActive()=false（isOnline=false）→ 跳过
+    │   ├─ 断开期间某次 setTimeout 到期 → isActive()=false → 调度再次断裂
     │   ├─ revalidateOnReconnect=true
-    │   │   → 立即 GET /api/ping?…  (第 4 次)
-    │   │   → 立即 GET /api/siteMonitor?…  (第 4 次)
-    │   └─ setInterval 继续按原节奏
+    │   │   → 立即 GET /api/ping?…  (第 4 次请求)
+    │   │   → 立即 GET /api/siteMonitor?…  (第 4 次请求)
+    │   └─ 请求完成 → next() → setTimeout(30s)  ← 再次恢复调度
     │
     │  【正常前台，无人操作】
-    │   ├─ 每 30s → GET /api/ping?…  + GET /api/siteMonitor?…
-    │   └─ ……
+    │   ├─ 每次 setTimeout 到期 + isActive=true → 发起请求 → 再 setTimeout
+    │   └─ 递归循环持续进行
     │
     ▼
-探测请求并非严格每 30 秒一次，
-而是"30 秒定时（到期时 isActive 检查后可能跳过）
-    + 聚焦触发（revalidateOnFocus）
-    + 重连触发（revalidateOnReconnect）"三者的叠加
+探测请求的真实节奏 =
+    "组件挂载即请求（第 1 次）
+    + 递归 setTimeout 30s（每次请求完成后计时；到期 isActive=false 则调度断裂）
+    + 页面聚焦时由 revalidateOnFocus 立即请求并重建调度
+    + 网络重连时由 revalidateOnReconnect 立即请求并重建调度"
+    的复合效果
 ```
 
 #### 7.4.1 Ping / SiteMonitor 实际触发时机汇总
 
-综合以上所有机制，Ping / SiteMonitor 的探测请求会在以下**六种**时机被触发：
+综合以上所有机制，Ping / SiteMonitor 的探测请求会在以下**六种**时机被触发（注意"跳过/断裂"与"真正触发"的区别）：
 
-| # | 触发时机 | 驱动来源 | 实际行为 |
-|---|---|---|---|
-| 1 | 组件首次挂载（页面打开或路由进入） | `revalidateOnMount=undefined` → 默认决策链返回 `true` | 立即发起一次探测，无任何缓存时同时显示加载态 |
-| 2 | 组件重新挂载（路由切回）且缓存有 stale 数据 | `revalidateIfStale=true`（默认） | 先展示旧数据，同时立即发起一次探测，新结果回来后替换 |
-| 3 | 每 30 秒定时到期且页面可见、在线 | `refreshInterval=30000` + `isActive()=true` | 每 30 秒发起一次周期性探测 |
-| 4 | 每 30 秒定时到期但页面隐藏或离线 | `refreshInterval=30000` + `isActive()=false` | **跳过本次请求**，不消耗网络；定时器仍继续计时 |
-| 5 | 页面重新获得焦点（切回标签页/窗口） | `revalidateOnFocus=true`（默认）+ `focusThrottleInterval=5000` | 立即发起一次探测；5 秒内重复聚焦仅发一次 |
-| 6 | 网络从离线恢复在线 | `revalidateOnReconnect=true`（默认） | 立即发起一次探测，确保恢复后状态及时更新 |
+| # | 时机 | 驱动来源 | 是否实际发起探测请求 | 对递归调度链的影响 |
+|---|---|---|---|---|
+| 1 | 组件首次挂载（页面打开或路由进入） | `revalidateOnMount=undefined` → 默认决策链返回 `true` | ✅ **立即发起**（无缓存时同时显示加载态） | 请求完成后调用 `next()` → `setTimeout(execute, 30000)` → 建立调度 |
+| 2 | 组件重新挂载（路由切回）且缓存有 stale 数据 | `revalidateIfStale=true`（默认） | ✅ **立即发起**（先展示旧数据，新结果回来后替换） | 请求完成后调用 `next()` → 重建调度 |
+| 3 | setTimeout 到期且页面可见、在线 | `refreshInterval=30000` + `isActive()=true` | ✅ **发起周期性探测** | 请求完成后再 `setTimeout(execute, 30000)` → 循环继续 |
+| 4 | setTimeout 到期但页面隐藏或离线 | `refreshInterval=30000` + `isActive()=false` | ❌ **不发起** | 不调用 `next()` → **调度链断裂**，后续无定时器 |
+| 5 | 页面重新获得焦点（切回标签页/窗口） | `revalidateOnFocus=true`（默认）+ `focusThrottleInterval=5000` | ✅ **立即发起**；5 秒内重复聚焦仅发 1 次 | 请求完成后调用 `next()` → 重建 30 秒调度 |
+| 6 | 网络从离线恢复在线 | `revalidateOnReconnect=true`（默认） | ✅ **立即发起**，确保恢复后状态及时更新 | 请求完成后调用 `next()` → 重建 30 秒调度 |
 
 ### 7.5 小结
 
 刷新节奏的真实特征：
 
-1. **基础周期**：每组件独立 `refreshInterval: 30000`（30 秒），硬编码不可配。定时器自组件挂载时启动，组件卸载时清除，**不因页面隐藏或离线而暂停**。
-2. **后台跳过而非暂停**：页面隐藏或离线时，定时器仍每 30 秒触发回调，但通过 `isActive()`（`isVisible() && isOnline()`）检查后**跳过请求**，不消耗网络资源。
-3. **事件驱动即时刷新**：页面重新获得焦点（`revalidateOnFocus`）或网络恢复（`revalidateOnReconnect`）时，SWR 会立即发起探测请求，不等下一个定时到点，确保状态及时更新。
-4. **挂载即请求**：`revalidateOnMount` 默认值为 `undefined`，在本项目配置下，组件每次挂载（无论首次还是重新挂载）都会决策为 `true`，立即发起探测。
-5. **防风暴保护**：`focusThrottleInterval=5000` 防止快速切换标签页造成探测风暴；`dedupingInterval=2000` 合并 2 秒窗口内对同一 key 的重复请求。
-6. **首屏行为**：Ping/SiteMonitor 不在 SSR fallback 中，首屏显示灰色加载态，hydration 后立即开始探测。
+1. **SWR 版本**：项目依赖 **SWR v2.4.1**（npm 发布于 2025 年 3 月），其行为参考 SWR 官方测试用例 `use-swr-refresh.test.tsx` 和 revalidation 流程图。
+2. **轮询实现**：`refreshInterval` 底层采用**递归 `setTimeout`**，不是固定 `setInterval`。每次请求完成后调用 `next()` 安排下一次 `setTimeout(execute, 30000)`，两次请求间隔为"完成 → 下一次开始"的 30 秒。
+3. **隐藏/离线时的真实行为**：不是"到期跳过"，而是"**到期检查 isActive=false 后彻底停止调度下一次 setTimeout**"。递归链断裂后，隐藏/离线期间完全没有定时器在运行，零 CPU 消耗。
+4. **恢复机制**：当页面重新聚焦或网络重连时，由 `revalidateOnFocus` / `revalidateOnReconnect` 事件立即触发请求，并在请求完成后由 `next()` 重新建立递归调度——新的 30 秒节奏从恢复请求完成时重新开始计算，不是沿用旧节奏。
+5. **挂载即请求**：`revalidateOnMount` 默认值为 `undefined`，在本项目默认配置下，组件每次挂载（无论首次还是重新挂载）都会决策为 `true`，立即发起探测。
+6. **防风暴保护**：`focusThrottleInterval=5000` 防止快速切换标签页造成探测风暴；`dedupingInterval=2000` 合并 2 秒窗口内对同一 key 的重复请求。
+7. **首屏行为**：Ping/SiteMonitor 不在 SSR fallback 中，首屏显示灰色加载态，hydration 后立即开始探测，请求完成后启动递归调度。
 
 ---
 
