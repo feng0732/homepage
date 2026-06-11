@@ -20,7 +20,7 @@ item.jsx (服务项组件)
 
 ### 核心入口文件
 
-- **服务项组件**: [item.jsx](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/components/services/item.jsx)
+- **服务项组件**: `src/components/services/item.jsx`
 - **状态展示样式**: 由 `statusStyle` 配置决定（来自全局 settings 或 service 单独配置）
 
 ---
@@ -32,7 +32,7 @@ item.jsx (服务项组件)
 ### 2.1 Docker 容器状态采集
 
 - **API 路径**: `/api/docker/status/[container]/[server]`
-- **源码**: [docker/status/[...service].js](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/pages/api/docker/status/[...service].js)
+- **源码**: `src/pages/api/docker/status/[...service].js`
 - **使用库**: `dockerode`
 - **采集内容**:
   - 容器状态: `info.State.Status`
@@ -43,7 +43,7 @@ item.jsx (服务项组件)
 ### 2.2 Ping 网络可达性采集
 
 - **API 路径**: `/api/ping?groupName=&serviceName=`
-- **源码**: [ping.js](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/pages/api/ping.js)
+- **源码**: `src/pages/api/ping.js`
 - **使用库**: `ping`
 - **采集逻辑**: `ping.probe(hostname)`
 - **主机解析**: 支持 URL 格式，自动提取 hostname
@@ -52,7 +52,7 @@ item.jsx (服务项组件)
 ### 2.3 HTTP 站点监控采集
 
 - **API 路径**: `/api/siteMonitor?groupName=&serviceName=`
-- **源码**: [siteMonitor.js](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/pages/api/siteMonitor.js)
+- **源码**: `src/pages/api/siteMonitor.js`
 - **使用库**: 内部 `httpProxy`
 - **采集逻辑**:
   1. 先发送 HEAD 请求，记录响应时间
@@ -63,7 +63,7 @@ item.jsx (服务项组件)
 ### 2.4 Kubernetes 应用状态采集
 
 - **API 路径**: `/api/kubernetes/status/[namespace]/[app]?podSelector=`
-- **源码**: [kubernetes/status/[...service].js](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/pages/api/kubernetes/status/[...service].js)
+- **源码**: `src/pages/api/kubernetes/status/[...service].js`
 - **使用库**: `@kubernetes/client-node`
 - **采集逻辑**:
   - 查询指定 namespace 下匹配 label 的 Pods
@@ -78,7 +78,7 @@ item.jsx (服务项组件)
 ### 2.5 Proxmox 虚拟机状态采集
 
 - **API 路径**: `/api/proxmox/stats/[node]/[vmid]?type=`
-- **源码**: [proxmox/stats/[...service].js](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/pages/api/proxmox/stats/[...service].js)
+- **源码**: `src/pages/api/proxmox/stats/[...service].js`
 - **调用接口**: `/nodes/{node}/{type}/{vmid}/status/current`
 - **支持类型**: `qemu` (默认) 或 `lxc`
 - **返回示例**: `{ status: "running", cpu: 0.05, mem: 1073741824 }`
@@ -91,7 +91,7 @@ item.jsx (服务项组件)
 
 ### 3.1 Ping 组件判断逻辑
 
-**源码**: [ping.jsx](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/components/services/ping.jsx)
+**源码**: `src/components/services/ping.jsx`
 
 | 条件 | 状态 |
 |------|------|
@@ -102,7 +102,7 @@ item.jsx (服务项组件)
 
 ### 3.2 站点监控组件判断逻辑
 
-**源码**: [site-monitor.jsx](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/components/services/site-monitor.jsx)
+**源码**: `src/components/services/site-monitor.jsx`
 
 | 条件 | 状态 |
 |------|------|
@@ -113,7 +113,7 @@ item.jsx (服务项组件)
 
 ### 3.3 Docker 状态组件判断逻辑
 
-**源码**: [status.jsx](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/components/services/status.jsx)
+**源码**: `src/components/services/status.jsx`
 
 | 条件 | 状态 |
 |------|------|
@@ -128,7 +128,7 @@ item.jsx (服务项组件)
 
 ### 3.4 Kubernetes 状态组件判断逻辑
 
-**源码**: [kubernetes-status.jsx](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/components/services/kubernetes-status.jsx)
+**源码**: `src/components/services/kubernetes-status.jsx`
 
 | 条件 | 状态 |
 |------|------|
@@ -140,7 +140,7 @@ item.jsx (服务项组件)
 
 ### 3.5 Proxmox 状态组件判断逻辑
 
-**源码**: [proxmox-status.jsx](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/components/services/proxmox-status.jsx)
+**源码**: `src/components/services/proxmox-status.jsx`
 
 | 条件 | 状态 |
 |------|------|
@@ -198,7 +198,7 @@ if (style === "dot") {
 
 ### 5.1 SWR 全局配置
 
-**源码**: [_app.jsx](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/pages/_app.jsx#L75-L79)
+**源码**: `src/pages/_app.jsx` L75-L79
 
 ```javascript
 <SWRConfig
@@ -215,8 +215,8 @@ if (style === "dot") {
 
 | 组件 | refreshInterval | 源码位置 |
 |------|-----------------|---------|
-| Ping | 30000ms (30秒) | [ping.jsx#L7](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/components/services/ping.jsx#L7-L8) |
-| Site Monitor | 30000ms (30秒) | [site-monitor.jsx#L7](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/components/services/site-monitor.jsx#L7-L8) |
+| Ping | 30000ms (30秒) | `src/components/services/ping.jsx` L7-L8 |
+| Site Monitor | 30000ms (30秒) | `src/components/services/site-monitor.jsx` L7-L8 |
 | Docker Status | 未设置 | - |
 | Kubernetes Status | 未设置 | - |
 | Proxmox Status | 未设置 | - |
@@ -231,7 +231,7 @@ if (style === "dot") {
 
 ### 5.4 useWidgetAPI 封装
 
-**源码**: [use-widget-api.js](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/utils/proxy/use-widget-api.js)
+**源码**: `src/utils/proxy/use-widget-api.js`
 
 ```javascript
 export default function useWidgetAPI(widget, ...options) {
@@ -250,7 +250,7 @@ export default function useWidgetAPI(widget, ...options) {
 配置中的 `refreshInterval` 可以通过以下方式设置：
 
 1. 在 service 的 widget 配置中直接设置 `refreshInterval`
-2. 在 [service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/utils/config/service-helpers.js) 中解析配置时传递
+2. 在 `src/utils/config/service-helpers.js` 中解析配置时传递
 3. 支持的 widget 类型: `glances`, `customapi`, `iframe`, `prometheusmetric`
 
 ---
@@ -261,7 +261,7 @@ export default function useWidgetAPI(widget, ...options) {
 
 **容易误判之处**: 变量名 `someReady` / `allReady` 暗示检查的是 Pod 的 Ready 条件，但实际检查的是 **Pod Phase**。
 
-**API 端点核心代码**（[kubernetes/status/[...service].js#L53-L60](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/pages/api/kubernetes/status/[...service].js#L53-L60)）:
+**API 端点核心代码**（`src/pages/api/kubernetes/status/[...service].js` L53-L60）:
 
 ```javascript
 const someReady = pods.find((pod) => ["Succeeded", "Running"].includes(pod.status.phase));
@@ -281,7 +281,7 @@ const allReady = pods.every((pod) => ["Succeeded", "Running"].includes(pod.statu
 
 **影响**: 一个 Pod 可能 `phase=Running`（状态指示器显示绿色 running）但 `Ready=false`（实际尚未就绪、无法接收流量）。这意味着 Kubernetes 状态指示器在 Pod 启动过程中可能过早地显示"正常"。
 
-**前端组件额外说明**（[kubernetes-status.jsx#L18-L21](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/components/services/kubernetes-status.jsx#L18-L21)）:
+**前端组件额外说明**（`src/components/services/kubernetes-status.jsx` L18-L21）:
 
 ```javascript
 if (data.status === "running") {
@@ -297,7 +297,7 @@ if (data.status === "running") {
 
 ### 6.2 状态指示器刷新与普通服务小组件刷新的区别
 
-在 [item.jsx](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/components/services/item.jsx) 中，每个服务卡片同时包含两类组件，它们的刷新机制**完全独立**：
+在 `src/components/services/item.jsx` 中，每个服务卡片同时包含两类组件，它们的刷新机制**完全独立**：
 
 #### 两类组件对比
 
@@ -325,9 +325,9 @@ SWR 以 URL 为缓存 key，相同 URL 的请求会共享同一条缓存数据�
 
 **SWR 项目使用版本与默认配置**：
 
-项目使用 SWR **2.4.1**（见 [package.json#L41](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/package.json#L41)）。
+项目使用 SWR **2.4.1**（见 `package.json` L41）。
 
-全局配置仅设置了 fetcher（[\_app.jsx#L75-L79](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/pages/_app.jsx#L75-L79)）：
+全局配置仅设置了 fetcher（`src/pages/_app.jsx` L75-L79）：
 
 ```javascript
 <SWRConfig
@@ -401,7 +401,7 @@ SWR 以 URL 为缓存 key，相同 URL 的请求会共享同一条缓存数据�
 
 各类型展开面板 widget 发起的请求数量不同，与状态指示器的关系也不同：
 
-**Docker 展开面板**（[widgets/docker/component.jsx#L13-L17](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/widgets/docker/component.jsx#L13-L17)）
+**Docker 展开面板**（`src/widgets/docker/component.jsx` L13-L17）
 
 ```javascript
 // ① 共用请求（与 Status 组件共享缓存）
@@ -410,7 +410,7 @@ const { data: statusData } = useSWR(`/api/docker/status/${widget.container}/${wi
 const { data: statsData } = useSWR(`/api/docker/stats/${widget.container}/${widget.server || ""}`);
 ```
 
-**Kubernetes 展开面板**（[widgets/kubernetes/component.jsx#L11-L17](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/widgets/kubernetes/component.jsx#L11-L17)）
+**Kubernetes 展开面板**（`src/widgets/kubernetes/component.jsx` L11-L17）
 
 ```javascript
 // ① 共用请求（与 KubernetesStatus 组件共享缓存）
@@ -419,7 +419,7 @@ const { data: statusData } = useSWR(`/api/kubernetes/status/${widget.namespace}/
 const { data: statsData } = useSWR(`/api/kubernetes/stats/${widget.namespace}/${widget.app}?${podSelectorString}`);
 ```
 
-**Proxmox 展开面板**（[widgets/proxmoxvm/component.jsx#L11](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/widgets/proxmoxvm/component.jsx#L11)）
+**Proxmox 展开面板**（`src/widgets/proxmoxvm/component.jsx` L11）
 
 ```javascript
 // 唯一请求（与 ProxmoxStatus 组件共享缓存，同时提供 stats 数据）
@@ -440,7 +440,7 @@ const { data, error } = useSWR(`/api/proxmox/stats/${widget.node}/${widget.vmid}
 
 **Proxmox 的特殊架构**：
 
-Proxmox 没有独立的 status API 和 stats API。状态指示器和展开面板 widget 共用**同一个** `/api/proxmox/stats/...` 端点（[proxmox/stats/[...service].js#L73-L77](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/pages/api/proxmox/stats/[...service].js#L73-L77)）：
+Proxmox 没有独立的 status API 和 stats API。状态指示器和展开面板 widget 共用**同一个** `/api/proxmox/stats/...` 端点（`src/pages/api/proxmox/stats/[...service].js` L73-L77）：
 
 ```javascript
 return res.status(200).json({
@@ -478,7 +478,7 @@ return res.status(200).json({
 
 #### useWidgetAPI 与直接 useSWR 的区别
 
-普通 widget 组件（如 glances、customapi 等）通过 [useWidgetAPI](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/utils/proxy/use-widget-api.js) 封装调用，支持通过配置传入 `refreshInterval`：
+普通 widget 组件（如 glances、customapi 等）通过 `src/utils/proxy/use-widget-api.js` 封装调用，支持通过配置传入 `refreshInterval`：
 
 ```javascript
 // useWidgetAPI 支持从 widget 配置读取 refreshInterval
