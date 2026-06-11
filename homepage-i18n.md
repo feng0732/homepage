@@ -60,10 +60,12 @@ module.exports = {
 
 > 注意：`locales: ["en"]` 只给 Next.js 构建用，**运行时支持的语言完全取决于 `public/locales/` 下有哪些目录**，由 `serverSideTranslations(language)` 动态加载。
 
-> **关于回退语言的重要澄清**：项目没有在 config 中显式写 `fallbackLng`，但这不等于运行时没有语言回退机制。i18next 有**三层独立的回退逻辑**，各自有默认值：
-> 1. `fallbackLng` 默认值是 `'dev'`（不是不存在、也不是 `"en"`），当一个 key 在当前语言所有变体中都找不到时，会去 `'dev'` 语言中再查；但 homepage 没有 `public/locales/dev/` 目录，所以这一层对 homepage **不产生实际效果**
-> 2. `load: 'all'`（默认值）触发 **variant resolving（变体解析）**：当语言为 `zh-Hans` 时，i18next 会按 `['zh-Hans', 'zh', 'dev']` 顺序逐级查找——这意味着如果同时有 `zh-Hans.json` 和 `zh.json`，变体中缺的 key 会自动去纯语言中补。homepage 项目如果存在这种"变体 + 纯语言"的目录组合，这一层就是**实际生效的隐式回退**
-> 3. 全部查找失败后，i18next 默认把**key 字符串本身**作为返回值（不是空、不是抛错）
+> **关于回退语言的重要澄清（分三层）**：
+> 1. **i18next 原生默认值**：`fallbackLng: 'dev'` —— 这是 i18next 库的出厂默认，面向开发者调试
+> 2. **next-i18next 包装层**：如果用户没在 config 中显式写 `fallbackLng`，next-i18next 会**自动**把 `config.i18n.defaultLocale` 的值作为 `fallbackLng` 传给 i18next（官方文档明确说明）
+> 3. **homepage 项目运行时实际值**：`fallbackLng: "en"` —— 因为 `defaultLocale: "en"`，next-i18next 自动补上了
+>
+> 所以**项目实际有英文回退**，不是 `'dev'` 也不是"没配置"。单个 key 缺失时会自动去英文包里找。
 
 [next.config.js](next.config.js#L1-L19) 将同一 i18n 配置注入 Next.js：
 
@@ -234,27 +236,27 @@ export default function Block({ value, label }) {
 
 ## 四、无效语言 / 缺失 Key / 加载失败的真实表现
 
-i18next 本身内置了**三层回退链**，配合 homepage 项目的代码层兜底，构成完整的容错策略。以下是每层的真实行为，均对照 i18next v26 官方配置文档核实。
+i18next 本身内置了回退链，配合 homepage 项目的代码层兜底，构成完整的容错策略。以下是每层的真实行为，**区分 i18next 原生默认值、next-i18next 包装层的修正、以及 homepage 项目运行时实际值**。
 
-### 先理清：i18next 内置的三层查找链（lookup chain）
+### 先理清：三层配置的叠加关系
 
-i18next 初始化时有三个与回退相关的关键配置（项目都用默认值，没显式覆盖）：
+| 配置项 | i18next 原生默认 | next-i18next 包装层处理 | homepage 运行时实际值 | 作用 |
+|---|---|---|---|---|
+| `fallbackLng` | `'dev'` | **自动覆盖为 `defaultLocale`**（如果用户没显式写） | **`"en"`** ✅ | 所有语言变体都找不到 key 时的终极回退语言 |
+| `load` | `'all'` | 不修改 | `'all'` | 加载策略：`'all'` 触发 variant resolving，同时加载变体+纯语言+fallbackLng |
+| `returnEmptyString` | `true` | 不修改 | `true` | key 找不到且所有回退都落空时，返回 key 本身（非空字符串） |
 
-| 配置项 | 项目值 | 默认值 | 作用 |
-|---|---|---|---|
-| `fallbackLng` | 未写 | `'dev'` | 所有语言变体都找不到 key 时的终极回退语言 |
-| `load` | 未写 | `'all'` | 加载策略：`'all'` 会同时加载 `zh-Hans` → `zh` → `'dev'` 三级变体 |
-| `returnEmptyString` | 未写 | `true` | key 找不到且所有回退都落空时，**返回 key 本身**（非空字符串） |
+> **关键纠正**：之前的分析错误地将 i18next 原生默认的 `'dev'` 当成了 homepage 的实际运行值。实际上 next-i18next 作为包装层，会在创建 i18next 实例时，**自动把 `config.i18n.defaultLocale` 赋给 `fallbackLng`**（除非用户显式覆盖）。这是 next-i18next 的设计行为，官方文档明确说明。
+>
+> 对 homepage 而言，`defaultLocale: "en"` → 运行时 `fallbackLng: "en"` → **单个 key 缺失时会自动回退到英文**。
 
-> 关键结论：`defaultLocale: "en"` 是 Next.js 国际化路由的字段，**不是** i18next 的 `fallbackLng`。i18next 实例的 `fallbackLng` 实际值是默认的 `'dev'`，**不是 `"en"`**——这就是为什么"单个 key 缺失时不会自动显示英文"的根本原因。
+对 `load: 'all'` + `fallbackLng: "en"` 组合的具体查找顺序（来自 i18next 官方文档）：
+- 设置 `lng: "zh-Hans"` → 依次查找 `["zh-Hans", "zh", "en"]`
+- 设置 `lng: "pt-BR"` → 依次查找 `["pt-BR", "pt", "en"]`
+- 设置 `lng: "en"`（纯语言无变体） → 查找 `["en"]`
+- 设置 `lng: "xx-YY"`（完全不存在） → 尝试 `["xx-YY", "xx", "en"]`，最后落在 `en`
 
-对 `load: 'all'` 具体含义（来自 i18next 官方文档）：
-- 设置 `lng: "zh-Hans"` → 会依次加载并查找 `["zh-Hans", "zh", "dev"]`
-- 设置 `lng: "pt-BR"` → 会依次加载并查找 `["pt-BR", "pt", "dev"]`
-- 设置 `lng: "en"`（纯语言无变体） → 加载查找 `["en", "dev"]`
-- 设置 `lng: "xx-YY"`（完全不存在） → 尝试 `["xx-YY", "xx", "dev"]`，但三者目录大概率都不存在
-
-其中 **variant resolving（变体解析）**是 i18next 的隐式回退：如果 `zh-Hans/common.json` 缺少某 key 但 `zh/common.json` 里有，自动补位。这一层 homepage 项目如果存在 `zh`、`pt` 等纯语言目录，就是**实际生效的"隐式英文之外"的回退**。
+其中 **variant resolving（变体解析）**是 i18next 的隐式回退：如果 `zh-Hans/common.json` 缺少某 key 但 `zh/common.json` 里有，自动补位；`zh` 里也没有，再去 `en` 里找。homepage 项目如果存在 `zh`、`pt` 等纯语言目录，这就是**"变体 → 纯语言 → 英文"**的三级回退。
 
 ---
 
@@ -279,14 +281,14 @@ const normalizeLanguage = (language) => {
 
 **代码路径**：`getStaticProps` → `normalizeLanguage` 返回 `"xx-YY"` → `serverSideTranslations("xx-YY")` → next-i18next 在服务端读文件系统
 
-**真实表现**（两条分支）：
+**真实表现**（两条分支，最终都能显示英文）：
 
 | 分支 | 触发条件 | 结果 |
 |---|---|---|
 | **分支 A（抛异常）** | `serverSideTranslations` 因文件不存在、JSON 语法错误、权限不足等**抛出同步/Promise 异常** | 被 `getStaticProps` 的 catch 块（[src/pages/index.jsx](src/pages/index.jsx#L101-L110)）捕获 → `initialSettings` 置空 → 调用 `serverSideTranslations("en")` → 页面正常加载英文 |
-| **分支 B（不抛异常）** | `serverSideTranslations` 内部吞掉文件缺失、只在控制台告警不抛错（next-i18next 常见实际行为） | `_nextI18Next` 注入到客户端，但语言资源为空/不完整 → 进入运行时 i18next 查找链 → 所有 key 查找落空 → **最终返回 key 本身**（界面上看到裸 key） |
+| **分支 B（不抛异常）** | `serverSideTranslations` 内部吞掉文件缺失、只在控制台告警不抛错（next-i18next 常见实际行为） | `_nextI18Next` 注入到客户端，`xx-YY` 和 `xx` 资源为空，但 `fallbackLng: "en"` 资源被加载 → 所有 `t(key)` 先查 `xx-YY` → 落空 → 查 `xx` → 落空 → **查 `en` 命中** → 显示英文翻译 |
 
-> 注意：分支 A 是项目层面的兜底（try/catch），这才是**真正能回退到英文**的代码路径；分支 B 则依赖 i18next 默认的 key-as-fallback，不会显示英文。
+> **注意修正**：之前的分析错误地认为分支 B 会显示裸 key。实际上由于 `fallbackLng: "en"` 会被自动加载（`load: 'all'` 策略），即使目标语言完全不存在，最终也会落在英文翻译上，**不会显示裸 key**。
 
 **测试验证**：[src/__tests__/pages/index.test.jsx](src/__tests__/pages/index.test.jsx#L208-L221) 中 `throwIn = "services"` 模拟异常后，验证 `serverSideTranslations` 最终被调用时传入 `"en"`。
 
@@ -306,19 +308,19 @@ const normalizeLanguage = (language) => {
  ② variant resolving：查 zh 资源（纯语言）→ 有？→ 返回翻译值（结束）
        │ 没有（或 public/locales/zh/ 目录根本不存在）
        ▼
- ③ 查 fallbackLng = 'dev' 资源 → 有？→ 返回（实际不存在，跳过）
-       │ 没有
+ ③ 查 fallbackLng = "en" 资源 → 有？→ 返回英文翻译（结束）✅
+       │ 没有（英文基准里也缺这个 key，极罕见）
        ▼
  ④ returnEmptyString: true → 返回 key 本身 "some.new.key"（界面显示裸 key）
 ```
 
 **真实表现**：
 - **不报错、不抛异常、不崩溃**，组件正常渲染
-- **不会自动回退到英文**（因为 `fallbackLng` 是 `'dev'` 不是 `"en"`）
-- 只在**变体级**有隐式回退（如 `zh-Hans` 缺 key → `zh` 补），但这要求纯语言目录 `zh/` 同时存在且资源被加载
-- 最终用户看到 `some.new.key` 这种裸 key 字符串（作为开发者可识别的"漏翻译"信号）
+- **会自动回退到英文**（因为 `fallbackLng: "en"`，next-i18next 自动设置）
+- 变体级也有隐式回退（如 `zh-Hans` 缺 key → `zh` 补），但要求纯语言目录 `zh/` 同时存在
+- 只有当**英文基准里也缺这个 key**时（极罕见，通常是新增功能还没来得及写英文文案），才会显示裸 key
 
-> 项目中所有组件都没有给 `t()` 传 `defaultValue` 第二个参数，也没有使用 `t([key, fallbackKey])` 数组语法提供 fallback key，因此缺失 key 的表现严格遵循 i18next 默认规则。
+> 项目中所有组件都没有给 `t()` 传 `defaultValue` 第二个参数，也没有使用 `t([key, fallbackKey])` 数组语法提供 fallback key，因此缺失 key 的表现严格遵循上述查找链。
 
 ### 4.4 场景四：客户端 `i18n.changeLanguage(lng)` 目标语言加载失败
 
@@ -339,7 +341,7 @@ useEffect(() => {
 - **当前语言保持不变**，所有 `t()` 调用继续使用切换前的语言翻译，用户不会看到断档或空白
 - 组件不会白屏，也不会报错崩溃
 
-### 4.5 兜底链路总览（按执行顺序 + 三层回退）
+### 4.5 兜底链路总览（按执行顺序 + 四层回退）
 
 ```
   settings.language 未配置 / 为空？
@@ -355,27 +357,29 @@ useEffect(() => {
         │     ▼
         │   catch 捕获 ──────────────────────────► serverSideTranslations("en")
         │                                               │
-        │     否（正常返回，可能资源不完整）               │ 英文基准，一定成功
+        │     否（正常返回，目标语言资源可能为空）       │ 英文基准，一定成功
         ▼                                               ▼
   客户端水合 i18n 实例                         客户端水合 i18n 实例
-        │                                               │
-        ▼                                               ▼
-  运行时 t(key)                                  t(key) 全部命中英文
+ （自动加载 fallbackLng: "en" 资源）                  │
+        │                                               ▼
+        ▼                                       t(key) 全部命中英文
+  运行时 t(key)
         │
         ▼
-  i18next 内置三层查找链：
+  i18next 内置四层查找链：
     ① 当前变体（如 zh-Hans） → 命中？→ 返回翻译
     ② 纯语言变体（如 zh）   → 命中？→ 返回翻译  （variant resolving，隐式生效）
-    ③ fallbackLng = 'dev'  → 实际不存在，跳过
-    ④ 全部落空 → 返回 key 本身（裸 key 显示在界面）
+    ③ fallbackLng = "en"   → 命中？→ 返回英文  （next-i18next 自动设置 ✅）
+    ④ 全部落空 → 返回 key 本身（裸 key，仅当英文基准也缺时）
 ```
 
 **哪些异常最终会显示英文？**
 - ✅ language 为空/未配置 → `normalizeLanguage` → 英文
 - ✅ `serverSideTranslations` 抛出异常 → catch 块 → 英文
-- ❌ 单个翻译 key 在所选语言中缺失 → 显示裸 key（**不显示英文**）
-- ❌ 语言目录不存在但 next-i18next 不抛错 → 显示裸 key
+- ✅ 单个翻译 key 在所选语言中缺失 → `fallbackLng: "en"` 自动回退 → 英文 **（之前错误，已修正）**
+- ✅ 语言目录不存在但 next-i18next 不抛错 → `fallbackLng: "en"` 自动回退 → 英文 **（之前错误，已修正）**
 - ❌ `changeLanguage` 目标语言加载失败 → 保持切换前语言，不显示英文（也不崩溃）
+- ❌ 英文基准本身也缺这个 key → 显示裸 key（极罕见）
 
 ---
 
