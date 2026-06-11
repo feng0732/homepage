@@ -112,7 +112,7 @@ const version = process.env.NEXT_PUBLIC_VERSION?.length ? process.env.NEXT_PUBLI
 |---|---|---|
 | `PUID` / `PGID` | `0` (root) | 非 root 运行：chown `/app/config` 和 `/app/.next`，然后 `su-exec` 降权 |
 | `HOSTNAME` | `::` (IPv6 双栈) | 探测 IPv6 绑定是否可用，失败则回退 `0.0.0.0` |
-| `HOMEPAGE_BUILDTIME` | `date +%s` | 运行时生成的构建时间戳（仅 entrypoint 内部使用，非前端展示用） |
+| `HOMEPAGE_BUILDTIME` | `date +%s` | **容器启动级的「虚拟构建时间」，与配置哈希和页面刷新强相关**（详见 2.3 节） |
 | `HOMEPAGE_CONFIG_DIR` | `/app/config` | 配置文件目录，见下文 |
 
 entrypoint 的完整执行流：
@@ -120,7 +120,7 @@ entrypoint 的完整执行流：
 ```
 1. 设置 PUID/PGID 默认值
 2. 若 /app/config 不存在 → ln -s /config /app/config（兼容 lscr.io 路径）
-3. 设置 HOMEPAGE_BUILDTIME
+3. export HOMEPAGE_BUILDTIME=$(date +%s)   ← 每次容器启动时重新生成
 4. IPv6 探测 → 可能回退 HOSTNAME=0.0.0.0
 5. 根据 PUID 调整 /app/config 和 /app/config/logs 的 ownership
 6. 调整 /app/.next 的 ownership
@@ -128,7 +128,233 @@ entrypoint 的完整执行流：
 8. 否则直接 exec "$@"（即 node server.js）
 ```
 
-### 2.3 应用配置期注入（YAML 模板变量替换）
+**`HOMEPAGE_BUILDTIME` 的关键作用：**
+这个变量是 entrypoint 在每次容器启动时用 `date +%s` 动态生成的 Unix 时间戳。它并非传给前端展示（展示用的是 `NEXT_PUBLIC_BUILDTIME`，在 CI 构建时已烧录），而是与配置文件内容一起参与 `/api/hash` 接口的哈希计算，从而实现「容器重启/重新创建 → 即使配置文件未改动 → 前端也能感知并触发全页刷新」的机制（详见 2.5 节完整协作链路）。
+
+### 2.3 配置刷新与前端重新校验的协作链路（HOMEPAGE_BUILDTIME → /api/hash → 前端刷新）
+
+这是运行时环境变量影响页面状态最核心的协作机制，横跨入口脚本、后端 API 和前端 React 组件三层。
+
+#### 2.3.1 入口脚本：`HOMEPAGE_BUILDTIME` 的生成
+
+[docker-entrypoint.sh 第 13 行](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/docker-entrypoint.sh#L13)：
+
+```sh
+export HOMEPAGE_BUILDTIME=$(date +%s)
+```
+
+- 每次容器启动（`docker start` / `docker restart` / 容器 recreate）都会生成一个**新的**时间戳。
+- `docker exec` 进入容器不会触发，因为不会重新执行 entrypoint。
+- 该变量通过 `export` 注入到 node server.js 的运行时环境中。
+
+#### 2.3.2 `/api/hash` 接口：哈希的计算与返回
+
+[src/pages/api/hash.js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/api/hash.js)：
+
+```js
+const configs = [
+  "docker.yaml", "settings.yaml", "services.yaml",
+  "bookmarks.yaml", "widgets.yaml", "custom.css", "custom.js",
+];
+
+export default async function handler(req, res) {
+  // 1. 对每个配置文件计算 sha256
+  const hashes = configs.map((config) => {
+    checkAndCopyConfig(config);
+    const configYaml = join(CONF_DIR, config);
+    return hash(readFileSync(configYaml, "utf8"));
+  });
+
+  // 2. 拼接所有文件哈希 + HOMEPAGE_BUILDTIME，再计算一次哈希
+  const buildTime = process.env.HOMEPAGE_BUILDTIME?.length ? process.env.HOMEPAGE_BUILDTIME : "";
+  const combinedHash = hash(hashes.join("") + buildTime);
+
+  res.send({ hash: combinedHash });
+}
+```
+
+关键逻辑在第 31-33 行：
+- `hashes.join("")` 是所有配置文件内容的哈希拼接，代表「配置内容是否改变」。
+- 加上 `buildTime`（即 `HOMEPAGE_BUILDTIME`）后再哈希，代表「即使配置文件没变，只要容器重启过，也视为整体状态变化」。
+- 源码直接运行时（无 entrypoint），`HOMEPAGE_BUILDTIME` 为空，哈希仅反映配置文件变化。
+
+这意味着 **两种场景下 `/api/hash` 的返回值都会变化**：
+1. 用户编辑了 docker.yaml / services.yaml 等配置文件 → 配置文件哈希变化。
+2. 容器被重启或重新创建 → `HOMEPAGE_BUILDTIME` 变化。
+
+#### 2.3.3 前端：Window Focus 触发的哈希校验与全页刷新
+
+前端在 [src/pages/index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/index.jsx) 的 `Index` 组件中实现了完整的检测-刷新链路：
+
+```js
+function Index({ initialSettings, fallback }) {
+  // 1. useWindowFocus 钩子：监听 window 的 focus/blur 事件
+  const windowFocused = useWindowFocus();
+  const [stale, setStale] = useState(false);
+
+  // 2. SWR 拉取 /api/validate（YAML 语法校验）和 /api/hash（配置哈希）
+  const { data: errorsData } = useSWR("/api/validate");
+  const { data: hashData, mutate: mutateHash } = useSWR("/api/hash");
+
+  // 3. 当窗口重新获得焦点时，强制重新请求 /api/hash
+  useEffect(() => {
+    if (windowFocused) {
+      mutateHash();  // 触发 SWR 重新校验
+    }
+  }, [windowFocused, mutateHash]);
+
+  // 4. 比对新旧哈希，不一致则触发 SSR 重渲染 + 全页 reload
+  useEffect(() => {
+    if (hashData) {
+      const previousHash = localStorage.getItem("hash");
+
+      if (!previousHash) {
+        // 首次访问：记录当前哈希
+        localStorage.setItem("hash", hashData.hash);
+      }
+
+      if (previousHash && previousHash !== hashData.hash) {
+        // 哈希变化：显示加载动画
+        setStale(true);
+        // 更新本地存储
+        localStorage.setItem("hash", hashData.hash);
+        // 调用 /api/revalidate 让 Next.js 重新生成首页的静态页面
+        fetch("/api/revalidate").then((res) => {
+          if (res.ok) {
+            // 强制整页刷新，拉取重新生成的 SSR 内容
+            window.location.reload();
+          }
+        });
+      }
+    }
+  }, [hashData]);
+```
+
+`useWindowFocus` 钩子（[src/utils/hooks/window-focus.js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/utils/hooks/window-focus.js)）的实现：监听 `window.focus` 和 `window.blur` 事件，返回当前窗口是否处于焦点状态。这样设计的意图是：用户切换标签页/最小化浏览器/切走再切回来时，自动触发一次哈希检查，无需手动刷新页面。
+
+#### 2.3.4 `/api/revalidate` 接口：Next.js ISR 增量静态再生成
+
+[src/pages/api/revalidate.js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/api/revalidate.js)：
+
+```js
+export default async function handler(req, res) {
+  try {
+    await res.revalidate("/");    // Next.js 原生 API：重新生成 "/" 路径的静态页面
+    return res.json({ revalidated: true });
+  } catch (err) {
+    return res.status(500).send("Error revalidating");
+  }
+}
+```
+
+这个接口调用 Next.js 的 Incremental Static Regeneration (ISR) 机制，让服务端重新执行 `getStaticProps()`，读取最新的 services.yaml / bookmarks.yaml / widgets.yaml 并生成新的静态 HTML。然后前端 `window.location.reload()` 拉取重新生成的页面。
+
+#### 2.3.5 `/api/validate` 接口：配置文件语法校验
+
+[src/pages/api/validate.js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/api/validate.js) 在页面加载时被调用，检查所有 YAML 配置文件的语法：
+
+```js
+const configs = ["docker.yaml", "settings.yaml", "services.yaml", "bookmarks.yaml", "kubernetes.yaml", "proxmox.yaml"];
+
+export default async function handler(req, res) {
+  let errors = configs.map((config) => checkAndCopyConfig(config)).filter((status) => status !== true);
+  // ...
+  res.send(errors);
+}
+```
+
+如果存在 YAML 解析错误（[checkAndCopyConfig](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/utils/config/config.js#L44-L49) 返回的是 yaml 解析异常对象而非 true），前端会在 [index.jsx 第 133-183 行](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/index.jsx#L133-L183) 显示错误页面而非仪表盘。
+
+#### 2.3.6 getStaticProps：首屏数据注入与 fallback
+
+[index.jsx 的 getStaticProps](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/index.jsx#L55-L95) 在构建时（以及 revalidate 时）服务端执行：
+
+```js
+export async function getStaticProps() {
+  const { providers, ...settings } = getSettings();
+  const services = await servicesResponse();   // 从 Docker/K8s/services.yaml 汇总
+  const bookmarks = await bookmarksResponse();
+  const widgets = await widgetsResponse();
+
+  return {
+    props: {
+      initialSettings: settings,
+      fallback: {
+        "/api/services": services,    // SWR fallback：首屏无需再请求这些 API
+        "/api/bookmarks": bookmarks,
+        "/api/widgets": widgets,
+        "/api/hash": false,           // /api/hash 故意设为 false，首屏不提供 fallback
+      },
+      ...(await serverSideTranslations(language)),
+    },
+  };
+}
+```
+
+注意 `"/api/hash": false` 的设计：首屏 SWR 不会使用 fallback，而是一定会真实请求 `/api/hash`，确保每次页面加载（包括软导航）都能拿到当前的哈希值。而 services/bookmarks/widgets 这些首屏数据则通过 fallback 直接注入，避免重复请求。
+
+#### 2.3.7 完整协作时序
+
+```
+容器启动
+  │
+  ├─ docker-entrypoint.sh
+  │   └─ export HOMEPAGE_BUILDTIME=$(date +%s)    ← 每启动一次都是新值
+  │
+  ▼
+Next.js server 启动
+  │
+  ├─ getStaticProps() 首次执行
+  │   ├─ getSettings() / servicesResponse() / ...
+  │   └─ 生成静态页面 + SWR fallback（/api/hash: false）
+  │
+  ▼
+用户浏览器访问首页
+  │
+  ├─ 1. 服务端渲染 HTML 返回（内含 initialSettings, fallback）
+  ├─ 2. 前端 Hydration，SWRConfig 使用 fallback 缓存
+  │     └─ /api/services, /api/bookmarks, /api/widgets 有缓存，不发请求
+  │     └─ /api/hash: false → SWR 认为无缓存，发起真实请求
+  │
+  ├─ 3. useSWR("/api/hash") 返回 { hash: "abc123..." }
+  │     └─ localStorage 为空 → 写入 hash = "abc123..."
+  │
+  ▼
+用户切换走标签页 → 切回来（触发 window focus）
+  │
+  ├─ useWindowFocus() → true
+  ├─ useEffect → mutateHash()    ← 强制 SWR 重新请求 /api/hash
+  │
+  ├─ 后端 hash.js 重新计算
+  │   ├─ configs 内容哈希（如果配置文件没变则相同）
+  │   └─ HOMEPAGE_BUILDTIME（如果容器没重启则相同）
+  │
+  ▼
+有两种情况：
+
+情况 A：配置未修改，容器未重启
+  └─ 哈希相同 → 无动作
+
+情况 B：配置已修改 或 容器已重启
+  └─ 哈希不同
+      ├─ setStale(true)          ← 显示加载动画（旋转圆环）
+      ├─ localStorage 更新 hash
+      ├─ fetch("/api/revalidate") → 服务端 ISR 重新 getStaticProps()
+      └─ window.location.reload() → 全页刷新，拉取新 SSR 内容
+```
+
+#### 2.3.8 三种「配置变化」场景的实际效果
+
+| 场景 | HOMEPAGE_BUILDTIME | 配置文件哈希 | combinedHash 变化 | 前端行为 |
+|---|---|---|---|---|
+| 用户编辑了 services.yaml | 不变 | 变化 | ✅ 变化 | Window focus 后自动刷新 |
+| `docker restart homepage` | 变化 | 不变 | ✅ 变化 | Window focus 后自动刷新 |
+| `docker-compose up -d --force-recreate` | 变化 | 不变 | ✅ 变化 | Window focus 后自动刷新 |
+| 无任何变化 | 不变 | 不变 | ❌ 不变 | 正常显示 |
+
+这个设计的好处是：**容器重启后，即使配置文件在 volume 中完全未变，前端也会在用户回到页面时自动重新拉取最新的服务列表**。这对于 Docker/K8s 服务发现（自动发现新容器/新 Ingress）尤其重要——比如新增了一个带 homepage 标签的容器，只要重启过 Homepage 容器（或等待下次触发），前端就能感知并展示新服务。
+
+### 2.4 应用配置期注入（YAML 模板变量替换）
 
 这是 Homepage 最有特色的一层。[src/utils/config/config.js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/utils/config/config.js#L8-L9) 定义了两个前缀：
 
@@ -153,7 +379,7 @@ const homepageFilePrefix = "HOMEPAGE_FILE_";
 | `settings.yaml` | [src/utils/config/config.js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/utils/config/config.js#L87) |
 | Docker label 值 | [src/utils/config/service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/utils/config/service-helpers.js#L115) |
 
-### 2.4 安全相关环境变量
+### 2.5 安全相关环境变量
 
 **`HOMEPAGE_ALLOWED_HOSTS`**：[src/middleware.js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/middleware.js) 在所有 `/api/*` 请求上校验 Host 头，防止 Host Header Injection 攻击。
 
@@ -440,6 +666,7 @@ NEXT_PUBLIC_* 变量为空 → Version 组件显示 "dev"
 │  ├─ PUID/PGID → chown + su-exec 降权                                │
 │  ├─ HOSTNAME → IPv6 探测 / IPv4 回退                                │
 │  ├─ /app/config → 符号链接兼容                                      │
+│  ├─ export HOMEPAGE_BUILDTIME=$(date +%s)   ← 每次启动都是新值       │
 │  └─ exec node server.js                                             │
 └───────────────────────────────┬─────────────────────────────────────┘
                                 │
@@ -451,6 +678,11 @@ NEXT_PUBLIC_* 变量为空 → Version 组件显示 "dev"
 │  ├─ config.js: HOMEPAGE_VAR_*/FILE_* → YAML 模板替换               │
 │  ├─ CONF_DIR = HOMEPAGE_CONFIG_DIR || /app/config                   │
 │  ├─ checkAndCopyConfig: 骨架文件自动初始化                           │
+│  │                                                                   │
+│  ├─ 配置刷新通道:                                                     │
+│  │   /api/hash → sha256(configs 内容 + HOMEPAGE_BUILDTIME)          │
+│  │   /api/revalidate → res.revalidate("/") → 重新执行 getStaticProps│
+│  │   /api/validate → YAML 语法错误检测                              │
 │  │                                                                   │
 │  ├─ Docker 通道:                                                     │
 │  │   docker.yaml → dockerode → listContainers/inspect/stats         │
@@ -467,13 +699,24 @@ NEXT_PUBLIC_* 变量为空 → Version 组件显示 "dev"
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        前端展示阶段                                  │
-│  index.jsx → Home                                                   │
+│                        前端展示与刷新阶段                             │
+│  index.jsx → Index → Home                                           │
+│  ├─ 首屏渲染: getStaticProps → initialSettings + SWR fallback       │
+│  │   └─ /api/hash fallback=false → 首屏必然真实请求哈希              │
+│  │                                                                   │
+│  ├─ 配置刷新检测:                                                    │
+│  │   useWindowFocus() → window focus 事件                           │
+│  │     → mutateHash() → 重新请求 /api/hash                          │
+│  │     → 与 localStorage.hash 对比                                  │
+│  │     → 若不同: setStale → /api/revalidate → window.location.reload│
+│  │                                                                   │
 │  ├─ Version 组件: NEXT_PUBLIC_VERSION/REVISION/BUILDTIME            │
 │  │   └─ /api/releases → 更新检测                                    │
+│  │                                                                   │
 │  ├─ ServicesGroup → Item                                            │
 │  │   ├─ service.container → <Status> + <Docker>                     │
 │  │   └─ service.app → <KubernetesStatus> + <Kubernetes>             │
+│  │                                                                   │
 │  └─ Widget 组件: 各服务自定义 widget                                 │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -497,6 +740,10 @@ NEXT_PUBLIC_* 变量为空 → Version 组件显示 "dev"
 | Docker 状态 API | [src/pages/api/docker/status/[...service].js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/api/docker/status/[...service].js) |
 | Docker 统计 API | [src/pages/api/docker/stats/[...service].js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/api/docker/stats/[...service].js) |
 | K8s 状态 API | [src/pages/api/kubernetes/status/[...service].js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/api/kubernetes/status/[...service].js) |
+| 配置哈希 API | [src/pages/api/hash.js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/api/hash.js) |
+| ISR 再生成 API | [src/pages/api/revalidate.js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/api/revalidate.js) |
+| 配置校验 API | [src/pages/api/validate.js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/api/validate.js) |
+| 首页入口（含刷新逻辑） | [src/pages/index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/index.jsx) |
 | 安全中间件 | [src/middleware.js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/middleware.js) |
 | 版本展示组件 | [src/components/version.jsx](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/components/version.jsx) |
 | Docker 状态展示 | [src/components/services/status.jsx](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/components/services/status.jsx) |
@@ -504,5 +751,6 @@ NEXT_PUBLIC_* 变量为空 → Version 组件显示 "dev"
 | Docker 统计展示 | [src/widgets/docker/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/widgets/docker/component.jsx) |
 | K8s 统计展示 | [src/widgets/kubernetes/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/widgets/kubernetes/component.jsx) |
 | 服务卡片入口 | [src/components/services/item.jsx](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/components/services/item.jsx) |
+| 窗口焦点钩子 | [src/utils/hooks/window-focus.js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/utils/hooks/window-focus.js) |
 | K8s 开发环境 | [k3d/](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/k3d) 目录 |
 | Helm Values | [k3d/k3d-helm-values.yaml](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/k3d/k3d-helm-values.yaml) |
