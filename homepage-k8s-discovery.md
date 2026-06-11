@@ -34,8 +34,8 @@
 
 ### 2.1 核心文件
 
-- [kubernetes.js](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/utils/config/kubernetes.js)
-- [config.js](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/utils/config/config.js)
+- `src/utils/config/kubernetes.js`
+- `src/utils/config/config.js`
 
 ### 2.2 关键函数
 
@@ -78,22 +78,24 @@ HTTPROUTE_API_VERSION = "v1"
 
 ## 三、资源采集层
 
-三种入口资源类型并行采集，汇总后统一处理，入口统一在 [export.js](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/utils/kubernetes/export.js)。
+三种入口资源类型并行采集，汇总后统一处理，入口统一在 `src/utils/kubernetes/export.js`。
 
 ### 3.1 标准 Ingress 采集
 
-文件：[ingress-list.js](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/utils/kubernetes/ingress-list.js)
+文件：`src/utils/kubernetes/ingress-list.js`
 
 ```
 NetworkingV1Api.listIngressForAllNamespaces()
-  → response.items  // 所有命名空间的 Ingress 列表
+  → 成功：response.body.items
+  → 失败：catch 后返回 null
+  → 最终：ingressData?.items ?? []  // 空数组兜底
 ```
 
-受 `kubernetes.yaml` 中 `ingress: true/false` 控制。
+受 `kubernetes.yaml` 中 `ingress: true/false` 控制，为 false 时直接返回空数组。
 
 ### 3.2 Traefik IngressRoute 采集
 
-文件：[traefik-list.js](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/utils/kubernetes/traefik-list.js)
+文件：`src/utils/kubernetes/traefik-list.js`
 
 Traefik 存在两套 CRD API Group，需要同时尝试：
 
@@ -106,6 +108,7 @@ Traefik 存在两套 CRD API Group，需要同时尝试：
      version: "v1alpha1",
      plural: "ingressroutes"
    })
+   → 两套分别请求，失败时返回空数组（仅在 CRD 确实存在时才打错误日志）
 
 4. 合并结果后，额外过滤条件：必须带有 gethomepage.dev/href 注解
    （因为 Traefik IngressRoute 的 URL 结构复杂，无法自动推断）
@@ -113,20 +116,25 @@ Traefik 存在两套 CRD API Group，需要同时尝试：
 
 ### 3.3 Gateway API HTTPRoute 采集
 
-文件：[httproute-list.js](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/utils/kubernetes/httproute-list.js)
+文件：`src/utils/kubernetes/httproute-list.js`
 
 Gateway API 的 HTTPRoute 是命名空间级别资源，无全集群 List API，需逐个 namespace 查询：
 
 ```
-1. CoreV1Api.listNamespace()  // 获取所有命名空间
-2. 对每个 namespace:
+1. CoreV1Api.listNamespace()
+   → 成功：items.map(ns => ns.metadata.name)
+   → 失败：返回 null
+
+2. 对每个 namespace 调用：
    CustomObjectsApi.listNamespacedCustomObject({
      group: "gateway.networking.k8s.io",
      version: "v1",
      plural: "httproutes",
      namespace: <ns>
    })
-3. Promise.all 并行查询后 flat() 展平
+   → 失败返回 null
+
+3. Promise.all 并行查询后 flat().filter(Boolean) 过滤掉 null
 ```
 
 ---
@@ -135,7 +143,7 @@ Gateway API 的 HTTPRoute 是命名空间级别资源，无全集群 List API，
 
 ### 4.1 核心文件
 
-[resource-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/utils/kubernetes/resource-helpers.js)
+`src/utils/kubernetes/resource-helpers.js`
 
 ### 4.2 可发现性判断
 
@@ -175,6 +183,7 @@ url    = `${schema}://${host}${path}`
    → CustomObjectsApi.getNamespacedCustomObject() 获取 Gateway
    → 匹配 sectionName 或取第一个 listener 的 protocol
 4. url = `${schema}://${hostnames[0]}${rules[0].matches[0].path.value}`
+5. Gateway 查询失败时，协议回退为 "http"
 ```
 
 用户可通过 `gethomepage.dev/href` 注解手动覆盖自动推断的 URL。
@@ -193,14 +202,14 @@ url    = `${schema}://${host}${path}`
 | `weight` | `gethomepage.dev/weight` 或 `"0"` |
 | `icon` | `gethomepage.dev/icon` |
 | `description` | `gethomepage.dev/description` |
-| `external` | `gethomepage.dev/external` |
+| `external` | `gethomepage.dev/external`（字符串 "true" 解析为布尔 true） |
 | `podSelector` | `gethomepage.dev/pod-selector` |
 | `ping` | `gethomepage.dev/ping` |
 | `siteMonitor` | `gethomepage.dev/siteMonitor` |
 | `statusStyle` | `gethomepage.dev/statusStyle` |
 | `widget.*` | 所有 `gethomepage.dev/widget.<xxx>` 注解通过 shvl.set() 嵌套写入 |
 
-最后对整个对象执行 `substituteEnvironmentVars()`，支持 `{{HOMEPAGE_VAR_*}}` 变量替换。
+最后对整个对象执行 `substituteEnvironmentVars()`，支持 `{{HOMEPAGE_VAR_*}}` 变量替换（JSON 序列化 → 替换 → 反序列化）。
 
 ---
 
@@ -208,38 +217,75 @@ url    = `${schema}://${host}${path}`
 
 ### 5.1 K8s 服务分组
 
-文件：[service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/utils/config/service-helpers.js) 的 `servicesFromKubernetes()`
+文件：`src/utils/config/service-helpers.js` 中的 `servicesFromKubernetes()`
+
+完整流程与空值/异常处理：
 
 ```
-1. getKubeConfig() 检查是否启用
-2. Promise.all([
-     listIngress(),
-     listTraefikIngress(),
-     listHttpRoute()
-   ]) 并行采集三类资源
-3. filter(isDiscoverable) → 过滤启用的资源
-4. map(constructedServiceFromResource) → 构建服务对象
-5. reduce() 按 group 字段分组：
-   { name: "Kubernetes", services: [...] }
+1. getSettings() 读取 instanceName
+2. checkAndCopyConfig("kubernetes.yaml") 确保配置存在
+3. try {
+     getKubeConfig() → 为 null（disabled 模式）直接 return []
+     Promise.all([ingress, traefik, httpRoute]) 并行采集
+     resources = [...三类结果展开]
+       → resources 为假值时 return []（代码注释标注此分支实际不可达）
+     filter(isDiscoverable) → 过滤启用的资源
+     map(constructedServiceFromResource) → 构建服务对象
+     reduce() 按 group 字段分组
+   } catch (e) {
+     logger.error(e)
+     throw e   // 异常向上抛出，由外层 servicesResponse 捕获
+   }
 ```
 
 ### 5.2 三方服务合并
 
-文件：[api-response.js](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/utils/config/api-response.js) 的 `servicesResponse()`
+文件：`src/utils/config/api-response.js` 中的 `servicesResponse()`
+
+**四个独立的 try-catch，各自失败互不影响：**
 
 ```javascript
-discoveredDockerServices     = await servicesFromDocker()
-discoveredKubernetesServices = await servicesFromKubernetes()
-configuredServices           = await servicesFromConfig()  // services.yaml
+// 1. Docker 服务
+try {
+  discoveredDockerServices = cleanServiceGroups(await servicesFromDocker())
+} catch (e) {
+  console.error("Failed to discover services, please check docker.yaml...")
+  discoveredDockerServices = []   // 异常兜底为空数组
+}
+
+// 2. K8s 服务
+try {
+  discoveredKubernetesServices = cleanServiceGroups(await servicesFromKubernetes())
+} catch (e) {
+  console.error("Failed to discover services, please check kubernetes.yaml...")
+  discoveredKubernetesServices = []   // 异常兜底为空数组
+}
+
+// 3. services.yaml 配置
+try {
+  configuredServices = cleanServiceGroups(await servicesFromConfig())
+} catch (e) {
+  console.error("Failed to load services.yaml, please check for errors")
+  configuredServices = []   // 异常兜底为空数组
+}
+
+// 4. settings.yaml 配置
+try {
+  initialSettings = await getSettings()
+} catch (e) {
+  console.error("Failed to load settings.yaml...")
+  initialSettings = {}   // 异常兜底为空对象
+}
 ```
 
-合并策略：
+**合并策略：**
 
-1. 取三者 group name 的并集
-2. 对每个 group，按 `docker → k8s → yaml` 顺序拼接 services，然后按 `weight`（升序）→ `name`（字典序）排序
-3. 根据 `settings.yaml` 的 `layout` 配置对 group 排序
-4. 支持嵌套 group（通过 `parent` 字段递归合并）
-5. `pruneEmptyGroups()` 移除无服务也无子组的空组
+1. 取三者 group name 的并集（`mergedGroupsNames`）
+2. 对每个 group，按 `docker → k8s → yaml` 顺序拼接 services，`.filter(Boolean)` 去除假值，然后按 `weight`（升序）→ `name`（字典序）排序
+3. `groups` 子组只取 `configuredGroup.groups`（即只来自 services.yaml，K8s 和 Docker 发现的服务不支持子组）
+4. 根据 `settings.yaml` 的 `layout` 配置对 group 排序
+5. 支持嵌套 group（通过 `parent` 字段递归合并）
+6. `pruneEmptyGroups()` 移除无服务也无子组的空组（递归处理）
 
 ### 5.3 数据清洗
 
@@ -257,19 +303,30 @@ configuredServices           = await servicesFromConfig()  // services.yaml
 
 ### 6.1 数据获取入口
 
-文件：[index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/pages/index.jsx)
+文件：`src/pages/index.jsx`
 
 **服务端预取（SSR）** — `getStaticProps()`：
 
 ```javascript
-const services  = await servicesResponse()
-const bookmarks = await bookmarksResponse()
-const widgets   = await widgetsResponse()
-// 注入 SWR fallback，首屏无需二次请求
-fallback: {
-  "/api/services": services,
-  "/api/bookmarks": bookmarks,
-  "/api/widgets": widgets,
+try {
+  const services  = await servicesResponse()
+  const bookmarks = await bookmarksResponse()
+  const widgets   = await widgetsResponse()
+  // 注入 SWR fallback，首屏无需二次请求
+  fallback: {
+    "/api/services": services,
+    "/api/bookmarks": bookmarks,
+    "/api/widgets": widgets,
+    "/api/hash": false,
+  }
+} catch (e) {
+  // 整体异常兜底，全部返回空数组
+  fallback: {
+    "/api/services": [],
+    "/api/bookmarks": [],
+    "/api/widgets": [],
+    "/api/hash": false,
+  }
 }
 ```
 
@@ -279,11 +336,11 @@ fallback: {
 const { data: services } = useSWR("/api/services")
 ```
 
-API 路由：[/api/services/index.js](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/pages/api/services/index.js) 直接转发 `servicesResponse()`。
+API 路由：`src/pages/api/services/index.js` 直接转发 `servicesResponse()`。
 
 ### 6.2 分组渲染
 
-文件：[group.jsx](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/components/services/group.jsx)
+文件：`src/components/services/group.jsx`
 
 `ServicesGroup` 组件：
 
@@ -293,28 +350,40 @@ API 路由：[/api/services/index.js](file:///d:/fz/0601/solo-dogfeeding/code/19
 
 ### 6.3 服务卡片渲染
 
-文件：[item.jsx](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/components/services/item.jsx)
+文件：`src/components/services/item.jsx`
 
-核心渲染逻辑：
+**核心渲染逻辑（K8s 相关部分）：**
 
 ```
-service 带 app 字段（K8s 发现的特征）→ 显示 KubernetesStatus 指示器
-点击卡片 → 展开 Kubernetes widget 组件显示 Pod 资源统计
-  ├── href 链接跳转
-  ├── icon 图标展示
-  ├── name + description
-  ├── 右侧状态标签：ping / siteMonitor / container / app / proxmox
-  └── 底部展开区：
-      - Docker: docker/component
-      - K8s:    widgets/kubernetes/component  ← 我们关注的
-      - ProxmoxVM
-      - 自定义 widgets 列表
+┌─ service 带 app 字段 → 识别为 Kubernetes 服务
+│
+├── 右上角状态指示器：
+│    条件：service.app && !service.external
+│    └─ KubernetesStatus 组件（圆点或文字标签）
+│       └─ useSWR(/api/kubernetes/status/{ns}/{app})
+│
+└── 底部展开监控区域：
+     条件：service.app  （注意：不判断 external！）
+     └─ 显示条件：showStats || statsOpen
+        ├─ showStats：service.showStats === false ? false : settings.showStats
+        │   （全局配置默认展开，或服务单独配置）
+        └─ statsOpen：点击状态指示器按钮切换
+           （但 external 服务没有指示器按钮，只能靠 showStats 自动展开）
 ```
 
-K8s 服务卡片识别依据：`service.app && !service.external`，满足条件时：
+**关键细节 — external 对 K8s 服务的影响：**
 
-1. 渲染 `KubernetesStatus` 小圆点（running/partial/down）
-2. 点击展开区域渲染 `Kubernetes` 组件，传参 `{ namespace, app, podSelector }`
+| 特性 | 条件 | external=true 时 |
+|-----|------|-----------------|
+| 状态指示器按钮 | `service.app && !service.external` | ❌ 不显示 |
+| 底部展开区域 DOM | `service.app` | ✅ 仍然存在 |
+| 通过点击展开 | 依赖指示器按钮的 onClick | ❌ 无法点击展开 |
+| 通过 showStats 默认展开 | 依赖 settings.showStats 或 service.showStats | ✅ 可以 |
+| Kubernetes 组件渲染 | `showStats \|\| statsOpen` | ✅ 若展开则正常显示 |
+
+简言之：`external=true` 的 K8s 服务隐藏了状态指示器按钮，但监控面板组件本身仍在，只是需要通过 `showStats` 配置才能自动展开。
+
+另外，服务卡片还可能带有 `ping`、`siteMonitor` 等状态标签，以及 `widgets` 数组渲染的各类型 Widget。
 
 ---
 
@@ -324,43 +393,52 @@ Kubernetes 监控分两个维度：**服务级 Pod 监控** 和 **集群级 Node
 
 ### 7.1 服务级 Pod 状态
 
-API 路由：[status/[...service].js](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/pages/api/kubernetes/status/[...service].js)
+API 路由：`src/pages/api/kubernetes/status/[...service].js`
 
 ```
 请求：GET /api/kubernetes/status/{namespace}/{app}?podSelector=...
 
 1. labelSelector = podSelector || "app.kubernetes.io/name=<appName>"
 2. CoreV1Api.listNamespacedPod({ namespace, labelSelector })
-3. 判断 Pod phase：
+   → 失败：500 + { error }
+3. pods.length === 0 → 404 + { status: "not found" }
+4. 判断 Pod phase：
    - 全部 Running/Succeeded → "running"
    - 部分 Running/Succeeded → "partial"
    - 否则                   → "down"
-4. 返回 { status }
+5. 200 + { status }
 ```
+
+前端组件：`src/components/services/kubernetes-status.jsx`
+
+- 通过 `useSWR` 定时获取状态
+- 支持 `dot` 和文字两种样式
+- 状态颜色：running→绿色，partial/down/not found→橙色，error→红色
 
 ### 7.2 服务级 Pod 资源统计
 
-API 路由：[stats/[...service].js](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/pages/api/kubernetes/stats/[...service].js)
+API 路由：`src/pages/api/kubernetes/stats/[...service].js`
 
 ```
 1. 同 status API，先 listNamespacedPod 获取目标 Pod
 2. 累加各 container 的 resources.limits.cpu / memory（使用 parseCpu/parseMemory 解析单位）
 3. Metrics.getPodMetrics(namespace) 获取 metrics.k8s.io 数据
+   → 404 不报错（可能 metrics 尚未填充），返回 null
 4. 按 Pod name 过滤后累加 containers 的 usage.cpu / memory
 5. 计算：
    stats.cpuUsage = cpuLimit ? 100 * (cpu / cpuLimit) : 0
    stats.memUsage = memLimit ? 100 * (mem / memLimit) : 0
-6. 返回 { stats: { cpu, mem, cpuLimit, memLimit, cpuUsage, memUsage } }
+6. 200 + { stats: { cpu, mem, cpuLimit, memLimit, cpuUsage, memUsage } }
 ```
 
-工具函数 [utils.js](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/utils/kubernetes/utils.js)：
+工具函数 `src/utils/kubernetes/utils.js`：
 
 - `parseCpu()`：支持 `n`(纳核) / `u`(微核) / `m`(毫核) / 纯数字
 - `parseMemory()`：支持 `Ki`/`K`/`Mi`/`M`/`Gi`/`G`，注意十进制与二进制的区别（Ki=1000, K=1024）
 
 ### 7.3 前端组件（服务级）
 
-文件：[widgets/kubernetes/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/widgets/kubernetes/component.jsx)
+文件：`src/widgets/kubernetes/component.jsx`
 
 ```javascript
 useSWR(`/api/kubernetes/status/${namespace}/${app}?podSelector=...`)
@@ -368,12 +446,14 @@ useSWR(`/api/kubernetes/stats/${namespace}/${app}?podSelector=...`)
 ```
 
 渲染两块数据：
-- **CPU**：有 limit 时显示百分比，否则显示绝对值（4 位小数）
-- **内存**：always 显示字节数（自动带单位）
+- **CPU**：有 limit 时显示百分比（带高亮），否则显示绝对值（4 位小数）
+- **内存**：显示字节数（自动带单位，带高亮）
+
+状态异常（非 running / partial）时，显示 "offline"。
 
 ### 7.4 集群级 Widget
 
-API 路由：[widgets/kubernetes.js](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/pages/api/widgets/kubernetes.js)
+API 路由：`src/pages/api/widgets/kubernetes.js`
 
 信息栏 Widget，在顶部展示整个集群的状态：
 
@@ -385,11 +465,12 @@ API 路由：[widgets/kubernetes.js](file:///d:/fz/0601/solo-dogfeeding/code/194
 2. Metrics.getNodeMetrics()
    - 每个节点的 usage.cpu/memory
    - 计算 load / percent / used / free
+   - 失败：500 + { error }，提示需安装 metrics-server
 
-3. 返回 { cluster: {...}, nodes: [{name, ready, cpu:{...}, memory:{...}}, ...] }
+3. 200 + { cluster: {...}, nodes: [{name, ready, cpu:{...}, memory:{...}}, ...] }
 ```
 
-前端组件：[components/widgets/kubernetes/kubernetes.jsx](file:///d:/fz/0601/solo-dogfeeding/code/194-homepage/src/components/widgets/kubernetes/kubernetes.jsx)
+前端组件：`src/components/widgets/kubernetes/kubernetes.jsx`
 
 每 1500ms 刷新一次，支持分别控制 `cluster.show` 和 `nodes.show`。
 
@@ -401,50 +482,64 @@ API 路由：[widgets/kubernetes.js](file:///d:/fz/0601/solo-dogfeeding/code/194
 用户访问首页
     │
     ▼
-getStaticProps() [pages/index.jsx]
-    ├── servicesResponse()        [utils/config/api-response.js]
-    │     ├── servicesFromDocker()
-    │     ├── servicesFromKubernetes()  [utils/config/service-helpers.js]
-    │     │     ├── getKubeConfig()     [utils/config/kubernetes.js]
-    │     │     ├── kubernetes.listIngress()
-    │     │     │     └── NetworkingV1Api.listIngressForAllNamespaces()
-    │     │     ├── kubernetes.listTraefikIngress()
-    │     │     │     ├── checkCRD(traefik.containo.us)
-    │     │     │     ├── checkCRD(traefik.io)
-    │     │     │     └── CustomObjectsApi.listClusterCustomObject() ×2
-    │     │     ├── kubernetes.listHttpRoute()
-    │     │     │     ├── CoreV1Api.listNamespace()
-    │     │     │     └── CustomObjectsApi.listNamespacedCustomObject() ×N
-    │     │     ├── filter(isDiscoverable)
-    │     │     ├── map(constructedServiceFromResource)
-    │     │     │     ├── getUrlFromIngress / getUrlFromHttpRoute
-    │     │     │     ├── 注解解析 → 服务对象
-    │     │     │     └── shvl.set() 写入 widget 嵌套字段
-    │     │     └── reduce() 按 group 分组
-    │     ├── servicesFromConfig()
+getStaticProps() [src/pages/index.jsx]
+    ├── servicesResponse()        [src/utils/config/api-response.js]
+    │     ├── try { servicesFromDocker() } catch → []
+    │     ├── try { servicesFromKubernetes() } catch → []
+    │     │     └── servicesFromKubernetes()  [src/utils/config/service-helpers.js]
+    │     │           ├── getSettings() → instanceName
+    │     │           ├── getKubeConfig()
+    │     │           │     └── kubernetes.yaml mode: cluster|default|disabled
+    │     │           ├── kubernetes.listIngress()
+    │     │           │     └── NetworkingV1Api.listIngressForAllNamespaces()
+    │     │           │       → 失败 → null → .items ?? []
+    │     │           ├── kubernetes.listTraefikIngress()
+    │     │           │     ├── checkCRD(traefik.containo.us)
+    │     │           │     ├── checkCRD(traefik.io)
+    │     │           │     └── CustomObjectsApi.listClusterCustomObject() ×2
+    │     │           │       → 失败 → []
+    │     │           ├── kubernetes.listHttpRoute()
+    │     │           │     ├── CoreV1Api.listNamespace()
+    │     │           │     └── CustomObjectsApi.listNamespacedCustomObject() ×N
+    │     │           │       → 失败 → null → filter(Boolean) 过滤
+    │     │           ├── filter(isDiscoverable)
+    │     │           │     └── gethomepage.dev/enabled === "true" + instance 匹配
+    │     │           ├── map(constructedServiceFromResource)
+    │     │           │     ├── getUrlFromIngress / getUrlFromHttpRoute
+    │     │           │     ├── 注解解析 → 服务对象
+    │     │           │     ├── shvl.set() 写入 widget 嵌套字段
+    │     │           │     └── substituteEnvironmentVars() 变量替换
+    │     │           └── reduce() 按 group 分组
+    │     │           └── catch → logger.error + throw
+    │     ├── try { servicesFromConfig() } catch → []
+    │     ├── try { getSettings() } catch → {}
     │     ├── 三方合并 + 排序 + layout 排序
+    │     │     └── compareServices(): weight 升序 → name 字典序
+    │     ├── pruneEmptyGroups()
     │     └── cleanServiceGroups()
     └── SWR fallback → props
     │
     ▼
-Home 组件 [pages/index.jsx]
+Home 组件 [src/pages/index.jsx]
     └── useSWR("/api/services")
          │
          ▼
-ServicesGroup [components/services/group.jsx]
+ServicesGroup [src/components/services/group.jsx]
     └── Services List
-         └── Item [components/services/item.jsx]
-              ├── service.app && !external → KubernetesStatus
-              └── 点击展开 → Kubernetes component [widgets/kubernetes/component.jsx]
-                   ├── useSWR(/api/kubernetes/status/{ns}/{app})
-                   │    └── CoreV1Api.listNamespacedPod → phase 判断
-                   └── useSWR(/api/kubernetes/stats/{ns}/{app})
-                        ├── CoreV1Api.listNamespacedPod → limits 累加
-                        └── Metrics.getPodMetrics → usage 累加
+         └── Item [src/components/services/item.jsx]
+              ├── service.app && !service.external → KubernetesStatus 按钮
+              │    └── useSWR(/api/kubernetes/status/{ns}/{app})
+              │         └── CoreV1Api.listNamespacedPod → phase 判断
+              └── service.app → 底部展开区域（点击或 showStats 显示）
+                   └── Kubernetes component [src/widgets/kubernetes/component.jsx]
+                        ├── useSWR(/api/kubernetes/status/{ns}/{app})
+                        └── useSWR(/api/kubernetes/stats/{ns}/{app})
+                             ├── CoreV1Api.listNamespacedPod → limits 累加
+                             └── Metrics.getPodMetrics → usage 累加
 
 另外（信息栏 Widget，独立于服务）：
-components/widgets/kubernetes/kubernetes.jsx
-    └── useSWR(/api/widgets/kubernetes)
+src/components/widgets/kubernetes/kubernetes.jsx
+    └── useSWR(/api/widgets/kubernetes, refreshInterval: 1500)
          ├── CoreV1Api.listNode()
          └── Metrics.getNodeMetrics()
 ```
@@ -468,7 +563,9 @@ components/widgets/kubernetes/kubernetes.jsx
 | `gethomepage.dev/ping` | | 启用 ICMP ping 检测 |
 | `gethomepage.dev/siteMonitor` | | 启用 HTTP 站点监控 |
 | `gethomepage.dev/pod-selector` | | 自定义 Pod label selector，覆盖默认 `app.kubernetes.io/name=<app>` |
-| `gethomepage.dev/external` | | `"true"` 时不显示 Kubernetes 状态指示器 |
+| `gethomepage.dev/external` | | `"true"` 时隐藏 K8s 状态指示器按钮（展开面板仍在，需 showStats 自动展开） |
+| `gethomepage.dev/statusStyle` | | 状态指示器样式：`dot` 或文字 |
+| `gethomepage.dev/showStats` | | 是否默认展开监控面板 |
 | `gethomepage.dev/instance` | | 多实例隔离，匹配 `settings.yaml` 的 `instanceName` |
 | `gethomepage.dev/instance.<name>` | | 多实例隔离的另一种写法 |
 | `gethomepage.dev/widget.<type>.<field>` | | 为服务附加 Widget，如 `widget.type=kubernetes` |
