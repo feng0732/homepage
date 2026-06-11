@@ -1,4 +1,4 @@
-# Homepage 身份认证代理协议分析（v5 - 完整分类版）
+# Homepage 身份认证代理协议分析（v6 - 统计口径修正版）
 
 > **项目信息**：Homepage v1.13.1 | 仓库：[gethomepage/homepage](https://github.com/gethomepage/homepage)
 >
@@ -8,7 +8,12 @@
 >
 > **仓库相对路径对照**：所有路径均为项目 `src/` 目录下的相对路径，可直接在本地 IDE 中按相同路径查找。
 >
-> **覆盖范围**：全部 **53 个自定义 widget proxy** + 5 个通用 handler，按 14 个业务类别组织。
+> **覆盖范围**：全部 **47 个自定义 widget proxy** + 5 个通用 handler，按 15 个业务类别组织。
+>
+> **统计口径**：
+> - 自定义 widget proxy：`src/widgets/*/proxy.js`，共 47 个（有独立 proxy 实现文件）
+> - 通用 handler：`src/utils/proxy/handlers/*.js`，共 5 个（credentialed, generic, synology, jsonrpc, unifi）
+> - 使用通用 handler 但无独立 proxy.js 的服务不计入自定义 proxy 数量
 
 ---
 
@@ -32,7 +37,7 @@ API 路由入口
   │  解析 widget 类型 → 选择 proxyHandler → endpoint mapping
   ▼
 Proxy Handler 层
-  │  credentialed / generic / synology / jsonrpc / unifi / 53 个自定义 widget proxy
+  │  credentialed / generic / synology / jsonrpc / unifi / 47 个自定义 widget proxy
   │  注入认证头 / 管理登录态 / Cookie Jar
   ▼
 HTTP 底层
@@ -178,7 +183,9 @@ mapping 支持的能力：
 
 ## 四、登录态判断逻辑（全分类 · 逐服务对齐）
 
-> 本章节覆盖全部 **53 个自定义 proxy handler** + 5 个通用 handler，按 14 个业务类别组织。每个服务都标注了**认证方式**、**Token/Cookie/业务字段**、**登录态判断条件**、**缓存策略**和**对应代码行号**。
+> 本章节覆盖全部 **47 个自定义 proxy handler** + 5 个通用 handler，按 15 个业务类别组织。每个服务都标注了**认证方式**、**Token/Cookie/业务字段**、**登录态判断条件**、**缓存策略**和**对应代码行号**。
+>
+> **分类说明**：有独立 proxy.js 文件的服务计入"自定义 proxy"数量；使用 credentialed/generic 等通用 handler 但无独立 proxy.js 的服务（如 Prowlarr、Miniflux、Nextcloud 等）在对应分类中注明"使用通用 handler"，不计入自定义 proxy 数量。
 >
 > 所有链接均指向 `v1.13.1` tag，永久有效。
 
@@ -186,8 +193,8 @@ mapping 支持的能力：
 
 | 模式分类 | 典型特征 | 代表服务数量 |
 |---|---|---|
-| **无状态模式** | 每次请求直接带认证头，无需登录流程 | ~28+（credentialed + generic 覆盖的多数） |
-| **Token 缓存模式** | 先登录获取 token，缓存到 memory-cache，401/403 时刷新 | 约 18 个 |
+| **无状态模式** | 每次请求直接带认证头，无需登录流程 | ~25+（credentialed + generic 覆盖的多数） |
+| **Token 缓存模式** | 先登录获取 token，缓存到 memory-cache，401/403 时刷新 | 约 17 个 |
 | **Cookie Jar 模式** | 登录后 Cookie 自动存入 cookie-jar，后续自动携带 | 约 8 个 |
 | **每次登录模式** | 每次请求前都重新登录，无缓存 | 约 6 个 |
 | **业务字段模式** | 通过响应 body 中的 success/error/code 字段判断登录态 | 约 7 个 |
@@ -215,13 +222,12 @@ mapping 支持的能力：
 
 ### 4.3 阅读库 / 电子书（eBook / Library）
 
-共 3 个服务。
+共 2 个自定义 proxy（Kavita 已归入漫画分类）。
 
 | 服务 | 认证方式 | Token/Cookie/业务字段 | 登录态判断 | 缓存策略 | 代码定位 |
 |---|---|---|---|---|---|
 | **Booklore** | Bearer Token（JWT） | `token` 字段（响应体） | `status === 401 \|\| status === 403` 时重新登录 | memory-cache，**10 小时 - 1 分钟**提前刷新 | [src/widgets/booklore/proxy.js#L44](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/booklore/proxy.js#L44) |
 | **Audiobookshelf** | Bearer Token | Header 携带 | 无 — 每次带 key 请求 | 无 | [src/widgets/audiobookshelf/proxy.js#L10-L23](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/audiobookshelf/proxy.js#L10-L23) |
-| **Kavita** | 同漫画分类 | 同上 | 同上 | 同上 | 同上 |
 
 **Booklore 登录细节**（[src/widgets/booklore/proxy.js#L13-L52](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/booklore/proxy.js#L13-L52)）：
 - 登录端点：`auth/login`（POST JSON，用户名+密码）
@@ -233,12 +239,12 @@ mapping 支持的能力：
 
 ### 4.4 RSS / 订阅（RSS / Feed）
 
-共 2 个服务。
+共 1 个自定义 proxy。
 
 | 服务 | 认证方式 | Token/Cookie/业务字段 | 登录态判断 | 缓存策略 | 代码定位 |
 |---|---|---|---|---|---|
 | **FreshRSS** | GoogleLogin Auth Token | `Auth=` 字段（响应体文本） | `status === 401` 时重新登录 | memory-cache，无显式过期 | [src/widgets/freshrss/proxy.js#L56-L66](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/freshrss/proxy.js#L56-L66) |
-| **Miniflux** | `X-Auth-Token` | Header 携带 | 无 — 每次带 token | 无（credentialed handler） | [src/utils/proxy/handlers/credentialed.js#L95-L96](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/credentialed.js#L95-L96) |
+| **Miniflux** | `X-Auth-Token` | Header 携带 | 无 — 每次带 token | 无（使用 credentialed 通用 handler，无独立 proxy.js） | [src/utils/proxy/handlers/credentialed.js#L95-L96](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/credentialed.js#L95-L96) |
 
 **FreshRSS 登录细节**（[src/widgets/freshrss/proxy.js#L13-L41](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/freshrss/proxy.js#L13-L41)）：
 - 登录端点：`accounts/ClientLogin`（POST form-urlencoded）
@@ -264,12 +270,12 @@ mapping 支持的能力：
 
 ### 4.6 文件管理（File Management）
 
-共 2 个服务。
+共 1 个自定义 proxy。
 
 | 服务 | 认证方式 | Token/Cookie/业务字段 | 登录态判断 | 缓存策略 | 代码定位 |
 |---|---|---|---|---|---|
 | **Filebrowser** | `X-AUTH` Header | 响应体 raw data 作为 token | 无显式重试 — 登录失败就 500 | **无（每次都重新登录）** | [src/widgets/filebrowser/proxy.js#L51-L68](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/filebrowser/proxy.js#L51-L68) |
-| **Nextcloud** | `NC-Token` 或 Basic Auth | Header 携带 | 无 — 每次带认证头 | 无（credentialed handler） | [src/utils/proxy/handlers/credentialed.js#L97-L102](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/credentialed.js#L97-L102) |
+| **Nextcloud** | `NC-Token` 或 Basic Auth | Header 携带 | 无 — 每次带认证头 | 无（使用 credentialed 通用 handler，无独立 proxy.js） | [src/utils/proxy/handlers/credentialed.js#L97-L102](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/credentialed.js#L97-L102) |
 
 **Filebrowser 每次登录模式**：
 - 每次调用 proxy handler 都先调用 `login()` 获取新 token
@@ -281,7 +287,7 @@ mapping 支持的能力：
 
 ### 4.7 NAS / 存储（NAS / Storage）
 
-共 7 个自定义 proxy + Synology 通用 handler。
+共 5 个自定义 proxy + Synology 通用 handler。
 
 | 服务 | 认证方式 | Token/Cookie/业务字段 | 登录态判断 | 缓存策略 | 代码定位 |
 |---|---|---|---|---|---|
@@ -291,8 +297,7 @@ mapping 支持的能力：
 | **TrueNAS v2** | WebSocket + `auth.login_with_api_key` / `auth.login` | WebSocket 消息 | 连接后调用 authenticate，失败抛错 | 无（每次新建 WS 连接） | [src/widgets/truenas/proxy.js#L84-L102](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/truenas/proxy.js#L84-L102) |
 | **UrBackup** | `urbackup-server-api` SDK | SDK 内部处理 | SDK 内部处理 | 无 | [src/widgets/urbackup/proxy.js#L9-L13](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/urbackup/proxy.js#L9-L13) |
 | **OpenMediaVault** | Bearer Token | `response.authenticated` 字段 | `resp.status === 401` 或 `json.response.authenticated !== true` | 无显式缓存（每次都预检登录） | [src/widgets/openmediavault/proxy.js#L71-L83](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/openmediavault/proxy.js#L71-L83) |
-| **Synology** | SID + Cookie | `success` 字段（响应体） | `json?.success !== true` 时重新登录 | Cookie Jar 自动管理 | [src/utils/proxy/handlers/synology.js#L168-L173](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/synology.js#L168-L173) |
-| **OpenMediaVault** | Bearer Token | 业务字段 | 401 + authenticated!==true | 每次预检登录 | 见上方 |
+| **Synology** | SID + Cookie | `success` 字段（响应体） | `json?.success !== true` 时重新登录 | Cookie Jar 自动管理 | （通用 handler，无独立 proxy.js）[src/utils/proxy/handlers/synology.js#L168-L173](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/synology.js#L168-L173) |
 
 **QNAP 双重登录重试逻辑**：
 1. 先用缓存的 SID 请求
@@ -327,12 +332,12 @@ mapping 支持的能力：
 
 ### 4.9 索引器（Indexer）
 
-共 2 个：Jackett（自定义 proxy）+ Prowlarr（credentialed handler）。
+共 1 个自定义 proxy。
 
 | 服务 | 认证方式 | Token/Cookie/业务字段 | 登录态判断 | 缓存策略 | 代码定位 |
 |---|---|---|---|---|---|
 | **Jackett** | Cookie（表单登录获取） | Set-Cookie 响应头 | 无登录态判断 — **每次请求前都重新获取 Cookie** | **无（每次都登录拿新 cookie）** | [src/widgets/jackett/proxy.js#L9-L25](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/jackett/proxy.js#L9-L25) |
-| **Prowlarr** | `X-Api-Key`（credentialed 默认） | Header 携带 | 无 | 无 | （credentialed handler） |
+| **Prowlarr** | `X-Api-Key`（credentialed 默认） | Header 携带 | 无 | 无（使用 credentialed 通用 handler，无独立 proxy.js） | [src/utils/proxy/handlers/credentialed.js#L138-L140](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/credentialed.js#L138-L140) |
 
 **Jackett 每次登录模式**（[src/widgets/jackett/proxy.js#L41-L48](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/jackett/proxy.js#L41-L48)）：
 > 每次调用 proxy handler 都会重新登录获取新 cookie，**没有复用机制**。
@@ -341,7 +346,7 @@ mapping 支持的能力：
 
 ### 4.10 广告过滤 / DNS（Ad Blocking / DNS）
 
-共 2 个版本的 Pi-hole。
+共 1 个自定义 proxy（Pi-hole，支持 v5/v6 两个版本）。
 
 | 服务 | 认证方式 | Token/Cookie/业务字段 | 登录态判断 | 缓存策略 | 代码定位 |
 |---|---|---|---|---|---|
@@ -386,7 +391,7 @@ mapping 支持的能力：
 
 ### 4.12 智能家居 / 路由器（Smart Home / Router）
 
-共 6 个服务。
+共 4 个自定义 proxy。
 
 | 服务 | 认证方式 | Token/Cookie/业务字段 | 登录态判断 | 缓存策略 | 代码定位 |
 |---|---|---|---|---|---|
@@ -394,7 +399,7 @@ mapping 支持的能力：
 | **Homebridge** | Bearer Token | `access_token` + `expires_in` 字段 | `status === 401 \|\| status === 403` 时重新登录 | memory-cache，`expires_in - 5分钟` 提前刷新 | [src/widgets/homebridge/proxy.js#L29](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/homebridge/proxy.js#L29) |
 | **FritzBox** | UPnP / SOAP（无认证） | — | 无 | 无 | [src/widgets/fritzbox/proxy.js#L11-L46](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/fritzbox/proxy.js#L11-L46) |
 | **OpenWRT** | JSON-RPC + ubus session | `ubus_rpc_session` 字段 + `error.code` | `json.error.code === -32002` 时重新登录 | 模块级变量（非 cache 库） | [src/widgets/openwrt/proxy.js#L37-L51](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/openwrt/proxy.js#L37-L51) |
-| **ESPHome** | Basic Auth 或 Cookie | `authenticated` Cookie | 无 — 每次带认证头 | 无（credentialed handler） | [src/utils/proxy/handlers/credentialed.js#L117-L122](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/credentialed.js#L117-L122) |
+| **ESPHome** | Basic Auth 或 Cookie | `authenticated` Cookie | 无 — 每次带认证头 | 无（使用 credentialed 通用 handler，无独立 proxy.js） | [src/utils/proxy/handlers/credentialed.js#L117-L122](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/credentialed.js#L117-L122) |
 
 **OpenWRT JSON-RPC 登录模式**（[src/widgets/openwrt/proxy.js#L42-L51](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/openwrt/proxy.js#L42-L51)）：
 - 登录方法：`call` + 参数 `["00000000000000000000000000000000", "session", "login", {username, password}]`
@@ -441,15 +446,15 @@ mapping 支持的能力：
 
 ### 4.14 资源监控 / 安全（Monitoring / Security）
 
-共 5 个服务。
+共 2 个自定义 proxy。
 
 | 服务 | 认证方式 | Token/Cookie/业务字段 | 登录态判断 | 缓存策略 | 代码定位 |
 |---|---|---|---|---|---|
 | **Beszel** | Bearer Token | `token` 字段（响应体） | `status === 400/403` 或 `items` 为空数组 | memory-cache，无显式过期 | [src/widgets/beszel/proxy.js#L75-L93](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/beszel/proxy.js#L75-L93) |
 | **CrowdSec** | Bearer Token | `token` + `expire` 字段 | `status === 401` 时重新登录 | memory-cache，按 `expire` 计算 TTL | [src/widgets/crowdsec/proxy.js#L87-L98](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/crowdsec/proxy.js#L87-L98) |
-| **Glances** | Basic Auth | Header 携带 | 无 — 每次带认证 | 无（credentialed handler） | [src/utils/proxy/handlers/credentialed.js#L111-L112](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/credentialed.js#L111-L112) |
-| **APC UPS** | — | — | 无 | 无（无认证） | — |
-| **Speedtest Tracker** | Bearer Token（可选） | Header 携带 | 无 | 无（credentialed handler） | [src/utils/proxy/handlers/credentialed.js#L133-L137](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/credentialed.js#L133-L137) |
+| **Glances** | Basic Auth | Header 携带 | 无 — 每次带认证 | 无（使用 credentialed 通用 handler，无独立 proxy.js） | [src/utils/proxy/handlers/credentialed.js#L111-L112](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/credentialed.js#L111-L112) |
+| **APC UPS** | — | — | 无 | 无（有独立 proxy.js，但无认证逻辑） | [src/widgets/apcups/proxy.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/apcups/proxy.js) |
+| **Speedtest Tracker** | Bearer Token（可选） | Header 携带 | 无 | 无（使用 credentialed 通用 handler，无独立 proxy.js） | [src/utils/proxy/handlers/credentialed.js#L133-L137](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/credentialed.js#L133-L137) |
 
 **Beszel 空数组判断模式**（[src/widgets/beszel/proxy.js#L79-L84](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/beszel/proxy.js#L79-L84)）：
 - 除了 HTTP 400/403，还会检查 `json.items.length === 0`
@@ -465,16 +470,15 @@ mapping 支持的能力：
 
 ### 4.15 容器 / 备份 / 调度（Container / Backup / Scheduler）
 
-共 6 个服务。
+共 4 个自定义 proxy（UrBackup 已归入 NAS/存储分类）。
 
 | 服务 | 认证方式 | Token/Cookie/业务字段 | 登录态判断 | 缓存策略 | 代码定位 |
 |---|---|---|---|---|---|
 | **Backrest** | Basic Auth（可选） | Header 携带 | 无 — 每次带认证头 | 无 | [src/widgets/backrest/proxy.js#L66-L68](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/backrest/proxy.js#L66-L68) |
-| **UrBackup** | SDK 内部处理（用户名密码） | SDK 内部 | SDK 内部处理 | 无 | [src/widgets/urbackup/proxy.js#L9-L13](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/urbackup/proxy.js#L9-L13) |
 | **Watchtower** | Bearer Token | Header 携带 | 无 — 每次带 token | 无 | [src/widgets/watchtower/proxy.js#L27-L32](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/watchtower/proxy.js#L27-L32) |
 | **Dockhand** | Cookie（登录后获取） | Set-Cookie 响应头 | `status === 401` 时登录并重试一次 | 无（每次都重新登录） | [src/widgets/dockhand/proxy.js#L46-L53](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/dockhand/proxy.js#L46-L53) |
 | **Dispatcharr** | Bearer Token（JWT） | `access` 字段 | `status === 400/401/403` 或 `items` 为空数组 | memory-cache，无显式过期 | [src/widgets/dispatcharr/proxy.js#L76-L93](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/dispatcharr/proxy.js#L76-L93) |
-| **Proxmox** | `PVEAPIToken` | Header 携带 | 无 — 每次带 token | 无（credentialed handler） | [src/utils/proxy/handlers/credentialed.js#L86-L87](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/credentialed.js#L86-L87) |
+| **Proxmox** | `PVEAPIToken` | Header 携带 | 无 — 每次带 token | 无（使用 credentialed 通用 handler，无独立 proxy.js） | [src/utils/proxy/handlers/credentialed.js#L86-L87](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/credentialed.js#L86-L87) |
 
 **Dockhand 登录模式**：
 - 首次请求无认证 → 若 401 则 POST `/api/auth/login` 登录
@@ -490,15 +494,17 @@ mapping 支持的能力：
 
 ### 4.16 媒体服务器 / IPTV / 其他（Media / Misc）
 
+共 6 个自定义 proxy。
+
 | 服务 | 认证方式 | Token/Cookie/业务字段 | 登录态判断 | 缓存策略 | 代码定位 |
 |---|---|---|---|---|---|
 | **Plex** | 无显式认证头（通过 URL 参数？） | — | 无 | 无（有数据缓存，非登录态缓存） | [src/widgets/plex/proxy.js#L35-L62](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/plex/proxy.js#L35-L62) |
 | **xTeVe** | Token（登录获取） | `status` + `token` 业务字段 | 登录失败返回 200 但 `json.status !== true` | **无（每次都重新登录）** | [src/widgets/xteve/proxy.js#L26-L48](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/xteve/proxy.js#L26-L48) |
 | **Tdarr** | `x-api-key` | Header 携带 | 无 | 无 | [src/widgets/tdarr/proxy.js#L27-L29](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/tdarr/proxy.js#L27-L29) |
-| **Minecraft** | 游戏协议（minecraft-server-util） | — | 无认证 | 无 | （无认证概念） |
-| **Gamedig** | 游戏协议（gamedig） | — | 无认证 | 无 | （无认证概念） |
-| **Calendar** | ics 文件 URL | — | 无 — 直接 fetch | 无 | （无认证） |
-| **Paperless-ngx** | `Token` 或 Basic Auth | Header 携带 | 无 | 无（credentialed handler） | [src/utils/proxy/handlers/credentialed.js#L103-L108](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/credentialed.js#L103-L108) |
+| **Minecraft** | 游戏协议（minecraft-server-util） | — | 无认证 | 无 | （无认证概念）[src/widgets/minecraft/proxy.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/minecraft/proxy.js) |
+| **Gamedig** | 游戏协议（gamedig） | — | 无认证 | 无 | （无认证概念）[src/widgets/gamedig/proxy.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/gamedig/proxy.js) |
+| **Calendar** | ics 文件 URL | — | 无 — 直接 fetch | 无 | （无认证）[src/widgets/calendar/proxy.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/calendar/proxy.js) |
+| **Paperless-ngx** | `Token` 或 Basic Auth | Header 携带 | 无 | 无（使用 credentialed 通用 handler，无独立 proxy.js） | [src/utils/proxy/handlers/credentialed.js#L103-L108](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/credentialed.js#L103-L108) |
 
 **xTeVe 每次登录模式**（[src/widgets/xteve/proxy.js#L26-L48](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/xteve/proxy.js#L26-L48)）：
 - 有用户名密码 → 先 POST `cmd: "login"` 登录
@@ -616,8 +622,6 @@ mapping 支持的能力：
 | **synology.js** | Synology 专用，SID 会话 | [src/utils/proxy/handlers/synology.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/synology.js) |
 | **jsonrpc.js** | JSON-RPC 协议代理 | [src/utils/proxy/handlers/jsonrpc.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/jsonrpc.js) |
 | **unifi.js** | UniFi 工厂函数 | [src/utils/proxy/handlers/unifi.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/handlers/unifi.js) |
-| **http.js** | HTTP 底层请求 | [src/utils/proxy/http.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/http.js) |
-| **cookie-jar.js** | Cookie 自动管理 | [src/utils/proxy/cookie-jar.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/cookie-jar.js) |
 
 ### 基础设施
 
@@ -628,10 +632,12 @@ mapping 支持的能力：
 | **api-helpers.js** | URL 格式化，敏感信息脱敏 | [src/utils/proxy/api-helpers.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/api-helpers.js) |
 | **validate-widget-data.js** | 响应数据校验 | [src/utils/proxy/validate-widget-data.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/validate-widget-data.js) |
 | **use-widget-api.js** | 前端 SWR Hook | [src/utils/proxy/use-widget-api.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/use-widget-api.js) |
+| **http.js** | HTTP 底层请求 | [src/utils/proxy/http.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/http.js) |
+| **cookie-jar.js** | Cookie 自动管理 | [src/utils/proxy/cookie-jar.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/utils/proxy/cookie-jar.js) |
 
-### 自定义 Widget Proxy 完整列表（53 个）
+### 自定义 Widget Proxy 完整列表（47 个）
 
-按字母顺序排列：
+按字母顺序排列（统计口径：`src/widgets/*/proxy.js` 实际存在的文件）：
 
 | 类别 | 服务 | GitHub 链接 |
 |---|---|---|
@@ -668,7 +674,6 @@ mapping 支持的能力：
 | 📷 照片 | photoprism | [src/widgets/photoprism/proxy.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/photoprism/proxy.js) |
 | 📊 广告过滤 | pihole | [src/widgets/pihole/proxy.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/pihole/proxy.js) |
 | 🎬 媒体服务器 | plex | [src/widgets/plex/proxy.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/plex/proxy.js) |
-| 🔍 索引器 | prowlarr | （credentialed handler） |
 | 📦 下载 | pyload | [src/widgets/pyload/proxy.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/pyload/proxy.js) |
 | 📂 NAS | qnap | [src/widgets/qnap/proxy.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/qnap/proxy.js) |
 | 📦 下载 | qbittorrent | [src/widgets/qbittorrent/proxy.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/qbittorrent/proxy.js) |
@@ -684,9 +689,44 @@ mapping 支持的能力：
 | 🛡️ 容器监控 | watchtower | [src/widgets/watchtower/proxy.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/watchtower/proxy.js) |
 | 📡 IPTV | xteve | [src/widgets/xteve/proxy.js](https://github.com/gethomepage/homepage/blob/v1.13.1/src/widgets/xteve/proxy.js) |
 
+> **使用通用 handler 但无独立 proxy.js 的服务**（不计入 47 个）：
+> - Prowlarr（credentialed）
+> - Miniflux（credentialed）
+> - Nextcloud（credentialed）
+> - Glances（credentialed）
+> - ESPHome（credentialed）
+> - Paperless-ngx（credentialed）
+> - Proxmox（credentialed）
+> - Speedtest Tracker（credentialed）
+> - Synology（synology 通用 handler）
+
 ---
 
 > **版本说明**：本文档基于 Homepage v1.13.1 源码分析，所有 GitHub 链接均指向 `v1.13.1` tag，确保长期可复核。如需查看最新版本，请将 URL 中的 `v1.13.1` 替换为 `main`。
+>
+> **v6 更新内容（统计口径修正）**：
+> - **数量修正**：自定义 widget proxy 从 53 个修正为 **47 个**（按 `src/widgets/*/proxy.js` 实际存在文件统计）
+> - **分类修正**：通用 handler 列表中移除混入的 http.js、cookie-jar.js（归入基础设施）
+> - **分类修正**：移除重复计算的服务（Kavita 归入漫画，UrBackup 归入 NAS）
+> - **分类修正**：从各分类数量中剔除使用通用 handler 但无独立 proxy.js 的服务（Prowlarr、Miniflux、Nextcloud、Glances、ESPHome、Paperless-ngx、Proxmox、Speedtest Tracker）
+> - **各分类数量核对**：
+>   - 漫画服务：4 → 4 ✓
+>   - 阅读库/电子书：3 → 2 ✓（移除重复的 Kavita）
+>   - RSS/订阅：2 → 1 ✓（Miniflux 无独立 proxy.js）
+>   - 家庭库存：1 → 1 ✓
+>   - 文件管理：2 → 1 ✓（Nextcloud 无独立 proxy.js）
+>   - NAS/存储：7 → 5 ✓（Synology 是通用 handler，移除重复的 OMV）
+>   - 摄像头/NVR/照片：3 → 3 ✓
+>   - 索引器：2 → 1 ✓（Prowlarr 无独立 proxy.js）
+>   - 广告过滤/DNS：2 → 1 ✓（Pi-hole v5/v6 是同一个 proxy.js 的两个版本）
+>   - 下载客户端：7 → 7 ✓
+>   - 智能家居/路由器：6 → 4 ✓（ESPHome 无独立 proxy.js，APC UPS 归入监控）
+>   - 网络控制器/代理管理：4 → 4 ✓
+>   - 资源监控/安全：5 → 2 ✓（Glances、Speedtest 无独立 proxy.js）
+>   - 容器/备份/调度：6 → 4 ✓（Proxmox 无独立 proxy.js，移除重复的 UrBackup）
+>   - 媒体/其他：7 → 6 ✓（Paperless-ngx 无独立 proxy.js）
+> - **新增说明**：明确"使用通用 handler 但无独立 proxy.js 的服务"清单，共 9 个
+> - **新增统计口径说明**：在文档头部和完整列表处明确统计规则
 >
 > **v5 更新内容**：
 > - 新增 RSS/订阅分类（FreshRSS、Miniflux）
@@ -698,4 +738,3 @@ mapping 支持的能力：
 > - 补充每次登录模式的详细说明
 > - 登录态判断方式从 10 种扩展到 11 种
 > - Token 缓存策略从 15 个扩展到 21 个条目
-> - 自定义 widget proxy 从 48 个更新为 53 个
