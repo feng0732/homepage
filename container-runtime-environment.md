@@ -223,8 +223,8 @@ fallback: {
 这个 `false` 不是给 `Index` 组件中的 `useSWR("/api/hash")` 用的（它根本读不到这个 fallback），而是给 `Home` 子树中可能存在的其他 `useSWR("/api/hash")` 调用的。设为 `false` 意味着：如果在 `Home` 子树中有人调用 `useSWR("/api/hash")`，SWR 会把初始数据设为 `false`（falsy），从而**阻止**子树从 SWR 缓存中拿到一个「看起来有效」的旧哈希值，强制子树也必须等待真实请求返回。
 
 总结：
-- `Index` 中的 hash 请求**始终发起真实网络请求**，不是因为 `fallback: false`，而是因为它在 `SWRConfig fallback` 之外。
-- `Home` 中的 services/bookmarks/widgets 请求**首屏使用 fallback 缓存**，不发起网络请求。
+- `Index` 中的 hash/validate 请求**始终发起真实网络请求**，因为它们在 `SWRConfig fallback` 之外，读不到 fallback。
+- `Home` 中的 services/bookmarks/widgets 请求**首屏先用 fallback 数据渲染**，组件挂载后 SWR 还会在后台自动重新请求（`revalidateOnMount` 默认 `true`），实现「即显即更」。
 - `"/api/hash": false` 是一个**防御性配置**，确保 Home 子树内部不会意外使用哈希缓存。
 
 #### 2.3.4 前端：Window Focus 触发的哈希校验与全页刷新
@@ -404,9 +404,22 @@ fallback 中 `"/api/hash": false` 的精确含义和作用经常被误解。
   │        └─ 校验通过 → 渲染 <SWRConfig value={{ fallback }}>
   │             │
   │             └─ Home 组件挂载
-  │                  ├─ useSWR("/api/services")  → 命中 fallback → 初始数据 = services
-  │                  ├─ useSWR("/api/bookmarks") → 命中 fallback → 初始数据 = bookmarks
-  │                  └─ useSWR("/api/widgets")   → 命中 fallback → 初始数据 = widgets
+  │                  ├─ 渲染阶段：立即使用 fallback 数据（不等待网络）
+  │                  │   ├─ useSWR("/api/services")  → data = services (from fallback)
+  │                  │   ├─ useSWR("/api/bookmarks") → data = bookmarks (from fallback)
+  │                  │   └─ useSWR("/api/widgets")   → data = widgets (from fallback)
+  │                  │
+  │                  └─ 挂载后（revalidateOnMount 默认 true）：后台重新请求
+  │                      ├─ 发起 GET /api/services   ③
+  │                      ├─ 发起 GET /api/bookmarks  ④
+  │                      └─ 发起 GET /api/widgets    ⑤
+  │
+  ▼
+请求陆续返回
+  │
+  ├─ ③ services 返回 → 更新缓存 → data 更新 → 组件重渲染（静默刷新）
+  ├─ ④ bookmarks 返回 → 更新缓存 → data 更新 → 组件重渲染（静默刷新）
+  └─ ⑤ widgets 返回 → 更新缓存 → data 更新 → 组件重渲染（静默刷新）
   │
   ▼
 window focus → mutateHash() → /api/hash 返回新值
@@ -435,7 +448,21 @@ window focus → mutateHash() → /api/hash 返回新值
 
 #### 2.3.6 首屏加载时的请求顺序与缓存命中
 
-用户首次访问或刷新页面时，请求的完整时序：
+用户首次访问或刷新页面时，请求的完整时序。关键要区分「首屏渲染用什么数据」和「挂载后是否重新请求」这两个独立的问题。
+
+**SWR 默认策略（项目未显式覆盖，使用 SWR v2 默认值）：**
+
+| 配置项 | 默认值 | 含义 |
+|---|---|---|
+| `revalidateOnMount` | `true` | 组件挂载时，即使缓存中有数据，也会重新请求 |
+| `revalidateOnFocus` | `true` | 窗口获得焦点时重新验证 |
+| `revalidateOnReconnect` | `true` | 网络重连时重新验证 |
+| `dedupingInterval` | `2000` ms | 2 秒内相同 key 的请求自动去重 |
+| `refreshInterval` | `0`（禁用） | 不自动定时刷新 |
+
+项目中两层 `SWRConfig` 都只设置了 `fetcher` 和 `fallback`，没有覆盖上述选项，所以全部使用 SWR v2 默认值。
+
+**首屏完整时序：**
 
 ```
 浏览器请求 GET /
@@ -447,9 +474,13 @@ window focus → mutateHash() → /api/hash 返回新值
   ▼
 浏览器接收 HTML → React Hydration 开始
   │
-  ├─ Index 组件挂载
-  │   ├─ useSWR("/api/validate") → 无 fallback → 发起真实请求 ①
-  │   └─ useSWR("/api/hash")     → 无 fallback → 发起真实请求 ②
+  ├─ 阶段 1：Index 组件挂载
+  │   │
+  │   ├─ useSWR("/api/validate")
+  │   │   └─ 无 fallback（在 SWRConfig 外）→ 发起真实请求 ①
+  │   │
+  │   └─ useSWR("/api/hash")
+  │       └─ 无 fallback（在 SWRConfig 外）→ 发起真实请求 ②
   │
   ├─ validateError 检查
   │   └─ 若 validate 请求返回错误 → 显示红色 Error 页面，不渲染 Home
@@ -457,20 +488,40 @@ window focus → mutateHash() → /api/hash 返回新值
   ├─ errorsData 检查
   │   └─ 若 validate 返回 YAML 语法错误数组 → 显示琥珀色警告页面
   │
-  ├─ 若校验通过 → 渲染 <SWRConfig fallback={...}><Home/></SWRConfig>
+  ├─ 阶段 2：校验通过 → 渲染 <SWRConfig fallback={...}><Home/></SWRConfig>
   │   │
   │   └─ Home 组件挂载
-  │       ├─ useSWR("/api/services")  → 命中 fallback → 不发请求，直接使用缓存
-  │       ├─ useSWR("/api/bookmarks") → 命中 fallback → 不发请求
-  │       └─ useSWR("/api/widgets")   → 命中 fallback → 不发请求
+  │        │
+  │        ├─ 渲染阶段（同步，立即）：
+  │        │   ├─ useSWR("/api/services")  → 命中 fallback → 初始 data = services  ✅ 立即有数据
+  │        │   ├─ useSWR("/api/bookmarks") → 命中 fallback → 初始 data = bookmarks ✅ 立即有数据
+  │        │   └─ useSWR("/api/widgets")   → 命中 fallback → 初始 data = widgets   ✅ 立即有数据
+  │        │
+  │        └─ 挂载后（异步，useEffect 中）：
+  │            ├─ revalidateOnMount = true（默认）→ 发起 GET /api/services   ③
+  │            ├─ revalidateOnMount = true（默认）→ 发起 GET /api/bookmarks  ④
+  │            └─ revalidateOnMount = true（默认）→ 发起 GET /api/widgets    ⑤
   │
-  ├─ hash 请求 ② 返回
-  │   └─ localStorage 为空 → 写入当前 hash → 不触发刷新
+  ├─ 请求陆续返回
+  │   ├─ validate ① 返回 → 更新 errorsData，如有错误切换到错误页面
+  │   ├─ hash ② 返回 → localStorage 写入基准 hash
+  │   ├─ services ③ 返回 → 更新缓存 → 重新渲染（静默刷新）
+  │   ├─ bookmarks ④ 返回 → 更新缓存 → 重新渲染（静默刷新）
+  │   └─ widgets ⑤ 返回 → 更新缓存 → 重新渲染（静默刷新）
   │
-  └─ 页面渲染完成，所有数据就绪
+  └─ 所有请求完成 → 页面数据为最新
 ```
 
-**首屏总共只有 2 个真实网络请求**（`/api/validate` 和 `/api/hash`），services/bookmarks/widgets 的数据通过 SSR fallback 直接注入，无需额外请求。
+**关键结论：**
+
+- **首屏渲染**：services/bookmarks/widgets **立即用 fallback 数据显示**，没有加载状态。
+- **后台刷新**：组件挂载后，SWR 依据 `revalidateOnMount: true` 的默认策略，**在后台静默发起 3 个请求**刷新数据。
+- **首屏总共 5 个真实网络请求**：`/api/validate` ①、`/api/hash` ②、`/api/services` ③、`/api/bookmarks` ④、`/api/widgets` ⑤。
+- 其中 ③④⑤ 是「后台请求」，不影响首屏显示速度，但保证数据最终是最新的。
+
+**为什么要设计成这样？**
+
+fallback 的作用是**消除首屏加载白屏**，让用户一打开页面就能看到内容。而 `revalidateOnMount` 的作用是**保证数据新鲜度**——毕竟 getStaticProps 的数据是构建时（或上次 revalidate 时）生成的，可能已经过时了。两者配合实现「Stale-While-Revalidate」模式：先显示旧数据，后台刷新，有新数据就静默更新。
 
 #### 2.3.7 `/api/revalidate` 接口：Next.js ISR 增量静态再生成
 
@@ -538,9 +589,11 @@ Next.js server 启动
   │     │   （均在 SWRConfig fallback 外层，不读缓存）
   │     │
   │     ├─ 校验通过 → 渲染 SWRConfig(fallback) → Home 挂载
-  │     │   ├─ useSWR("/api/services")  → 命中 fallback，不发请求
-  │     │   ├─ useSWR("/api/bookmarks") → 命中 fallback，不发请求
-  │     │   └─ useSWR("/api/widgets")   → 命中 fallback，不发请求
+  │     │   ├─ 渲染阶段：立即用 fallback 数据显示（无加载状态）
+  │     │   └─ 挂载后（revalidateOnMount 默认 true）：后台发起 3 个请求刷新
+  │     │       ├─ GET /api/services   （静默刷新）
+  │     │       ├─ GET /api/bookmarks  （静默刷新）
+  │     │       └─ GET /api/widgets    （静默刷新）
   │     │
   │     └─ GET /api/hash 返回 → localStorage 写入基准 hash
   │
@@ -928,7 +981,7 @@ NEXT_PUBLIC_* 变量为空 → Version 组件显示 "dev"
 │  index.jsx → Index → Home                                           │
 │  ├─ 首屏渲染: getStaticProps → initialSettings + SWR fallback       │
 │  │   ├─ Index 层（SWRConfig 外层）: hash/validate 始终真实请求       │
-│  │   └─ Home 层（SWRConfig 内层）: services/bookmarks/widgets 命中缓存│
+│  │   └─ Home 层（SWRConfig 内层）: 先用 fallback 渲染 + 后台重请求    │
 │  │                                                                   │
 │  ├─ 配置刷新检测:                                                    │
 │  │   useWindowFocus() → window focus 事件                           │
