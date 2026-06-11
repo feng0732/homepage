@@ -86,7 +86,7 @@ HTTPROUTE_API_VERSION = "v1"
 
 ```
 NetworkingV1Api.listIngressForAllNamespaces()
-  → 成功：response.body.items
+  → 成功：response（客户端库已自动解析 body，资源列表在 response.items）
   → 失败：catch 后返回 null
   → 最终：ingressData?.items ?? []  // 空数组兜底
 ```
@@ -366,7 +366,8 @@ API 路由：`src/pages/api/services/index.js` 直接转发 `servicesResponse()`
      条件：service.app  （注意：不判断 external！）
      └─ 显示条件：showStats || statsOpen
         ├─ showStats：service.showStats === false ? false : settings.showStats
-        │   （全局配置默认展开，或服务单独配置）
+        │   （来自 settings.yaml 全局配置，或 services.yaml 中该服务的单独配置；
+        │    Kubernetes 注解不支持设置 showStats）
         └─ statsOpen：点击状态指示器按钮切换
            （但 external 服务没有指示器按钮，只能靠 showStats 自动展开）
 ```
@@ -381,7 +382,7 @@ API 路由：`src/pages/api/services/index.js` 直接转发 `servicesResponse()`
 | 通过 showStats 默认展开 | 依赖 settings.showStats 或 service.showStats | ✅ 可以 |
 | Kubernetes 组件渲染 | `showStats \|\| statsOpen` | ✅ 若展开则正常显示 |
 
-简言之：`external=true` 的 K8s 服务隐藏了状态指示器按钮，但监控面板组件本身仍在，只是需要通过 `showStats` 配置才能自动展开。
+简言之：`external=true` 的 K8s 服务隐藏了状态指示器按钮，但监控面板组件本身仍在，只能通过 settings.yaml 的全局 `showStats` 或 services.yaml 中该服务的 `showStats` 配置自动展开（K8s 注解无法设置 showStats）。
 
 另外，服务卡片还可能带有 `ping`、`siteMonitor` 等状态标签，以及 `widgets` 数组渲染的各类型 Widget。
 
@@ -563,9 +564,8 @@ src/components/widgets/kubernetes/kubernetes.jsx
 | `gethomepage.dev/ping` | | 启用 ICMP ping 检测 |
 | `gethomepage.dev/siteMonitor` | | 启用 HTTP 站点监控 |
 | `gethomepage.dev/pod-selector` | | 自定义 Pod label selector，覆盖默认 `app.kubernetes.io/name=<app>` |
-| `gethomepage.dev/external` | | `"true"` 时隐藏 K8s 状态指示器按钮（展开面板仍在，需 showStats 自动展开） |
+| `gethomepage.dev/external` | | `"true"` 时隐藏 K8s 状态指示器按钮（监控面板仍可通过 settings.yaml/services.yaml 的 `showStats` 自动展开） |
 | `gethomepage.dev/statusStyle` | | 状态指示器样式：`dot` 或文字 |
-| `gethomepage.dev/showStats` | | 是否默认展开监控面板 |
 | `gethomepage.dev/instance` | | 多实例隔离，匹配 `settings.yaml` 的 `instanceName` |
 | `gethomepage.dev/instance.<name>` | | 多实例隔离的另一种写法 |
 | `gethomepage.dev/widget.<type>.<field>` | | 为服务附加 Widget，如 `widget.type=kubernetes` |
