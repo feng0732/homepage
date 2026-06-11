@@ -987,6 +987,216 @@ if (typeof fields === "string") fields = JSON.parse(service.widget.fields);
 
 3. **Container 的 `JSON.parse` 缺少 try-catch**：[container.jsx#L36](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/components/services/widget/container.jsx#L36) 的裸解析依赖上游 `cleanServiceGroups` 的保护，属于隐式耦合。如果上游防护被绕过（例如直接传入未处理的字符串），会导致组件白屏崩溃。
 
+### 10.9 自动发现场景下的 `fields` 边界行为（Docker 标签 / Kubernetes 注解）
+
+Home Assistant widget 也可以通过 Docker 标签或 Kubernetes 注解自动发现。在这种场景下，标签/注解里的 widget 配置值来源**本质上都是字符串**（Docker API 和 K8s API 返回的标签/注解值都是字符串类型），没有 YAML 的自动类型推断。这带来了一系列与 YAML 场景不同的边界行为。
+
+#### 前置知识：自动发现的字段值都是字符串
+
+**Docker 标签** 的处理逻辑在 [service-helpers.js#L93-L121](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/utils/config/service-helpers.js#L93-L121)：
+
+```javascript
+// service-helpers.js servicesFromDocker 中
+container.Labels[label];  // ← Docker API 返回的都是字符串
+// ...
+shvl.set(constructedService, value, substitutedVal);
+//                              ↑ 直接赋值，不做 JSON.parse
+```
+
+**Kubernetes 注解** 的处理逻辑在 [resource-helpers.js#L119-L127](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/utils/kubernetes/resource-helpers.js#L119-L127)：
+
+```javascript
+// resource-helpers.js constructedServiceFromResource 中
+Object.keys(resource.metadata.annotations).forEach((annotation) => {
+  if (annotation.startsWith(ANNOTATION_WIDGET_BASE)) {
+    shvl.set(
+      constructedService,
+      annotation.replace(`${ANNOTATION_BASE}/`, ""),
+      resource.metadata.annotations[annotation],  // ← K8s API 返回的都是字符串
+    );
+  }
+});
+// 第 130 行 JSON.parse(JSON.stringify(...)) 仅用于环境变量替换，不改变类型
+```
+
+**`shvl.set`** 的实现在 [shvl.js#L38-L64](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/utils/config/shvl.js#L38-L64)，它直接赋值不做类型转换：
+
+```javascript
+// shvl.js 第 61 行
+keys.reduce(... , obj)[lastKey] = val;  // ← 直接赋值，val 是原始字符串
+```
+
+**结论**：自动发现场景下，`widget.fields` / `widget.custom` 这类从标签或注解进入的 widget 配置值都是字符串；除非后续清洗流程显式 `JSON.parse`，否则没有 YAML 的自动数组/对象解析。
+
+#### 自动发现配置的写法
+
+**Docker 标签写法**：
+```bash
+docker run -d \
+  --label homepage.group=Home \
+  --label homepage.name=HomeAssistant \
+  --label homepage.widget.type=homeassistant \
+  --label homepage.widget.url=http://hassio:8123 \
+  --label homepage.widget.key=xxxxx \
+  --label homepage.widget.fields='["people_home"]' \
+  --label homepage.widget.custom='[{"state":"sensor.temp","label":"Temp"}]' \
+  homeassistant
+```
+
+**Kubernetes 注解写法**（Ingress 资源）：
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: homeassistant
+  annotations:
+    gethomepage.dev/enabled: "true"
+    gethomepage.dev/name: "HomeAssistant"
+    gethomepage.dev/group: "Home"
+    gethomepage.dev/widget.type: "homeassistant"
+    gethomepage.dev/widget.url: "http://hassio:8123"
+    gethomepage.dev/widget.key: "xxxxx"
+    gethomepage.dev/widget.fields: '["people_home"]'
+    gethomepage.dev/widget.custom: '[{"state":"sensor.temp","label":"Temp"}]'
+```
+
+关键：**单引号内的内容就是字符串值**。K8s/Docker 不会解析里面的 JSON。
+
+#### 关键差异：`getServiceWidget` 对自动发现服务返回的是原始字符串
+
+`getServiceWidget` 的查找路径 [service-helpers.js#L727-L761](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/utils/config/service-helpers.js#L727-L761)：
+
+```
+getServiceWidget(group, service, index)
+  → getServiceItem(group, service)
+     ├─ 先查 servicesFromConfig() → YAML 解析，可能有数组
+     ├─ 再查 servicesFromDocker() → 直接使用原始结果，**不经过 cleanServiceGroups**
+     └─ 再查 servicesFromKubernetes() → 直接使用原始结果，**不经过 cleanServiceGroups**
+```
+
+**这意味着**：对于自动发现的服务，`getServiceWidget` 返回的 `widget.fields` 永远是字符串，不会被解析为数组。这与 YAML 场景形成了显著差异。
+
+而前端 API 的 `/api/services` 响应中，自动发现的服务是经过 `cleanServiceGroups` 处理的（[api-response.js#L165-L176](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/utils/config/api-response.js#L165-L176)），`fields` 会被尝试 JSON 解析。
+
+#### 逐场景行为分析（自动发现专属）
+
+##### 场景 A1：`fields: "[]"`（空数组字符串）
+
+Docker/K8s 中配置：
+```
+homepage.widget.fields="[]"
+# 或 K8s 注解: gethomepage.dev/widget.fields: "[]"
+```
+
+| 环节 | `fields` 的值 | 行为 |
+|------|--------------|------|
+| 服务端 `getServiceWidget`（自动发现返回原始值） | `"[]"`（字符串） | `!"[]"` = `false`（非空字符串是 truthy）→ **custom 被阻断**，使用默认查询 |
+| `cleanServiceGroups` 处理 | `typeof fields === "string"` → `JSON.parse("[]")` → **成功** → `fieldsList = []` → `[] \|\| null` = `[]` | 前端 widget.fields = `[]` |
+| Container 二次解析 | 已解析为数组 → 跳过 JSON.parse | `fields = []` |
+| Container 过滤判断 | `if (fields && type)` → `[] && "homeassistant"` = truthy | 进入过滤 |
+| Container 过滤执行 | `fields.some(...)` = `false` | **所有 Block 被过滤掉，卡片空白** |
+
+**结果**：与 YAML 中 `fields: []`（空数组）行为完全一致——服务端阻断 custom，前端过滤全部 Block，卡片静默空白。
+
+##### 场景 A2：`fields: ""`（空字符串）
+
+Docker/K8s 中配置：
+```
+homepage.widget.fields=""
+```
+
+| 环节 | `fields` 的值 | 行为 |
+|------|--------------|------|
+| 服务端 `getServiceWidget` | `""`（空字符串） | `!""` = `true`（falsy）→ custom 可生效 |
+| `cleanServiceGroups` 处理 | `typeof fields === "string"` → `JSON.parse("")` → **抛出 SyntaxError** → catch → `fieldsList = null` | 前端 widget.fields = `null` |
+| Container 二次解析 | `null` → 跳过 JSON.parse | `fields = null` |
+| Container 过滤判断 | `if (fields && type)` → `null && "homeassistant"` = `false` | 不过滤 |
+
+**结果**：与 YAML 中 `fields: ""` 行为完全一致。
+
+##### 场景 A3：`fields: '["people_home","lights_on"]'`（合法数组字符串）
+
+Docker/K8s 中配置：
+```
+homepage.widget.fields='["people_home","lights_on"]'
+```
+
+> 注意：这是最常用的配置方式。外层单引号是 Docker/K8s 的值边界，内层内容就是字符串 `"[\"people_home\",\"lights_on\"]"`。
+
+| 环节 | `fields` 的值 | 行为 |
+|------|--------------|------|
+| 服务端 `getServiceWidget` | `'["people_home","lights_on"]'`（字符串） | `!string` = `false`（非空字符串 truthy）→ **custom 被阻断**，使用默认查询 |
+| `cleanServiceGroups` 处理 | `typeof fields === "string"` → `JSON.parse(...)` → **成功** → `fieldsList = ["people_home","lights_on"]` | 前端 widget.fields = `["people_home","lights_on"]` |
+| Container 二次解析 | 已解析为数组 → 跳过 JSON.parse | `fields = ["people_home","lights_on"]` |
+| Container 过滤判断 | truthy | 进入过滤 |
+| Container 过滤执行 | 匹配 `homeassistant.people_home` 和 `homeassistant.lights_on` | 只显示匹配的 2 个 Block |
+
+**结果**：行为正确，与 YAML 中 `fields: '["people_home","lights_on"]'`（JSON 字符串写法）一致。
+
+##### 场景 A4：`fields: "people_home,lights_on"`（非法 JSON 字符串）
+
+Docker/K8s 中配置：
+```
+homepage.widget.fields="people_home,lights_on"
+```
+
+| 环节 | `fields` 的值 | 行为 |
+|------|--------------|------|
+| 服务端 `getServiceWidget` | `"people_home,lights_on"`（字符串） | `!string` = `false`（非空字符串 truthy）→ **custom 被阻断**，使用默认查询 |
+| `cleanServiceGroups` 处理 | `JSON.parse("people_home,lights_on")` → **抛出 SyntaxError** → catch → `fieldsList = null` | 前端 widget.fields = `null`（有 try-catch 保护） |
+| Container 二次解析 | `null` → 跳过 JSON.parse | `fields = null` |
+| Container 过滤判断 | `false` | 不过滤 |
+
+**结果**：与 YAML 中 `fields: "invalid"` 行为一致。服务端用默认查询，前端不过滤。
+
+#### 自动发现 vs YAML 对比表
+
+| 配置值 | YAML 场景（可能自动解析为数组） | Docker/K8s 自动发现（永远是字符串） |
+|--------|:---:|:---:|
+| 不配 fields | `widget.fields = undefined` → custom 可生效 | `widget.fields = undefined` → custom 可生效 |
+| `fields: []` | 原始数组 → `![] = false` → custom 被阻断 | 无法表示（标签/注解都是字符串） |
+| `fields: "[]"` | 字符串 `"[]"` → `!"[]" = false` → custom 被阻断 | 字符串 `"[]"` → `!"[]" = false` → custom 被阻断 |
+| `fields: ""` | 空字符串 → `!"" = true` → custom 可生效 | 空字符串 → `!"" = true` → custom 可生效 |
+| `fields: '["a","b"]'` | 字符串 → `!"..." = false` → custom 被阻断 | 字符串 → `!"..." = false` → custom 被阻断 |
+| `fields: ["a","b"]` | 原始数组 → `![] = false` → custom 被阻断 | 无法表示（标签/注解都是字符串） |
+| `fields: "invalid"` | 字符串 → `!"invalid" = false` → custom 被阻断 | 字符串 → `!"invalid" = false` → custom 被阻断 |
+
+**关键发现**：在自动发现场景下，**所有非空 `fields` 值都会阻断 custom**，因为它们都是字符串，而 `!"non-empty string"` 永远是 `false`。只有 `fields: ""`（空字符串）和不配置 fields 这两种情况允许 custom 生效。
+
+这与 YAML 场景有一个微妙区别：YAML 中 `fields: []`（空数组）也会阻断 custom，而自动发现中无法表示真正的空数组（只能用 `"[]"` 字符串，效果相同）。其他场景行为一致。
+
+#### `custom` 在自动发现场景下的解析
+
+`custom` 字段在自动发现中同样是字符串，但只有在 `!widget.fields` 为 `true` 时才会被服务端 `proxy.js` 尝试 JSON 解析（[proxy.js#L80-L87](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/widgets/homeassistant/proxy.js#L80-L87)）：
+
+```javascript
+// proxy.js 第 80-87 行
+if (typeof widget.custom === "string") {
+  try {
+    widget.custom = JSON.parse(widget.custom);
+  } catch (error) {
+    logger.debug("Error parsing HASS widget custom label: %s", JSON.stringify(error));
+    return res.status(400).json({ error: "Error parsing widget custom label" });
+  }
+}
+```
+
+**自动发现中 custom 的边界行为**：
+
+| custom 配置值 | 前提（`!widget.fields`） | 行为 |
+|--------------|:---:|------|
+| 不配 custom | true/false | 使用默认查询 |
+| `custom: '[{"state":"..."}]'` | true | JSON.parse 成功 → 自定义查询生效 |
+| `custom: '[{"state":"..."}]'` | false（如 fields 非空） | custom 被完全忽略，使用默认查询 |
+| `custom: "invalid json"` | true | JSON.parse 失败 → 返回 400 错误 → 前端显示 Error 组件 |
+| `custom: "invalid json"` | false | 不进入 custom 分支，无错误，使用默认查询 |
+
+#### 自动发现场景下 Container 二次 JSON.parse 的风险
+
+在自动发现场景下，`cleanServiceGroups` 对 `fields` 做了 try-catch 保护，把无效 JSON 归一化为 `null`。但如果由于某种原因（例如缓存不一致、或 `cleanServiceGroups` 被绕过），前端 Container 收到的 `widget.fields` 仍然是原始字符串，则 [container.jsx#L36](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/components/services/widget/container.jsx#L36) 的裸 `JSON.parse` 会导致组件崩溃白屏。
+
+**自动发现下这个风险尤为突出**，因为所有配置本质上都是字符串，用户很容易写错 JSON 格式（如漏掉引号、括号不匹配等）。如果 `cleanServiceGroups` 的 try-catch 由于某些原因未能正确归一化，用户会看到白屏而不是友好的错误提示。
+
 ---
 
 ## 十一、错误与空值的传递路径
