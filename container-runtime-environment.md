@@ -321,14 +321,117 @@ window focus 事件
   │                                                   新页面包含新的 getStaticProps 结果
 ```
 
-**关键细节：`setStale(true)` 会卸载整个 `Home` 组件树。**
+**关键细节：`setStale(true)` 会卸载整个 `Home` 组件树，但不会清空 SWR 缓存。**
 
 当 `stale` 为 true 时，[index.jsx 第 151-157 行](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/index.jsx#L151-L157) 返回旋转加载动画，**不再渲染** `<SWRConfig><Home/></SWRConfig>`。这意味着：
-- Home 及其所有子组件（ServicesGroup、BookmarksGroup、Widget 等）全部卸载。
-- 这些组件持有的 SWR 缓存数据（services、bookmarks、widgets）也被丢弃。
-- `window.location.reload()` 后，新页面重新从 `getStaticProps` 获取数据，SWR fallback 全部更新为最新值。
+- Home 及其所有子组件（ServicesGroup、BookmarksGroup、Widget 等）全部**卸载**（React 组件树中移除）。
+- 但 **SWR 全局缓存不会被清空**。SWR 的缓存储存在全局 cache 中，`SWRConfig` 组件的卸载**不会**触发缓存清除。`/api/services`、`/api/bookmarks`、`/api/widgets` 等数据仍然保留在内存缓存中。
+- 然而，这些缓存只是暂时不可见，等待 `window.location.reload()` 后整个页面重新加载时，所有 JS 状态（包括 SWR 缓存）都会被彻底重置。
 
-这个「先卸载再硬刷新」的设计保证了配置变更后，**不会出现旧数据和新配置混合渲染的中间状态**。
+这个「先卸载再硬刷新」的设计保证了配置变更后，**不会出现旧数据和新配置混合渲染的中间状态**。同时也避免了在 revalidate 与 stale 数据共存的闪烁问题。
+
+#### 2.3.5.1 四个环节的精确区分：页面隐藏、ISR 再生成、浏览器刷新、缓存清空
+
+配置刷新流程中涉及四个容易混淆的环节，它们分别发生在不同层面，效果各异：
+
+| 环节 | 发生位置 | 触发方式 | 实际效果 | 缓存是否被清空 |
+|---|---|---|---|---|
+| 页面内容隐藏 | 客户端 React | `setStale(true)` | Home 组件树卸载，显示旋转动画 | ❌ SWR 缓存保留，仅 UI 隐藏 |
+| 静态页面重新生成 | 服务端 Next.js | `fetch("/api/revalidate")` → `res.revalidate("/")` | 服务端重新执行 `getStaticProps()`，生成新的静态 HTML 和 JSON | ❌ 与客户端缓存无关 |
+| 浏览器刷新 | 浏览器 | `window.location.reload()` | 整页重载，所有 JS 运行时重建 | ✅ 所有 JS 状态（含 SWR 缓存）全部销毁重建 |
+| 缓存显式清空 | — | 无 | — | ❌ 代码中没有显式调用 cache.clear() |
+
+**逐环节详解：**
+
+**① 页面内容隐藏（`setStale(true)`）**
+- 属于客户端行为。
+- React 组件层面上，`SWRConfig` 和 `Home` 从 DOM 中移除，但 SWR 的全局缓存仍然存在于内存中。
+- 如果 `stale` 状态被撤销（实际流程中紧接着就是 reload，不会发生），组件重新挂载时会立即显示之前缓存的数据。
+- 目的：在 revalidate 过程中不让用户看到新旧混合的数据，避免视觉闪烁。
+
+**② 静态页面重新生成（`res.revalidate("/")`）**
+- 纯服务端行为。
+- Next.js ISR 机制重新运行 `getStaticProps()`，读取最新的配置文件，生成新的静态 HTML 和 JSON 数据。
+- 与客户端浏览器状态完全无关，客户端只是发起一个 fetch 请求触发它。
+- revalidate 完成后，**服务端的静态缓存会被替换为新内容**。
+- 客户端如果不刷新页面，看到的仍然是旧的客户端渲染结果。
+
+**③ 浏览器刷新（`window.location.reload()`）**
+- 浏览器行为，销毁当前 document，重新请求 HTML 页面。
+- 所有 React 组件状态、SWR 缓存、localStorage 之外的所有 JS 内存状态全部被销毁。
+- 新页面加载后，SWR 重新从 `fallback` 初始化。
+- 这是确保页面数据全新的最终手段。
+
+**④ 缓存显式清空**
+- 代码中**没有**任何地方显式调用 SWR 的 `cache.clear()` 或 `mutate(key, undefined)` 来主动清空缓存。
+- 缓存的清空完全依赖 `window.location.reload()` 的副作用。
+
+#### 2.3.5.2 `"/api/hash": false` 的实际影响
+
+fallback 中 `"/api/hash": false` 的精确含义和作用经常被误解。
+
+**SWR fallback 的工作原理：**
+- `fallback` 是 `SWRConfig` 提供给其子组件中 `useSWR` 的**初始数据**。
+- 当子组件中调用 `useSWR(key)` 时，如果 SWR 缓存中没有该 key 的数据，就使用 `fallback[key]` 作为初始值。
+- `fallback` 只在 `useSWR` 首次渲染时生效，不会改变全局缓存状态。
+- Index 组件在 `SWRConfig` **外部**，所以它的 `useSWR("/api/hash")` 完全不受 fallback 影响。
+
+**`"/api/hash": false` 的精确作用：**
+
+1. **对 Index 组件的 `useSWR("/api/hash")`**：**没有任何影响**。因为 Index 在 SWRConfig 外面，读不到这个 fallback。
+
+2. **对 Home 子树内的潜在 hash 请求**：如果 Home 子树中有人调用 `useSWR("/api/hash")`，初始数据会是 `false`（falsy 值），而不是 `undefined`。这是一个**防御性配置**，确保子树不会因为拿不到数据而显示异常。
+
+3. **语义上的作用**：明确地在配置中标注「hash 数据不使用 fallback，必须从网络请求获取」。
+
+4. **测试断言**：测试用例（[index.test.jsx 第 195 行](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/__tests__/pages/index.test.jsx#L195)）中 `expect(result.props.fallback["/api/hash"]).toBe(false)` 验证了这个设计意图。
+
+**实际效果**：Home 子树内**没有任何组件调用** `useSWR("/api/hash")`，所以这个 fallback 条目在运行时实际效果有限，更多是**设计意图的声明**和**防御性编程**。
+
+#### 2.3.5.3 SWR 缓存的完整生命周期
+
+结合两层 SWRConfig 的嵌套关系，SWR 缓存的生命周期如下：
+
+```
+页面加载
+  │
+  ├─ _app.jsx <SWRConfig value={{ fetcher }}>    ← 外层：注册全局 fetcher
+  │   │
+  │   └─ Index 组件挂载
+  │        ├─ useSWR("/api/validate") → 无 fallback → 发起请求 ①
+  │        ├─ useSWR("/api/hash")     → 无 fallback → 发起请求 ②
+  │        │
+  │        └─ 校验通过 → 渲染 <SWRConfig value={{ fallback }}>
+  │             │
+  │             └─ Home 组件挂载
+  │                  ├─ useSWR("/api/services")  → 命中 fallback → 初始数据 = services
+  │                  ├─ useSWR("/api/bookmarks") → 命中 fallback → 初始数据 = bookmarks
+  │                  └─ useSWR("/api/widgets")   → 命中 fallback → 初始数据 = widgets
+  │
+  ▼
+window focus → mutateHash() → /api/hash 返回新值
+  │
+  ├─ hashData 变化 → 与 localStorage 对比 → 不一致
+  │
+  ├─ setStale(true)
+  │   │
+  │   └─ <SWRConfig><Home/></SWRConfig> 从 DOM 卸载
+  │        │
+  │        └─ ⚠️ 注意：SWR 全局缓存中的数据仍在内存中，不会被清空
+  │
+  ├─ fetch("/api/revalidate")
+  │   └─ 服务端 ISR 重新生成静态页面
+  │
+  └─ window.location.reload()
+       │
+       └─ 浏览器卸载整个 document
+            └─ 所有 JS 内存状态全部销毁（包括 SWR 缓存、React state、事件监听器等）
+```
+
+**核心结论：**
+- SWR 缓存的生命周期 = 页面的生命周期。
+- SWRConfig 的挂载/卸载不会清空缓存。
+- 只有 `window.location.reload()` 或用户手动刷新页面，SWR 缓存才会被彻底重置。
 
 #### 2.3.6 首屏加载时的请求顺序与缓存命中
 
