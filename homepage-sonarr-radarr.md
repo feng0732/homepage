@@ -1093,47 +1093,58 @@ title={moviesData.all.find((entry) => entry.id === queueEntry.movieId)?.title ??
 
 ## 十二、日历集成的服务定位机制
 
-日历集成是 Homepage 中最复杂的服务定位场景：日历 Widget 本身是一个独立服务，但它的集成项需要引用 **其他已配置的服务**（如 Sonarr、Radarr）来获取日历数据。本节深入分析这一"服务中引用服务"的定位链路。
+日历集成是 Homepage 中最复杂的服务定位场景：日历 Widget 本身是一个独立服务，但它的集成项需要引用 **其他已配置的服务**（如 Sonarr、Radarr）来获取日历数据。本节深入分析这一"服务中引用服务"的定位链路，包括配置清洗的边界、序号（index）的传递方式、以及 type 在前端动态组件和服务端的不同作用。
 
 ### 12.1 两种集成模式
 
-日历 Widget 的 integrations 支持两种完全不同的模式：
+日历 Widget 的 integrations 支持两种完全不同的模式，它们的服务定位逻辑截然不同：
 
 | 模式 | 典型类型 | 数据来源 | 代理方式 |
 |------|----------|----------|----------|
 | **服务引用模式** | `sonarr`, `radarr`, `lidarr`, `readarr` | 引用 Homepage 中已配置的其他 Widget 服务 | 走通用代理 `genericProxyHandler` |
-| **直接 URL 模式** | `ical` | 集成项自带 URL | 走日历专属代理 `calendarProxyHandler` |
+| **直接 URL 模式** | `ical` | 集成项自身携带 URL 配置 | 走日历专属代理 `calendarProxyHandler` |
 
 Sonarr / Radarr 属于 **服务引用模式**，这是本节分析的重点。
 
-### 12.2 集成项的配置结构
+### 12.2 配置清洗的两层边界
 
-#### 12.2.1 YAML 配置示例
+理解服务定位的前提是区分**两套配置数据**：一套给前端用（经过清洗），一套给服务端内部用（原始完整）。
 
-```yaml
-- 媒体中心:
-    - 日历面板:
-        widget:
-          type: calendar
-          integrations:
-            - type: sonarr          # 集成类型，决定使用哪个 Widget 的 mappings
-              service_group: 媒体管理 # 被引用服务所在的分组
-              service_name: Sonarr    # 被引用服务的名称
-              color: teal             # 可选：事件颜色
-              baseUrl: https://sonarr.example.com  # 可选：跳转链接前缀
-              params:                 # 可选：额外请求参数
-                unmonitored: true
-            - type: radarr
-              service_group: 媒体管理
-              service_name: Radarr
-              color: amber
+#### 12.2.1 两套配置数据的来源
+
+| 配置集 | 生成函数 | 使用方 | 包含敏感信息 |
+|--------|----------|--------|-------------|
+| 原始配置 | `servicesFromConfig()` / `servicesFromDocker()` / `servicesFromKubernetes()` | 服务端 `getServiceWidget()` | 是（含 url、key、password 等） |
+| 清洗后配置 | `cleanServiceGroups()` | 前端 React 组件 | 否（白名单过滤） |
+
+两者是**独立生成**的：服务端代理调用 `getServiceWidget()` 时，直接读 YAML 原始配置，不走 `cleanServiceGroups()`。这意味着：
+- 传给前端的 integration 没有 `url`
+- 但服务端 `getServiceWidget()` 返回的 integration **仍然有** `url`（iCal 模式需要用）
+
+#### 12.2.2 前端配置的白名单清洗
+
+传给前端的 widget 数据经过 [service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/utils/config/service-helpers.js#L253-L439) L253-L439 的白名单解构：
+
+```javascript
+const {
+  // all widgets
+  fields, hideErrors, highlight, type,
+
+  // calendar
+  firstDayInWeek, integrations, maxEvents, showTime, previousDays, view, timezone,
+
+  // sonarr, radarr
+  enableQueue,
+
+  // ... 其他 widget 类型的字段
+} = widgetData;
 ```
 
-> 从文档 [calendar.md](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/docs/widgets/services/calendar.md) 可以看到，`service_group` 和 `service_name` 是必填的，用于定位到具体的服务 Widget。
+只有在这个解构列表中的字段才会被保留，传给前端。`integrations` 作为 calendar 类型的字段，**整体被保留**。
 
-#### 12.2.2 配置清洗阶段的处理
+#### 12.2.3 integration 的二次处理：仅删除真实地址
 
-[service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/utils/config/service-helpers.js#L622-L642) L622-L642：
+在白名单保留的基础上，calendar 的 integrations 会经历 [二次处理](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/utils/config/service-helpers.js#L622-L642) L622-L642：
 
 ```javascript
 if (type === "calendar") {
@@ -1143,24 +1154,39 @@ if (type === "calendar") {
         if (!integration || typeof integration !== "object") {
           return integration;
         }
-        const { url, ...integrationWithoutUrl } = integration;   // ← 主动删除 url 字段
+        const { url, ...integrationWithoutUrl } = integration;   // 只删除 url
         return integrationWithoutUrl;
       });
     }
   }
-  // ... 其他 calendar 字段
+  // 日历自有字段：有值才设置
+  if (firstDayInWeek) widget.firstDayInWeek = firstDayInWeek;
+  if (view) widget.view = view;
+  if (maxEvents) widget.maxEvents = maxEvents;
+  // ... showTime, previousDays, timezone 等同理
 }
 ```
 
-**关键点**：
-- `integrations` 数组整体被白名单放行，传给前端
-- 但每个 integration 的 **`url` 字段被主动删除**（安全考虑，避免暴露真实地址）
-- `service_group`、`service_name`、`type`、`color`、`params` 等字段原样保留
-- **注意**：`index` 字段不在 integration 中，而是使用日历 Widget 自己的 `index`（这是一个设计假设）
+**关键事实：integration 只删除 `url` 字段，其他所有字段原样保留。**
 
-### 12.3 前端集成组件的配置合并
+保留的字段包括（但不限于）：
+- `type`：集成类型（sonarr / radarr / ical 等）
+- `service_group`：被引用服务所在组
+- `service_name`：被引用服务名称
+- `name`：集成的显示名称（iCal 模式必填）
+- `color`：事件颜色
+- `baseUrl`：跳转链接前缀
+- `params`：额外请求参数
+- `index`：**如果配置了的话**（见 12.4 节讨论）
 
-[calendar/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/component.jsx#L70-L86) L70-L86：
+> 为什么只删 `url`？因为：
+> - 服务引用模式（sonarr/radarr）的 URL 来自被引用服务的配置，integration 中本来就没有 url
+> - iCal 模式的 url 是敏感信息（可能包含 token），不应暴露给前端
+> - 其他字段（service_group、service_name、color 等）都是非敏感的展示或定位参数
+
+### 12.3 前端配置合并：日历字段保留与集成字段覆盖
+
+[calendar/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/component.jsx#L70-L86) L70-L86 的合并逻辑：
 
 ```javascript
 const integrations = useMemo(
@@ -1169,100 +1195,139 @@ const integrations = useMemo(
       ?.filter((integration) => integration?.type)
       .map((integration) => ({
         service: dynamic(() => import(`./integrations/${integration.type}.jsx`)),
-        widget: { ...widget, ...integration },   // ← 关键合并逻辑
+        widget: { ...widget, ...integration },   // 展开日历 widget，再展开 integration 覆盖
       })) ?? [],
   [widget],
 );
 ```
 
-#### 12.3.1 合并顺序与覆盖关系
+#### 12.3.1 合并的三个分区
 
-`{ ...widget, ...integration }` 是 **后写覆盖前写**，即 integration 中的字段会覆盖日历 widget 的同名字段。
+`{ ...日历widget, ...integration }` 的合并结果可以分为三类：
 
-合并前后的字段对比：
+| 分区 | 字段示例 | 来源 | 合并后行为 |
+|------|----------|------|------------|
+| **日历独有字段** | `firstDayInWeek`, `maxEvents`, `view`, `showTime`, `previousDays`, `timezone`, `integrations` | 日历 widget | 保留（integration 通常不设置这些） |
+| **通用重叠字段** | `type`, `service_group`, `service_name`, `index`, `hide_errors`, `fields` | 两者都有 | integration 覆盖日历 widget（定位切换的核心） |
+| **集成独有字段** | `color`, `baseUrl`, `params`, `name` | integration | 新增（日历 widget 没有这些） |
 
-| 字段 | 日历 widget (被覆盖的) | integration (覆盖源) | 合并后结果 |
+#### 12.3.2 合并前后的完整字段对比
+
+以 Sonarr 集成为例：
+
+| 字段 | 日历 widget (合并前) | integration (合并前) | 合并后结果 |
 |------|---------------------|---------------------|------------|
-| `type` | `"calendar"` | `"sonarr"` | `"sonarr"` |
-| `service_group` | 日历所在组（如 `"媒体中心"`） | 被引用服务组（如 `"媒体管理"`） | `"媒体管理"` |
-| `service_name` | 日历服务名（如 `"日历面板"`） | 被引用服务名（如 `"Sonarr"`） | `"Sonarr"` |
-| `index` | 日历 widget 的 index（如 `0`） | 未设置 | `0`（沿用日历的）|
-| `hide_errors` | 日历的设置 | 通常未设置 | 沿用日历的 |
-| `fields` | 日历的设置 | 通常未设置 | 沿用日历的 |
-| `color` | 无 | `"teal"` | `"teal"` |
-| `baseUrl` | 无 | `"https://sonarr.example.com"` | `"https://sonarr.example.com"` |
-| `params` | 无 | `{ unmonitored: true }` | `{ unmonitored: true }` |
+| **type** | `"calendar"` | `"sonarr"` | `"sonarr"` ← 被覆盖 |
+| **service_group** | 日历所在组（如 `"媒体中心"`） | 被引用服务组（如 `"媒体管理"`） | `"媒体管理"` ← 被覆盖 |
+| **service_name** | 日历服务名（如 `"日历面板"`） | 被引用服务名（如 `"Sonarr"`） | `"Sonarr"` ← 被覆盖 |
+| **index** | `0`（日历 widget 自身序号） | 通常未设置 | `0` ← 沿用日历的 |
+| **hide_errors** | `false`（日历的设置） | 通常未设置 | `false` ← 沿用日历的 |
+| **fields** | `null` | 通常未设置 | `null` ← 沿用日历的 |
+| **firstDayInWeek** | `"monday"` | 未设置 | `"monday"` ← 保留 |
+| **view** | `"monthly"` | 未设置 | `"monthly"` ← 保留 |
+| **maxEvents** | `10` | 未设置 | `10` ← 保留 |
+| **timezone** | `"Asia/Shanghai"` | 未设置 | `"Asia/Shanghai"` ← 保留 |
+| **integrations** | 数组（所有集成） | 未设置 | 数组 ← 保留 |
+| **color** | 无 | `"teal"` | `"teal"` ← 新增 |
+| **baseUrl** | 无 | `"https://sonarr.example.com"` | `"https://sonarr.example.com"` ← 新增 |
+| **params** | 无 | `{ unmonitored: true }` | `{ unmonitored: true }` ← 新增 |
 
-> **重要**：合并后 `type` 从 `"calendar"` 变成 `"sonarr"`，这是后续所有服务定位的基础。`service_group` 和 `service_name` 也从日历自身的值切换为被引用服务的值。
+> **注意**：日历面板的字段（firstDayInWeek、view、maxEvents 等）在合并后**仍然保留**在集成组件的 `config` 对象中。虽然 Sonarr/Radarr 集成组件通常不会使用这些字段，但它们是可用的。
 
-#### 12.3.2 组件 key 的构造
+### 12.4 序号（index）的边界：能否指定目标 widget？
 
-[calendar/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/component.jsx#L94) L94：
+#### 12.4.1 技术上：可以，但未文档化
 
+integration 的字段除了 `url` 都保留，所以**如果用户在 YAML 中给 integration 加上 `index` 字段，它会被保留并最终覆盖日历 widget 的 index**。
+
+示例：
+```yaml
+widget:
+  type: calendar
+  integrations:
+    - type: sonarr
+      service_group: 媒体管理
+      service_name: Sonarr
+      index: 1   # 引用 Sonarr 服务的第 2 个 widget（未文档化的用法）
+```
+
+合并后 `widget.index = 1`，然后 `formatProxyUrl` 会把 `index=1` 传给代理接口，服务端 `getServiceWidget(group, service, index)` 就能找到对应序号的 widget。
+
+#### 12.4.2 实践中：默认用日历自身的 index
+
+绝大多数场景下，integration 不配置 `index`，所以：
+- 合并后 index 沿用日历 widget 自己的 index（通常是 0）
+- 这隐含了一个假设：**被引用服务的 widget 序号和日历服务的 widget 序号相同**
+
+对于只有一个 widget 的服务（绝大多数情况），这个假设成立。但如果被引用服务有多个 widget，而日历服务只有一个，想引用被引用服务的第 2 个 widget，就需要显式在 integration 中设置 `index`。
+
+#### 12.4.3 设计意图：简化配置
+
+这是有意的设计简化——服务引用模式下，用户只需要配置 `service_group` 和 `service_name`，就能定位到目标服务。`index` 作为高级参数，不暴露在文档中，避免增加配置复杂度。
+
+### 12.5 type 的双重作用：前端动态加载 vs 服务端类型读取
+
+`type` 字段在前端和服务端扮演完全不同的角色，且**服务端不依赖前端传来的 type**。
+
+#### 12.5.1 前端：type 用于动态组件加载
+
+两处使用 `integration.type`：
+
+**① 决定加载哪个集成组件** ([calendar/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/component.jsx#L76-L81) L76-L81)：
 ```javascript
-const key = `integration-${integration.widget.type}-${integration.widget.service_name}-${integration.widget.service_group}-${integration.widget.name}`;
+service: dynamic(() => import(`./integrations/${integration.type}.jsx`))
+// type = "sonarr" → 加载 ./integrations/sonarr.jsx
+// type = "radarr" → 加载 ./integrations/radarr.jsx
+// type = "ical"   → 加载 ./integrations/ical.jsx
 ```
 
-Key 由 4 部分组成：`type` + `service_name` + `service_group` + `name`，确保 React 能正确识别不同的集成实例。
-
-### 12.4 前端代理请求的服务定位
-
-日历集成组件（如 Sonarr 集成）调用 `useWidgetAPI` 时，使用的 `config` 就是上面合并后的 widget 对象。
-
-#### 12.4.1 请求 URL 构造
-
-[api-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/utils/proxy/api-helpers.js#L31-L49) L31-L49：
-
+**② 错误提示中显示服务类型**（如 [sonarr.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/sonarr.jsx#L40) L40）：
 ```javascript
-export function getURLSearchParams(widget, endpoint) {
-  const params = new URLSearchParams({
-    group: widget.service_group,   // ← 被引用服务的 group（如 "媒体管理"）
-    service: widget.service_name,   // ← 被引用服务的 name（如 "Sonarr"）
-    index: widget.index,            // ← 沿用日历 widget 的 index（通常是 0）
-  });
-  if (endpoint) {
-    params.append("endpoint", endpoint);  // "calendar"
-  }
-  return params;
-}
-
-export function formatProxyUrl(widget, endpoint, queryParams) {
-  const params = getURLSearchParams(widget, endpoint);
-  // ...
-  return `/api/services/proxy?${params.toString()}`;
-}
+<Error error={{ message: `${config.type}: ${error.message ?? error}` }} />
+// 显示 "sonarr: xxx error"
 ```
 
-最终生成的请求 URL 示例：
+此外，合并后的 `config.type` 也是集成组件内部逻辑可能使用的标识。
+
+#### 12.5.2 服务端：type 从配置中重新读取
+
+服务端代理**不信任**前端传来的 type。它通过 `group` + `service` + `index` 定位到服务后，从**服务端自身的配置**中读取 type：
+
+[proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/pages/api/services/proxy.js#L12-L20) L12-L20：
+```javascript
+const { service, group, index } = req.query;
+const serviceWidget = await getServiceWidget(group, service, index);
+let type = serviceWidget?.type;   // ← 从服务端配置读取，不是从请求参数读
+
+if (type === "calendar") type = "ical";   // 特殊处理
+
+const widget = widgets[type];
 ```
-/api/services/proxy?group=%E5%AA%92%E4%BD%93%E7%AE%A1%E7%90%86&service=Sonarr&index=0&endpoint=calendar&query=%7B%22start%22%3A%222026-03-11%22%7D
-```
 
-解码后：
-```
-/api/services/proxy
-  ?group=媒体管理
-  &service=Sonarr
-  &index=0
-  &endpoint=calendar
-  &query={"start":"2026-03-11","end":"2026-09-11",...}
-```
+**注意**：请求参数中没有 `type`，只有 `group`、`service`、`index`、`endpoint`。服务端完全通过 group/service/index 定位服务，然后从配置中获取 type。
 
-**这意味着：虽然请求是从日历集成组件发出的，但代理层看到的 group/service 是 Sonarr 服务的，而不是日历服务的。**
+#### 12.5.3 类型边界的两次转换
 
-#### 12.4.2 index 传递的设计假设
+`type` 的值在链路中发生两次变化，但含义完全不同：
 
-这里有一个值得注意的设计假设：**集成引用的服务 widget 的 index，和日历 widget 自己的 index 相同**。
+| 转换 | 位置 | 触发原因 | 转换方向 |
+|------|------|----------|----------|
+| 第一次 | 前端日历组件合并配置 | integration.type 覆盖 widget.type | `"calendar"` → `"sonarr"`（或 `"radarr"`、`"ical"`） |
+| 第二次 | 服务端 proxy.js | calendar 类型特殊处理（别名） | `"calendar"` → `"ical"` （仅当 type 是 calendar 时） |
 
-因为合并时 `index` 字段没有被 integration 覆盖（integration 中通常不设置 index），所以沿用的是日历 widget 的 index。
+**为什么第二次转换只对 calendar 生效？**
 
-这在大多数情况下是正确的（大多数服务只有一个 widget，index=0），但如果被引用服务有多个 widget，且想引用第 2 个 widget（index=1），目前的机制是不支持的——integration 配置中没有设置 index 的字段。
+因为 widgets 注册表中：
+- `ical: calendar`（iCal 是日历的别名，共享 calendar widget 定义）
+- 但 `sonarr`、`radarr` 都是独立注册的 widget，有自己的 mappings 和 proxyHandler
 
-### 12.5 服务端代理的请求路由
+当服务端读取到 type 为 `"sonarr"` 时，直接查找 `widgets["sonarr"]`，不会触发 calendar→ical 的转换。这是 Sonarr/Radarr 日历集成能走通的关键——前端已经通过 service_group/service_name 把请求"转发"给了 Sonarr 服务，服务端看到的就是一个标准的 Sonarr widget 请求。
+
+### 12.6 服务端代理的请求路由（五步定位法）
 
 请求到达 [pages/api/services/proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/pages/api/services/proxy.js) 后，经历以下定位步骤：
 
-#### 12.5.1 第一步：根据 group/service/index 找到服务配置
+#### 第一步：group + service + index → 服务配置对象
 
 ```javascript
 const { service, group, index } = req.query;
@@ -1270,26 +1335,28 @@ const serviceWidget = await getServiceWidget(group, service, index);
 let type = serviceWidget?.type;
 ```
 
-- `getServiceWidget("媒体管理", "Sonarr", 0)` 
-- → `getServiceItem()` 在 services.yaml（或 Docker/K8s）中查找 "媒体管理" 组下的 "Sonarr" 服务
-- → 返回该服务的第 0 个 widget 配置（含完整的 `url`、`key` 等敏感字段）
+- 输入：`group="媒体管理"`, `service="Sonarr"`, `index=0`
+- 输出：Sonarr 服务的第 0 个 widget 配置（含完整的 url、key 等敏感字段）
+- type 来自服务端配置，不是前端参数
 
-> 关键：这里查找的是 **Sonarr 服务** 的配置，不是日历服务的。前端通过 `service_group` + `service_name` 完成了"从日历服务跳转到 Sonarr 服务"的定位。
+> 这是服务引用模式的核心：前端通过 `service_group` + `service_name` 把"日历集成"请求转化为对"Sonarr 服务"的请求。
 
-#### 12.5.2 第二步：根据 type 找到 Widget 定义
+#### 第二步：type → Widget 定义对象
 
 ```javascript
-if (type === "calendar") type = "ical";   // ← 特殊处理：日历类型重映射
-
+if (type === "calendar") type = "ical";   // 仅 calendar 类型重映射
 const widget = widgets[type];
 ```
 
-因为此时 `type` 是 `"sonarr"`（不是 `"calendar"`），所以走正常流程：
-- `widgets["sonarr"]` → Sonarr Widget 定义对象（含 `api` 模板、`mappings` 等）
+- 输入：`type = "sonarr"`
+- 输出：`widgets["sonarr"]` → Sonarr Widget 定义对象
 
-> 如果是 iCal 类型的集成，`type` 会是 `"ical"`，然后 `widgets["ical"]` 指向 calendar widget（通过别名 `ical: calendar`），走日历专属的 `calendarProxyHandler`。
+如果是 iCal 集成，流程不同：
+- 前端 type 是 `"ical"`，请求的 group/service 是**日历服务自身**的
+- 服务端读取到 type = `"calendar"`（日历服务的 type），然后重映射为 `"ical"`
+- `widgets["ical"]` 指向 calendar widget，使用 `calendarProxyHandler`
 
-#### 12.5.3 第三步：通过 endpoint 找到映射配置
+#### 第三步：endpoint → mapping 配置
 
 ```javascript
 const mapping = widget?.mappings?.[req.query.endpoint];
@@ -1306,24 +1373,23 @@ calendar: {
 },
 ```
 
-#### 12.5.4 第四步：参数白名单过滤
+#### 第四步：query 参数白名单过滤
 
 [proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/pages/api/services/proxy.js#L74-L86) L74-L86：
 
 ```javascript
 if (req.query.query && (mappingParams || optionalParams)) {
   const queryParams = JSON.parse(req.query.query);
-  // 只保留 mapping.params 中声明的参数
-  let params = mappingParams ? mappingParams.slice() : [];
-  // ...
+  // 只保留 mapping.params 和 optionalParams 中声明的参数名
+  const params = [...(mappingParams || []), ...filteredOptionalParams];
   const query = new URLSearchParams(params.map((p) => [p, queryParams[p]]));
   req.query.endpoint = `${req.query.endpoint}?${query}`;
 }
 ```
 
-前端传入的 query 参数（如 `start`, `end`, `includeSeries` 等）只有在 `mapping.params` 白名单中的才会转发到 Sonarr API。
+前端传来的参数（`start`, `end`, `includeSeries` 等）只有在 mapping 的 params 白名单中才会转发到真实 API。
 
-#### 12.5.5 第五步：调用代理处理器
+#### 第五步：调用代理处理器
 
 ```javascript
 return await serviceProxyHandler(req, res, map);
@@ -1332,15 +1398,49 @@ return await serviceProxyHandler(req, res, map);
 ```
 
 `genericProxyHandler` 执行实际的 HTTP 请求：
-- 用 `{url}/api/v3/{endpoint}?apikey={key}` 模板构造完整 URL
-- 注入 API Key
+- 根据 `{url}/api/v3/{endpoint}?apikey={key}` 模板构造完整 URL
+- 注入 API Key 和 Basic Auth
 - 发起请求到真实的 Sonarr 服务器
-- 返回响应数据
+- 数据校验和转换后返回前端
 
-### 12.6 完整服务定位链路图
+### 12.7 iCal 模式的特殊定位（对比理解）
+
+为了更清晰地理解 Sonarr/Radarr 的服务引用模式，下面对比 iCal（直接 URL 模式）的定位方式：
+
+| 维度 | Sonarr/Radarr（服务引用模式） | iCal（直接 URL 模式） |
+|------|-----------------------------|----------------------|
+| **数据来源** | 引用其他已配置的 Widget 服务 | 集成项自带 URL |
+| **定位方式** | `service_group` + `service_name` + `index` → 找到目标服务 → 读 type | `name` 字段匹配 integration → 取 integration.url |
+| **请求中的 group/service** | 被引用服务的（如 "媒体管理/Sonarr"） | 日历服务自身的（如 "媒体中心/日历面板"） |
+| **服务端 type** | `"sonarr"`（从被引用服务配置读取） | `"calendar"` → 重映射为 `"ical"`（从日历服务配置读取） |
+| **Widget 定义** | `widgets["sonarr"]` | `widgets["ical"]`（即 calendar） |
+| **Proxy Handler** | `genericProxyHandler` | `calendarProxyHandler` |
+| **endpoint 含义** | Sonarr API 的 endpoint 名（如 "calendar"） | integration 的 `name`（用于在 integrations 数组中查找） |
+| **URL 来源** | 被引用服务配置的 `widget.url` | integration 自身的 `url` 字段（服务端可见，前端不可见） |
+| **API Key** | 使用被引用服务的 key | 无（或包含在 URL 中） |
+
+iCal 模式的服务端定位逻辑在 [calendar/proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/proxy.js#L7-L17) L7-L17：
+
+```javascript
+const { group, service, endpoint, index } = req.query;
+
+if (group && service) {
+  const widget = await getServiceWidget(group, service, index);  // 找到日历服务的配置
+  const integration = widget.integrations?.find((i) => i.name === endpoint);  // endpoint 当 name 用
+  if (integration) {
+    if (!integration.url) {  // 服务端能看到 integration.url（前端看不到）
+      return res.status(403).json({ error: "No integration URL specified" });
+    }
+    // ... 用 integration.url 发起请求
+  }
+}
+```
+
+### 12.8 完整服务定位链路图
 
 ```
-┌─ services.yaml 配置 ───────────────────────────────────────┐
+┌─ services.yaml 原始配置 ───────────────────────────────────┐
+│  （服务端 getServiceWidget 直接读这里）                       │
 │                                                            │
 │  媒体管理组:                                                 │
 │    Sonarr 服务: { widget: { type: sonarr, url, key } }      │
@@ -1349,10 +1449,12 @@ return await serviceProxyHandler(req, res, map);
 │    日历面板服务: {                                           │
 │      widget: {                                              │
 │        type: calendar,                                      │
+│        maxEvents: 10,                                       │
 │        integrations: [                                      │
 │          { type: sonarr,                                    │
 │            service_group: 媒体管理,  ← 定位指针              │
 │            service_name: Sonarr,     ← 定位指针              │
+│            url: ...(iCal 模式才有), ← 服务端可见             │
 │            color: teal }                                    │
 │        ]                                                    │
 │      }                                                      │
@@ -1360,57 +1462,62 @@ return await serviceProxyHandler(req, res, map);
 └────────────────────────────────────────────────────────────┘
                               │
                               ▼
-┌─ 配置清洗 (service-helpers.js) ─────────────────────────────┐
-│  - 日历 widget 的 integrations 数组保留                          │
-│  - 每个 integration 的 url 字段被删除                           │
-│  - service_group、service_name、type 原样保留                  │
-│  - 日历 widget 有自己的 service_group/name/index              │
+┌─ 配置清洗 cleanServiceGroups() ────────────────────────────┐
+│  （给前端用的配置，白名单过滤）                               │
+│                                                            │
+│  - integrations 数组整体保留                                 │
+│  - 每个 integration 只删除 url 字段                          │
+│  - 日历独有字段（firstDayInWeek, maxEvents, view...）保留    │
+│  - 通用字段（type, service_group, service_name, index...）保留│
 └────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─ 前端：日历组件 (calendar/component.jsx) ──────────────────┐
 │                                                            │
 │  对每个 integration:                                        │
-│    { ...widget, ...integration }                           │
-│    → type: sonarr (覆盖 calendar)                          │
-│    → service_group: 媒体管理 (覆盖日历自己的组)                │
-│    → service_name: Sonarr (覆盖日历自己的服务名)               │
-│    → index: 0 (沿用日历的，不被覆盖)                          │
+│    { ...日历widget, ...integration }                      │
 │                                                            │
-│  动态加载 ./integrations/sonarr.jsx 组件                     │
+│  结果：                                                     │
+│    - type: sonarr（覆盖 calendar）                          │
+│    - service_group: 媒体管理（覆盖日历自身组）                │
+│    - service_name: Sonarr（覆盖日历自身名）                   │
+│    - index: 0（沿用日历的，除非 integration 设置了 index）   │
+│    - firstDayInWeek, maxEvents, view...（保留日历字段）      │
+│    - color, baseUrl, params...（integration 新增字段）       │
+│                                                            │
+│  按 type 动态加载集成组件: ./integrations/sonarr.jsx         │
 │  传入 config = 合并后的 widget 对象                           │
 └────────────────────────────────────────────────────────────┘
                               │
                               ▼
-┌─ 前端：Sonarr 日历集成组件 (sonarr.jsx) ───────────────────┐
+┌─ 前端：Sonarr 集成组件 (sonarr.jsx) ──────────────────────┐
 │                                                            │
 │  useWidgetAPI(config, "calendar", { start, end, ... })    │
 │    ↓                                                        │
 │  formatProxyUrl() → /api/services/proxy                    │
 │    ?group=媒体管理&service=Sonarr&index=0&endpoint=calendar │
 │                                                            │
-│  ↑ 注意：group/service 是 Sonarr 服务的，不是日历的！           │
+│  ↑ 关键：group/service 是 Sonarr 的，不是日历的！             │
 └────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─ 服务端：代理入口 (proxy.js) ──────────────────────────────┐
 │                                                            │
 │  ① getServiceWidget("媒体管理", "Sonarr", 0)               │
-│     → 找到 Sonarr 服务的完整配置（含 url、key）               │
-│     → type = "sonarr"                                      │
+│     → 读原始配置，找到 Sonarr 服务的 widget                  │
+│     → type = "sonarr"（从服务端配置读取，不来自请求）          │
 │                                                            │
 │  ② widgets["sonarr"] → Sonarr Widget 定义                   │
-│     → 不走 calendarProxyHandler，走 genericProxyHandler     │
+│     → proxyHandler = genericProxyHandler                   │
 │                                                            │
-│  ③ widget.mappings["calendar"] → 映射配置                   │
+│  ③ mappings["calendar"] → 映射配置                          │
 │     endpoint: "calendar"                                   │
 │     params: [start, end, unmonitored, ...]                 │
 │                                                            │
-│  ④ 参数白名单过滤 query 参数                                 │
+│  ④ query 参数白名单过滤                                      │
 │                                                            │
-│  ⑤ genericProxyHandler(req, res, map)                      │
-│     → 构造真实 URL: {url}/api/v3/calendar?apikey={key}     │
-│     → 请求 Sonarr 服务器                                     │
+│  ⑤ genericProxyHandler                                      │
+│     → 用 Sonarr 的 url + key 构造真实请求                     │
 │     → 返回日历数据数组                                       │
 └────────────────────────────────────────────────────────────┘
                               │
@@ -1418,52 +1525,28 @@ return await serviceProxyHandler(req, res, map);
                     前端收到数据，渲染日历事件
 ```
 
-### 12.7 两种日历集成模式的对比
+### 12.9 设计特点与边界总结
 
-为了更清晰地理解 Sonarr/Radarr 模式的特殊性，下面对比它与 iCal 模式的区别：
+#### 12.9.1 配置清洗的精确边界
 
-| 维度 | Sonarr/Radarr 模式（服务引用） | iCal 模式（直接 URL） |
-|------|-------------------------------|----------------------|
-| 数据来源 | 引用其他已配置的 Widget 服务 | 集成项自带 URL |
-| 定位方式 | `service_group` + `service_name` + `index` | `name` 字段匹配 |
-| 服务端 Widget 定义 | `widgets["sonarr"]` | `widgets["ical"]` (即 calendar) |
-| Proxy Handler | `genericProxyHandler` | `calendarProxyHandler` |
-| API Key | 使用被引用服务的 key | 无（iCal URL 通常无需认证） |
-| endpoint 含义 | Sonarr API 的 endpoint 名（如 "calendar"） | 集成项的 `name`（用于查找） |
-| 日历数据格式 | Sonarr API 返回的 JSON 数组 | iCal 格式字符串 |
-| 数据处理 | 前端 JS 解析转换 | 前端 JS 解析 iCal |
+- **只删 `url`**：integration 只删除真实地址字段，其他字段完整保留
+- **两套配置独立**：前端看到的是清洗后的，服务端代理读的是原始配置
+- **日历字段保留**：合并后日历的显示配置（view、maxEvents 等）仍然在 config 中可用
 
-### 12.8 服务定位的关键问题与设计特点
+#### 12.9.2 序号的隐式假设
 
-#### 12.8.1 为什么不用日历服务自己的配置？
+- `index` 可以在 integration 中指定（技术上可行），但未文档化
+- 默认沿用日历服务自身的 index（通常为 0）
+- 隐含假设：被引用服务的 widget 序号与日历服务相同
 
-因为日历 Widget 本身没有 `url` 和 `key` 等 Sonarr/Radarr 连接参数。这些参数在 Sonarr/Radarr 各自的服务配置中。通过 `service_group` + `service_name` 引用机制，日历集成可以**复用已有的服务配置**，避免重复配置。
+#### 12.9.3 type 的两种角色
 
-#### 12.8.2 为什么要删除 integration 的 url 字段？
+| 角色 | 位置 | 作用 |
+|------|------|------|
+| 前端 type | integration.type | 动态加载哪个集成组件；错误提示标识 |
+| 服务端 type | getServiceWidget 返回的配置.type | 决定用哪个 Widget 定义（mappings、proxyHandler） |
 
-在配置清洗阶段 [service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/utils/config/service-helpers.js#L629) L629，日历 integration 的 `url` 被主动删除。这是因为：
-- 服务引用模式（sonarr/radarr）的 URL 来自被引用服务的配置，不需要在 integration 中重复设置
-- iCal 模式的 URL 是敏感信息（可能包含 token），不应暴露给前端
-- iCal 模式走 `calendarProxyHandler`，URL 只在服务端使用
-
-#### 12.8.3 type 的两次重映射
-
-`type` 字段在链路中经历了两次变化：
-
-**第一次（前端）**：日历组件合并配置时，`integration.type` 覆盖 `widget.type`
-- `"calendar"` → `"sonarr"`（或 `"radarr"` / `"ical"`）
-
-**第二次（服务端）**：只有 calendar 类型会被重映射
-- `"calendar"` → `"ical"`（因为 widgets 中别名为 `ical: calendar`）
-- 但 `"sonarr"` 不会被重映射，直接查找 `widgets["sonarr"]`
-
-这是 Sonarr/Radarr 日历集成能走通的关键：前端已经把 type 改成 `"sonarr"` 了，所以服务端不会触发 calendar→ical 的重映射逻辑。
-
-#### 12.8.4 index 未被传递的隐患
-
-如 12.4.2 节所述，integration 配置中没有 `index` 字段，合并后沿用日历 Widget 自己的 index。如果被引用服务有多个 widget（不常见），且想引用非第一个 widget，目前没有办法配置。
-
-这是一个有意的设计简化——绝大多数服务只有一个 widget，index=0 即可。
+服务端不相信前端传来的 type，始终通过 group/service/index 从配置中重新读取。这是安全设计的一部分——前端无法通过篡改 type 来访问未授权的 Widget 类型。
 
 ---
 
@@ -1485,6 +1568,8 @@ return await serviceProxyHandler(req, res, map);
 | [src/widgets/calendar/integrations/sonarr.test.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/sonarr.test.jsx) | Sonarr 日历集成测试 |
 | [src/widgets/calendar/integrations/radarr.test.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/radarr.test.jsx) | Radarr 日历集成测试 |
 | [src/widgets/calendar/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/component.jsx) | 日历主组件（集成加载 + 配置合并） |
+| [src/widgets/calendar/proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/proxy.js) | 日历专属代理处理器（iCal 模式 URL 直接请求） |
+| [docs/widgets/services/calendar.md](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/docs/widgets/services/calendar.md) | 日历 Widget 配置文档 |
 | [src/components/services/widget/container.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/components/services/widget/container.jsx) | Widget 容器（错误拦截 + 字段过滤 + 高亮） |
 | [src/components/services/widget/error.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/components/services/widget/error.jsx) | 错误展示组件（容错格式化 + 可折叠面板） |
 | [src/widgets/widgets.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/widgets.js) | Widget 定义注册表 |
