@@ -129,7 +129,7 @@ entrypoint 的完整执行流：
 ```
 
 **`HOMEPAGE_BUILDTIME` 的关键作用：**
-这个变量是 entrypoint 在每次容器启动时用 `date +%s` 动态生成的 Unix 时间戳。它并非传给前端展示（展示用的是 `NEXT_PUBLIC_BUILDTIME`，在 CI 构建时已烧录），而是与配置文件内容一起参与 `/api/hash` 接口的哈希计算，从而实现「容器重启/重新创建 → 即使配置文件未改动 → 前端也能感知并触发全页刷新」的机制（详见 2.5 节完整协作链路）。
+这个变量是 entrypoint 在每次容器启动时用 `date +%s` 动态生成的 Unix 时间戳。它并非传给前端展示（展示用的是 `NEXT_PUBLIC_BUILDTIME`，在 CI 构建时已烧录），而是与配置文件内容一起参与 `/api/hash` 接口的哈希计算，从而实现「容器重启/重新创建 → 即使配置文件未改动 → 前端也能感知并触发全页刷新」的机制（详见 2.3 节完整协作链路）。
 
 ### 2.3 配置刷新与前端重新校验的协作链路（HOMEPAGE_BUILDTIME → /api/hash → 前端刷新）
 
@@ -182,47 +182,85 @@ export default async function handler(req, res) {
 1. 用户编辑了 docker.yaml / services.yaml 等配置文件 → 配置文件哈希变化。
 2. 容器被重启或重新创建 → `HOMEPAGE_BUILDTIME` 变化。
 
-#### 2.3.3 前端：Window Focus 触发的哈希校验与全页刷新
+#### 2.3.3 组件层级与 SWR 缓存边界：hash 请求为何不读 fallback
 
-前端在 [src/pages/index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/index.jsx) 的 `Index` 组件中实现了完整的检测-刷新链路：
+这是理解配置刷新机制最关键但最易混淆的一点。需要从组件树的层级关系说起。
+
+**三层 SWRConfig 嵌套结构**（由外到内）：
+
+```
+_app.jsx: <SWRConfig value={{ fetcher }}>          ← 第 1 层：注册全局 fetcher
+  └─ <Wrapper>
+       └─ <Index>                                   ← ⚠️ hash/validate 请求在这里
+            ├─ useSWR("/api/hash")
+            ├─ useSWR("/api/validate")
+            └─ <SWRConfig value={{ fallback }}>     ← 第 2 层：注入 fallback 缓存
+                 └─ <Home>
+                      ├─ useSWR("/api/services")     ← ✅ 能读到 fallback
+                      ├─ useSWR("/api/bookmarks")    ← ✅ 能读到 fallback
+                      └─ useSWR("/api/widgets")      ← ✅ 能读到 fallback
+```
+
+[_app.jsx](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/_app.jsx#L73-L97) 在最外层注册全局 `fetcher`，所有 `useSWR` 调用共享此 fetcher。
+
+[index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/index.jsx) 中：
+- `Index` 组件（[第 97 行](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/index.jsx#L97)）在 `SWRConfig fallback` 的**外层**，直接调用 `useSWR("/api/hash")` 和 `useSWR("/api/validate")`。
+- `SWRConfig fallback`（[第 186 行](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/index.jsx#L186)）包裹的是 `Home` 组件及其子树。
+
+**SWR fallback 的工作原理：** `SWRConfig` 的 `fallback` 值只对其**子组件树**中的 `useSWR` 调用生效。`Index` 组件在 `SWRConfig fallback` 的**外层**，所以 `useSWR("/api/hash")` 和 `useSWR("/api/validate")` **完全无法读取** fallback 缓存，它们永远会发起真实的网络请求。
+
+**`"/api/hash": false` 的真正作用：**
+
+```js
+fallback: {
+  "/api/services": services,    // Home 子树：直接使用缓存数据，不发起网络请求
+  "/api/bookmarks": bookmarks,
+  "/api/widgets": widgets,
+  "/api/hash": false,           // ← 这行的作用对象不是 Index 中的 hash 请求
+}
+```
+
+这个 `false` 不是给 `Index` 组件中的 `useSWR("/api/hash")` 用的（它根本读不到这个 fallback），而是给 `Home` 子树中可能存在的其他 `useSWR("/api/hash")` 调用的。设为 `false` 意味着：如果在 `Home` 子树中有人调用 `useSWR("/api/hash")`，SWR 会把初始数据设为 `false`（falsy），从而**阻止**子树从 SWR 缓存中拿到一个「看起来有效」的旧哈希值，强制子树也必须等待真实请求返回。
+
+总结：
+- `Index` 中的 hash 请求**始终发起真实网络请求**，不是因为 `fallback: false`，而是因为它在 `SWRConfig fallback` 之外。
+- `Home` 中的 services/bookmarks/widgets 请求**首屏使用 fallback 缓存**，不发起网络请求。
+- `"/api/hash": false` 是一个**防御性配置**，确保 Home 子树内部不会意外使用哈希缓存。
+
+#### 2.3.4 前端：Window Focus 触发的哈希校验与全页刷新
+
+理解了组件层级后，`Index` 组件中的完整检测-刷新链路如下（[index.jsx 第 97-131 行](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/index.jsx#L97-L131)）：
 
 ```js
 function Index({ initialSettings, fallback }) {
-  // 1. useWindowFocus 钩子：监听 window 的 focus/blur 事件
   const windowFocused = useWindowFocus();
   const [stale, setStale] = useState(false);
 
-  // 2. SWR 拉取 /api/validate（YAML 语法校验）和 /api/hash（配置哈希）
+  // ① 两个 SWR 请求都在 SWRConfig fallback 外层，必定发起真实网络请求
   const { data: errorsData } = useSWR("/api/validate");
+  const { error: validateError } = errorsData || {};
   const { data: hashData, mutate: mutateHash } = useSWR("/api/hash");
 
-  // 3. 当窗口重新获得焦点时，强制重新请求 /api/hash
+  // ② 窗口焦点变化 → 强制重新请求 /api/hash
   useEffect(() => {
     if (windowFocused) {
-      mutateHash();  // 触发 SWR 重新校验
+      mutateHash();   // bypass SWR 缓存，发起新的 fetch
     }
   }, [windowFocused, mutateHash]);
 
-  // 4. 比对新旧哈希，不一致则触发 SSR 重渲染 + 全页 reload
+  // ③ hashData 变化 → 比对 localStorage，决定是否刷新
   useEffect(() => {
     if (hashData) {
       const previousHash = localStorage.getItem("hash");
-
       if (!previousHash) {
-        // 首次访问：记录当前哈希
-        localStorage.setItem("hash", hashData.hash);
+        localStorage.setItem("hash", hashData.hash);  // 首次：记录基准
       }
-
       if (previousHash && previousHash !== hashData.hash) {
-        // 哈希变化：显示加载动画
-        setStale(true);
-        // 更新本地存储
-        localStorage.setItem("hash", hashData.hash);
-        // 调用 /api/revalidate 让 Next.js 重新生成首页的静态页面
+        setStale(true);                                // 显示旋转加载动画
+        localStorage.setItem("hash", hashData.hash);   // 更新基准
         fetch("/api/revalidate").then((res) => {
           if (res.ok) {
-            // 强制整页刷新，拉取重新生成的 SSR 内容
-            window.location.reload();
+            window.location.reload();                   // 全页硬刷新
           }
         });
       }
@@ -230,16 +268,115 @@ function Index({ initialSettings, fallback }) {
   }, [hashData]);
 ```
 
-`useWindowFocus` 钩子（[src/utils/hooks/window-focus.js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/utils/hooks/window-focus.js)）的实现：监听 `window.focus` 和 `window.blur` 事件，返回当前窗口是否处于焦点状态。这样设计的意图是：用户切换标签页/最小化浏览器/切走再切回来时，自动触发一次哈希检查，无需手动刷新页面。
+`useWindowFocus` 钩子（[src/utils/hooks/window-focus.js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/utils/hooks/window-focus.js)）监听 `window.focus` 和 `window.blur` 事件。用户切换标签页再切回来时，自动触发 `mutateHash()` 重新请求。
 
-#### 2.3.4 `/api/revalidate` 接口：Next.js ISR 增量静态再生成
+注意 `mutateHash()` 与普通 SWR revalidation 的区别：SWR 默认的 `useSWR` 也会在窗口 focus 时重新校验（如果开启了 `revalidateOnFocus`，默认为 true），但 `mutateHash()` 是**显式调用**，**无条件**触发一次新的 fetch，不依赖 SWR 内置的 focus revalidation 机制。这确保即使 SWR 因为某种策略跳过了自动 revalidation，哈希校验也一定会执行。
+
+#### 2.3.5 配置刷新的完整请求与状态依赖链
+
+一次完整的配置刷新涉及 **3 个 API 请求** 和 **3 个状态变化**：
+
+**请求清单：**
+
+| 请求 | 发起位置 | 触发条件 | 是否读 fallback |
+|---|---|---|---|
+| `GET /api/validate` | `Index` → `useSWR` | 页面加载时（SWR 挂载） | ❌ 在 fallback 外层 |
+| `GET /api/hash` | `Index` → `useSWR` | 页面加载时 + window focus 时 | ❌ 在 fallback 外层 |
+| `GET /api/revalidate` | `Index` → `fetch` | 仅当 hash 变化时 | N/A（裸 fetch，不走 SWR） |
+
+**状态变化依赖链：**
+
+```
+window focus 事件
+  │
+  ├─ useWindowFocus() 返回 true
+  │
+  ├─ useEffect([windowFocused]) → mutateHash()
+  │     │
+  │     └─ 触发 GET /api/hash → 后端返回 { hash: "新值" }
+  │           │
+  │           └─ hashData 更新（SWR 内部状态）
+  │                 │
+  │                 └─ useEffect([hashData]) 执行
+  │                       │
+  │                       ├─ previousHash = localStorage.getItem("hash")
+  │                       │
+  │                       ├─ 若 previousHash 不存在 → 仅写入 localStorage（首次访问）
+  │                       │
+  │                       └─ 若 previousHash !== hashData.hash
+  │                             │
+  │                             ├─ ① setStale(true)     → React 重渲染，显示旋转加载动画
+  │                             │                         Index 返回 <div className="animate-spin">
+  │                             │                         而非 <SWRConfig><Home/></SWRConfig>
+  │                             │
+  │                             ├─ ② localStorage.setItem("hash", 新值)
+  │                             │
+  │                             └─ ③ fetch("/api/revalidate")
+  │                                   │
+  │                                   └─ 后端 res.revalidate("/") → ISR 重新执行 getStaticProps
+  │                                         │
+  │                                         └─ res.ok → window.location.reload()
+  │                                               │
+  │                                               └─ 浏览器硬刷新，重新加载整个页面
+  │                                                   新页面包含新的 getStaticProps 结果
+```
+
+**关键细节：`setStale(true)` 会卸载整个 `Home` 组件树。**
+
+当 `stale` 为 true 时，[index.jsx 第 151-157 行](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/index.jsx#L151-L157) 返回旋转加载动画，**不再渲染** `<SWRConfig><Home/></SWRConfig>`。这意味着：
+- Home 及其所有子组件（ServicesGroup、BookmarksGroup、Widget 等）全部卸载。
+- 这些组件持有的 SWR 缓存数据（services、bookmarks、widgets）也被丢弃。
+- `window.location.reload()` 后，新页面重新从 `getStaticProps` 获取数据，SWR fallback 全部更新为最新值。
+
+这个「先卸载再硬刷新」的设计保证了配置变更后，**不会出现旧数据和新配置混合渲染的中间状态**。
+
+#### 2.3.6 首屏加载时的请求顺序与缓存命中
+
+用户首次访问或刷新页面时，请求的完整时序：
+
+```
+浏览器请求 GET /
+  │
+  ├─ Next.js SSR 渲染
+  │   ├─ getStaticProps() 返回 { initialSettings, fallback }
+  │   └─ HTML 包含内联的 fallback 数据（services/bookmarks/widgets 的 JSON）
+  │
+  ▼
+浏览器接收 HTML → React Hydration 开始
+  │
+  ├─ Index 组件挂载
+  │   ├─ useSWR("/api/validate") → 无 fallback → 发起真实请求 ①
+  │   └─ useSWR("/api/hash")     → 无 fallback → 发起真实请求 ②
+  │
+  ├─ validateError 检查
+  │   └─ 若 validate 请求返回错误 → 显示红色 Error 页面，不渲染 Home
+  │
+  ├─ errorsData 检查
+  │   └─ 若 validate 返回 YAML 语法错误数组 → 显示琥珀色警告页面
+  │
+  ├─ 若校验通过 → 渲染 <SWRConfig fallback={...}><Home/></SWRConfig>
+  │   │
+  │   └─ Home 组件挂载
+  │       ├─ useSWR("/api/services")  → 命中 fallback → 不发请求，直接使用缓存
+  │       ├─ useSWR("/api/bookmarks") → 命中 fallback → 不发请求
+  │       └─ useSWR("/api/widgets")   → 命中 fallback → 不发请求
+  │
+  ├─ hash 请求 ② 返回
+  │   └─ localStorage 为空 → 写入当前 hash → 不触发刷新
+  │
+  └─ 页面渲染完成，所有数据就绪
+```
+
+**首屏总共只有 2 个真实网络请求**（`/api/validate` 和 `/api/hash`），services/bookmarks/widgets 的数据通过 SSR fallback 直接注入，无需额外请求。
+
+#### 2.3.7 `/api/revalidate` 接口：Next.js ISR 增量静态再生成
 
 [src/pages/api/revalidate.js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/api/revalidate.js)：
 
 ```js
 export default async function handler(req, res) {
   try {
-    await res.revalidate("/");    // Next.js 原生 API：重新生成 "/" 路径的静态页面
+    await res.revalidate("/");
     return res.json({ revalidated: true });
   } catch (err) {
     return res.status(500).send("Error revalidating");
@@ -249,7 +386,9 @@ export default async function handler(req, res) {
 
 这个接口调用 Next.js 的 Incremental Static Regeneration (ISR) 机制，让服务端重新执行 `getStaticProps()`，读取最新的 services.yaml / bookmarks.yaml / widgets.yaml 并生成新的静态 HTML。然后前端 `window.location.reload()` 拉取重新生成的页面。
 
-#### 2.3.5 `/api/validate` 接口：配置文件语法校验
+此外，[Revalidate 组件](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/components/toggles/revalidate.jsx) 在页面底部提供了一个手动刷新按钮，直接调用同一个 `/api/revalidate` 接口，允许用户主动触发 ISR 再生成。
+
+#### 2.3.8 `/api/validate` 接口：配置文件语法校验
 
 [src/pages/api/validate.js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/api/validate.js) 在页面加载时被调用，检查所有 YAML 配置文件的语法：
 
@@ -265,35 +404,13 @@ export default async function handler(req, res) {
 
 如果存在 YAML 解析错误（[checkAndCopyConfig](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/utils/config/config.js#L44-L49) 返回的是 yaml 解析异常对象而非 true），前端会在 [index.jsx 第 133-183 行](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/index.jsx#L133-L183) 显示错误页面而非仪表盘。
 
-#### 2.3.6 getStaticProps：首屏数据注入与 fallback
+注意 `/api/validate` 的校验列表与 `/api/hash` 的哈希列表**不完全相同**：
+- `/api/hash` 包含：docker.yaml, settings.yaml, services.yaml, bookmarks.yaml, widgets.yaml, **custom.css**, **custom.js**
+- `/api/validate` 包含：docker.yaml, settings.yaml, services.yaml, bookmarks.yaml, **kubernetes.yaml**, **proxmox.yaml**
 
-[index.jsx 的 getStaticProps](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/pages/index.jsx#L55-L95) 在构建时（以及 revalidate 时）服务端执行：
+差异原因是 `validate` 负责 YAML 语法校验（kubernetes.yaml / proxmox.yaml 是 YAML 文件，容易出错），而 `hash` 负责检测配置变更（custom.css / custom.js 是用户自定义资源，变更后需要刷新页面）。
 
-```js
-export async function getStaticProps() {
-  const { providers, ...settings } = getSettings();
-  const services = await servicesResponse();   // 从 Docker/K8s/services.yaml 汇总
-  const bookmarks = await bookmarksResponse();
-  const widgets = await widgetsResponse();
-
-  return {
-    props: {
-      initialSettings: settings,
-      fallback: {
-        "/api/services": services,    // SWR fallback：首屏无需再请求这些 API
-        "/api/bookmarks": bookmarks,
-        "/api/widgets": widgets,
-        "/api/hash": false,           // /api/hash 故意设为 false，首屏不提供 fallback
-      },
-      ...(await serverSideTranslations(language)),
-    },
-  };
-}
-```
-
-注意 `"/api/hash": false` 的设计：首屏 SWR 不会使用 fallback，而是一定会真实请求 `/api/hash`，确保每次页面加载（包括软导航）都能拿到当前的哈希值。而 services/bookmarks/widgets 这些首屏数据则通过 fallback 直接注入，避免重复请求。
-
-#### 2.3.7 完整协作时序
+#### 2.3.9 完整协作时序
 
 ```
 容器启动
@@ -306,24 +423,29 @@ Next.js server 启动
   │
   ├─ getStaticProps() 首次执行
   │   ├─ getSettings() / servicesResponse() / ...
-  │   └─ 生成静态页面 + SWR fallback（/api/hash: false）
+  │   └─ 生成静态页面 + SWR fallback 数据
   │
   ▼
 用户浏览器访问首页
   │
-  ├─ 1. 服务端渲染 HTML 返回（内含 initialSettings, fallback）
-  ├─ 2. 前端 Hydration，SWRConfig 使用 fallback 缓存
-  │     └─ /api/services, /api/bookmarks, /api/widgets 有缓存，不发请求
-  │     └─ /api/hash: false → SWR 认为无缓存，发起真实请求
+  ├─ 1. 服务端渲染 HTML 返回（内含 initialSettings + fallback JSON）
   │
-  ├─ 3. useSWR("/api/hash") 返回 { hash: "abc123..." }
-  │     └─ localStorage 为空 → 写入 hash = "abc123..."
+  ├─ 2. React Hydration
+  │     ├─ Index 挂载 → 发起 GET /api/validate + GET /api/hash
+  │     │   （均在 SWRConfig fallback 外层，不读缓存）
+  │     │
+  │     ├─ 校验通过 → 渲染 SWRConfig(fallback) → Home 挂载
+  │     │   ├─ useSWR("/api/services")  → 命中 fallback，不发请求
+  │     │   ├─ useSWR("/api/bookmarks") → 命中 fallback，不发请求
+  │     │   └─ useSWR("/api/widgets")   → 命中 fallback，不发请求
+  │     │
+  │     └─ GET /api/hash 返回 → localStorage 写入基准 hash
   │
   ▼
 用户切换走标签页 → 切回来（触发 window focus）
   │
   ├─ useWindowFocus() → true
-  ├─ useEffect → mutateHash()    ← 强制 SWR 重新请求 /api/hash
+  ├─ useEffect → mutateHash()    ← 显式强制 SWR 重新 fetch /api/hash
   │
   ├─ 后端 hash.js 重新计算
   │   ├─ configs 内容哈希（如果配置文件没变则相同）
@@ -333,23 +455,23 @@ Next.js server 启动
 有两种情况：
 
 情况 A：配置未修改，容器未重启
-  └─ 哈希相同 → 无动作
+  └─ 哈希相同 → mutateHash() 返回相同数据 → 无动作
 
 情况 B：配置已修改 或 容器已重启
   └─ 哈希不同
-      ├─ setStale(true)          ← 显示加载动画（旋转圆环）
+      ├─ setStale(true)     ← Home 整棵子树卸载，显示旋转加载动画
       ├─ localStorage 更新 hash
       ├─ fetch("/api/revalidate") → 服务端 ISR 重新 getStaticProps()
-      └─ window.location.reload() → 全页刷新，拉取新 SSR 内容
+      └─ window.location.reload() → 全页硬刷新，新页面使用新的 fallback 数据
 ```
 
-#### 2.3.8 三种「配置变化」场景的实际效果
+#### 2.3.10 三种「配置变化」场景的实际效果
 
 | 场景 | HOMEPAGE_BUILDTIME | 配置文件哈希 | combinedHash 变化 | 前端行为 |
 |---|---|---|---|---|
-| 用户编辑了 services.yaml | 不变 | 变化 | ✅ 变化 | Window focus 后自动刷新 |
-| `docker restart homepage` | 变化 | 不变 | ✅ 变化 | Window focus 后自动刷新 |
-| `docker-compose up -d --force-recreate` | 变化 | 不变 | ✅ 变化 | Window focus 后自动刷新 |
+| 用户编辑了 services.yaml | 不变 | 变化 | ✅ 变化 | Window focus 后：Home 卸载 → ISR → 硬刷新 |
+| `docker restart homepage` | 变化 | 不变 | ✅ 变化 | Window focus 后：Home 卸载 → ISR → 硬刷新 |
+| `docker-compose up -d --force-recreate` | 变化 | 不变 | ✅ 变化 | Window focus 后：Home 卸载 → ISR → 硬刷新 |
 | 无任何变化 | 不变 | 不变 | ❌ 不变 | 正常显示 |
 
 这个设计的好处是：**容器重启后，即使配置文件在 volume 中完全未变，前端也会在用户回到页面时自动重新拉取最新的服务列表**。这对于 Docker/K8s 服务发现（自动发现新容器/新 Ingress）尤其重要——比如新增了一个带 homepage 标签的容器，只要重启过 Homepage 容器（或等待下次触发），前端就能感知并展示新服务。
@@ -702,13 +824,14 @@ NEXT_PUBLIC_* 变量为空 → Version 组件显示 "dev"
 │                        前端展示与刷新阶段                             │
 │  index.jsx → Index → Home                                           │
 │  ├─ 首屏渲染: getStaticProps → initialSettings + SWR fallback       │
-│  │   └─ /api/hash fallback=false → 首屏必然真实请求哈希              │
+│  │   ├─ Index 层（SWRConfig 外层）: hash/validate 始终真实请求       │
+│  │   └─ Home 层（SWRConfig 内层）: services/bookmarks/widgets 命中缓存│
 │  │                                                                   │
 │  ├─ 配置刷新检测:                                                    │
 │  │   useWindowFocus() → window focus 事件                           │
 │  │     → mutateHash() → 重新请求 /api/hash                          │
 │  │     → 与 localStorage.hash 对比                                  │
-│  │     → 若不同: setStale → /api/revalidate → window.location.reload│
+│  │     → 若不同: setStale(卸载Home) → /api/revalidate → reload     │
 │  │                                                                   │
 │  ├─ Version 组件: NEXT_PUBLIC_VERSION/REVISION/BUILDTIME            │
 │  │   └─ /api/releases → 更新检测                                    │
@@ -752,5 +875,6 @@ NEXT_PUBLIC_* 变量为空 → Version 组件显示 "dev"
 | K8s 统计展示 | [src/widgets/kubernetes/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/widgets/kubernetes/component.jsx) |
 | 服务卡片入口 | [src/components/services/item.jsx](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/components/services/item.jsx) |
 | 窗口焦点钩子 | [src/utils/hooks/window-focus.js](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/utils/hooks/window-focus.js) |
+| 手动刷新按钮 | [src/components/toggles/revalidate.jsx](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/src/components/toggles/revalidate.jsx) |
 | K8s 开发环境 | [k3d/](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/k3d) 目录 |
 | Helm Values | [k3d/k3d-helm-values.yaml](file:///d:/fz/0601/solo-dogfeeding/code/207-homepage/k3d/k3d-helm-values.yaml) |
