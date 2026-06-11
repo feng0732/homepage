@@ -151,75 +151,93 @@ Object.keys(containerLabels).forEach((label) => {
 ```
 构造的对象只包含 `container`、`server`、`weight`、`type` 四个固定字段 + 从标签解析出的白名单属性。Docker 连接凭证（Socket 路径、TLS 证书等）来自 `docker.yaml`，通过 `getDockerArguments()` 读取，**绝不会出现在 `constructedService` 对象中**。
 
-**第二步：`cleanServiceGroups`——Widget 配置白名单过滤**
+**第二步：`cleanServiceGroups`——字段分两层处理，仅 widget 子对象经白名单过滤**
 
-`cleanServiceGroups`（[service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/utils/config/service-helpers.js#L231-L708)）是最关键的脱敏步骤。它遍历每个服务的每个 widget，通过**显式解构白名单**的方式只保留展示所需的字段：
+`cleanServiceGroups`（[service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/utils/config/service-helpers.js#L231-L708)）是最关键的脱敏步骤。**必须精确区分"服务卡片本身的字段"和"widget 配置字段"，两者处理方式完全不同：**
 
 ```javascript
-const {
-  // all widgets
-  fields, hideErrors, highlight, type,
+export function cleanServiceGroups(groups) {
+  return groups.map((serviceGroup) => ({
+    name: serviceGroup.name,
+    services: serviceGroup.services.map((service) => {
+      // ────────────────── 第一层：服务卡片本身的字段 ──────────────────
+      const cleanedService = { ...service };  // ← 浅拷贝，service 所有字段原样保留！
+      // 只做 showStats / weight 的类型修正，不删除任何字段
+      if (cleanedService.showStats !== undefined) cleanedService.showStats = JSON.parse(cleanedService.showStats);
+      if (typeof service.weight === "string") { /* weight 转 int */ }
+      if (!cleanedService.widgets) cleanedService.widgets = [];
+      if (cleanedService.widget) { cleanedService.widgets.push(cleanedService.widget); delete cleanedService.widget; }
 
-  // arcane
-  env,
+      // ────────────────── 第二层：widget 子对象的字段 ──────────────────
+      cleanedService.widgets = cleanedService.widgets.map((widgetData, index) => {
+        // ↓ 只有这里做白名单解构！只有 widgetData 内的字段被过滤！
+        const {
+          // all widgets
+          fields, hideErrors, highlight, type,
+          // arcane
+          env,
+          // azuredevops
+          repositoryId, userEmail,
+          // beszel
+          systemId,
+          // ... 约 100 个按 widget 类型分类的白名单字段 ...
+          // grafana
+          alerts,
+        } = widgetData;  // ← 不在解构列表中的 widget 字段被丢弃
 
-  // azuredevops
-  repositoryId, userEmail,
+        // 组装返回的 widget 对象，只有白名单字段
+        const widget = { type, fields: fieldsList || null, hide_errors: hideErrors || false, ... };
+        // 按 type 逐个条件添加白名单字段
+        if (type === "docker") { if (server) widget.server = server; if (container) widget.container = container; }
+        // calendar integrations 做二次脱敏，剥离 url
+        if (type === "calendar") { if (integrations) { widget.integrations = integrations.map(({url, ...rest}) => rest); } }
+        return widget;
+      });
 
-  // beszel
-  systemId,
-
-  // ... 约 100 个按 widget 类型分类的白名单字段 ...
-
-  // unraid
-  pool1, pool2, pool3, pool4,
-
-  // yourspotify
-  interval,
-
-  // technitium
-  range,
-
-  // spoolman
-  spoolIds,
-
-  // grafana
-  alerts,
-} = widgetData;  // ← 不在此解构列表中的字段被隐式丢弃
-```
-
-这段代码通过解构赋值实现白名单：`widgetData` 对象中所有不在上述白名单内的键都会被丢弃。**明确被排除的敏感字段包括：**
-- `url`（绝大部分 widget 类型，仅 search 和 glances 例外）
-- `username`、`password`
-- `key`、`apiKey`
-
-之后按 widget 类型组装返回的 `widget` 对象，结构是固定的最小集合：
-```javascript
-const widget = {
-  type,
-  fields: fieldsList || null,
-  hide_errors: hideErrors || false,
-  service_name: service.name,
-  service_group: serviceGroup.name,
-  index,
-};
-// 然后按 type 逐个添加白名单字段：
-if (type === "docker") {
-  if (server) widget.server = server;
-  if (container) widget.container = container;
+      return cleanedService;  // ← 返回的 cleanedService 保留了 service 本身的所有原始字段！
+    }),
+    type: serviceGroup.type || "group",
+    groups: serviceGroup.groups ? cleanServiceGroups(serviceGroup.groups) : [],
+  }));
 }
 ```
 
-注意：对于 `calendar` widget 的 integrations，还做了**二次脱敏**——显式剥离 `url`：
-```javascript
-if (Array.isArray(integrations)) {
-  widget.integrations = integrations.map((integration) => {
-    if (!integration || typeof integration !== "object") return integration;
-    const { url, ...integrationWithoutUrl } = integration;  // ← 剥离 url
-    return integrationWithoutUrl;
-  });
-}
-```
+**第一层：服务卡片本身的字段（`href`/`icon`/`description`/`server`/`container`/`ping`/`siteMonitor`/`namespace` 等）**
+
+这些字段通过 `const cleanedService = { ...service }` **原样浅拷贝保留**，`cleanServiceGroups` 完全不做过滤。这些字段是用户在前端渲染卡片时需要的：
+
+| 典型字段 | 来源 | 用途 | 是否进入 `__NEXT_DATA__` |
+|---------|------|------|:---:|
+| `href` | services.yaml `href:`、Docker 标签 `homepage.href` | 卡片点击跳转地址 | ✅ **完整暴露** |
+| `icon` | services.yaml `icon:` | 卡片图标 | ✅ |
+| `description` | services.yaml `description:` | 卡片描述 | ✅ |
+| `server` | services.yaml `server:`、Docker 自动发现 | 卡片显示/Docker widget 标识服务器 | ✅ |
+| `container` | Docker 自动发现 | 卡片显示/Docker widget 标识容器 | ✅ |
+| `ping` | services.yaml `ping:` | 前端发起 ping 探测的目标地址 | ✅ **可能暴露内网 IP** |
+| `siteMonitor` | services.yaml `siteMonitor:` | 前端发起 HTTP 健康检查的 URL | ✅ **可能暴露内网 URL** |
+| `namespace` | Kubernetes 自动发现 | 显示命名空间 | ✅ |
+| `app` / `podSelector` | services.yaml widget 配置 | Kubernetes widget 标识 | 只在 widget 白名单内保留 |
+
+**风险点：** 如果 services.yaml 中配置了 `ping: http://192.168.1.100:9090` 或 `siteMonitor: http://10.0.0.50:3000/health`，这些内网地址会**完整出现在 `__NEXT_DATA__` 中**，直接暴露内网拓扑。
+
+**第二层：widget 子对象的字段（`url`/`username`/`password`/`apiKey` 等）**
+
+只有 `cleanedService.widgets.map((widgetData, index) => { const { 白名单 } = widgetData; ... })` 这一层做白名单解构过滤。不在白名单中的 widget 字段被隐式丢弃：
+
+| 典型 widget 字段 | 是否在白名单内 | 是否进入 `__NEXT_DATA__` |
+|-----------------|:---:|:---:|
+| `type` | ✅ | ✅ |
+| `fields` | ✅ | ✅ |
+| `container` (docker widget) | ✅ | ✅ |
+| `server` (docker widget) | ✅ | ✅ |
+| `namespace` (k8s widget) | ✅ | ✅ |
+| `url` | ❌ 除 search/glances 外 | ❌ **绝大多数被剔除** |
+| `username` | ❌ | ❌ **被剔除** |
+| `password` | ❌ | ❌ **被剔除** |
+| `apiKey` | ❌ | ❌ **被剔除** |
+| `key` | ❌ | ❌ **被剔除** |
+
+注意：widget 白名单中的 `container` 和 `server`（docker 类型）是**容器名和服务器名**，用于前端标识和 API 路由查询参数，不是连接地址。真正的连接地址（Docker Socket 路径、TLS 证书等）由 `getDockerArguments()` 从 docker.yaml 读取，从未进入 service 对象。
 
 **第三步：`servicesResponse` 组装与排序**
 
@@ -315,12 +333,7 @@ export async function getPrivateWidgetOptions(type, widgetIndex) {
 [api-response.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/utils/config/api-response.js#L27-L71)：
 ```javascript
 export async function bookmarksResponse() {
-  const bookmarksYaml = path.join(CONF_DIR, "bookmarks.yaml");
-  const rawFileContents = await fs.readFile(bookmarksYaml, "utf8");
-  const fileContents = substituteEnvironmentVars(rawFileContents);
-  const bookmarks = yaml.load(fileContents);
-
-  // YAML 结构 → JS 数组
+  // ...
   const bookmarksArray = bookmarks.map((group) => ({
     name: Object.keys(group)[0],
     bookmarks: group[Object.keys(group)[0]].map((entries) => ({
@@ -328,55 +341,62 @@ export async function bookmarksResponse() {
       ...entries[Object.keys(entries)[0]][0],  // ← 原样展开 YAML 字段
     })),
   }));
-
-  // 按 layout 排序，不新增字段
   return [...sortedGroups.filter((g) => g), ...unsortedGroups];
 }
 ```
 
-bookmarks.yaml 本身只存储书签的展示字段（`name`、`href`、`icon`、`description` 等），不含任何凭证，所以不需要单独的脱敏步骤。**暴露的风险在于 bookmark 的 URL 本身可能揭示内网服务地址**。
+bookmarks.yaml 只存储展示字段：
+- `name`（书签名称）
+- `href`（书签跳转链接）
+- `icon`（图标）
+- `description`（描述）
+
+这些字段全部原样进入 fallback，**无凭证字段。**
+
+**风险点：** `href` 是用户点击跳转的 URL，可能包含内网地址（如 `http://192.168.1.50:8080`），会完整暴露在 `__NEXT_DATA__` 中。
 
 ---
 
-### 清洗链路 4：initialSettings 数据
+### 清洗链路 4：initialSettings + providers 解构排除
 
 [index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/index.jsx#L59-L60)：
 ```javascript
 const { providers, ...settings } = getSettings();
 ```
 
-`providers` 被显式解构排除——这是 settings.yaml 中存放 Docker/Kubernetes/Proxmox 连接信息的字段。其余字段（`title`、`layout`、`theme`、`color`、`background`、`base`、`language` 等展示相关配置）原样进入 `initialSettings` 并被序列化。
+**providers 字段是 settings.yaml 中存放基础设施连接信息的顶级字段：
+- Docker provider：Docker 连接参数（未加密令牌）
+- Kubernetes provider：Kubernetes 连接配置
+- Proxmox provider：Proxmox 凭证
+
+这些字段被显式解构排除后，**完全不进入 `initialSettings`。
+
+**providers/连接凭证的实际读取方式：
+| 凭证类型 | 存储位置 | 服务端读取函数 | 是否进入 fallback/客户端 |
+|---------|---------|-------------|:---:|
+| Docker 连接（Socket 路径/TLS 参数） | docker.yaml | `getDockerArguments(server)`（[docker.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/utils/config/docker.js#L16-L55) | ❌ 完全不进入 |
+| Kubernetes 连接配置 | kubernetes.yaml / settings.yaml providers | `getKubeConfig()`（[kubernetes.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/utils/config/kubernetes.js#L1-L100)） | ❌ 完全不进入 |
+| Widget API key / url / username / password | widgets.yaml 服务对象 | `getPrivateWidgetOptions()`（服务端 API 路由专用函数） | ❌ 完全不进入 |
+| Service widget url / username / password | services.yaml 的 widget 对象 | `getServiceWidget()`（从 servicesFromConfig 直接读取原始 YAML） | ❌ 完全不进入 |
+| Proxmox 连接凭证 | settings.yaml providers | 未命名的 k8s/Docker 类似专用函数 | ❌ 完全不进入 |
+
+注意：`getDockerArguments()` 和 `getKubeConfig()` 在 servicesFromDocker/servicesFromKubernetes 被调用（服务端专用函数**只在服务端模块中使用在 Node.js 环境执行，从不在任何地方导入调用代码被打包到客户端 bundle。
 
 ---
 
-### 总结：`__NEXT_DATA__` 中到底包含什么、不包含什么
+### 总结：三类 URL 与凭证的去向对比
 
-| 数据 | 进入 fallback 前的处理 | 是否包含敏感信息 |
-|------|----------------------|:---:|
-| `fallback["/api/services"]` | `cleanServiceGroups` 的 widget 白名单解构 + calendar integrations url 剥离 | ❌ 不含 url/username/password/apiKey |
-| `fallback["/api/widgets"]` | `cleanWidgetGroups` 的敏感字段黑名单删除 + url 按类型过滤 | ❌ 不含 username/password/key/apiKey；除 search/glances 外不含 url |
-| `fallback["/api/bookmarks"]` | YAML 原样展开，无凭证字段 | ⚠️ 书签 URL 可能暴露内网拓扑 |
-| `initialSettings` | `providers` 解构排除 | ❌ 不含 Docker/K8s/Proxmox 连接凭证 |
+| 类别 | 代表字段 | 清洗动作 | 最终去向 |
+|------|---------|---------|---------|
+| **第 1 类：服务卡片跳转 URL** | `href`、`ping`、`siteMonitor`、bookmark `href` | **不过滤 | ✅ 完整进入 `__NEXT_DATA__`，客户端 JSX 渲染 |
+| **第 2 类：Widget 私有地址与凭证** | widget `url`、`username`、`password`、`apiKey` | cleanServiceGroups 白名单解构 + cleanWidgetGroups 黑名单删除 | ❌ 不进入 fallback；服务端通过 `getServiceWidget` / `getPrivateWidgetOptions` 按需读取 |
+| **第 3 类：基础设施连接凭证** | settings.yaml `providers`、docker.yaml 连接参数 | `const { providers, ...settings }` 解构排除；专用函数独立读取 | ❌ 完全不进入任何面向客户端数据结构 |
 
-**因此，说"fallback 携带完整业务数据"不严谨。** 更准确的表述是：fallback 携带**展示层面的完整配置数据**（服务/书签名称、图标、描述、展示参数等），但**不含连接凭证、API key、目标服务 URL（少数白名单类型除外）**。真正的敏感凭证仅存在于服务端的 YAML 文件中，通过 `getPrivateWidgetOptions`、`getDockerArguments` 等服务端专用函数按需读取，从未进入客户端 bundle。
+**因此，说"fallback 携带完整业务数据"**确实不严谨。**更准确的分层：**：
+- **暴露的**：服务卡片的跳转链接（href/ping/siteMonitor）、书签链接、图标、描述、权重、布局、主题、主题配置（展示参数
+- **不暴露的**：Widget 的目标服务 URL、访问凭证、基础设施的连接信息
 
-**修正后的信息泄露边界：**
-
-攻击者通过 `GET /`（不经过中间件）可以获取：
-- ✅ 所有服务项的名称、图标、描述、权重、分组、widget 展示参数
-- ✅ 所有书签的名称、URL、图标、描述
-- ✅ 所有小部件的类型、展示参数（不含 url/username/password/key/apiKey）
-- ✅ 网站标题、布局、主题、颜色、背景图 URL、base 路径
-- ❌ 无法获取任何 API key、密码、用户名
-- ❌ 无法获取绝大部分 widget 的目标服务 URL
-- ❌ 无法获取 Docker/Kubernetes/Proxmox 的连接配置
-
-攻击者通过受中间件保护的 API 端点（Host 合法时）还能获取：
-- ✅ 实时状态数据（容器状态、系统指标、天气、下载进度等）
-- ✅ 自定义 CSS/JS 文件内容
-- ✅ 配置文件哈希、校验结果
-- ✅ 对内网主机发起 Ping 探测
-- ✅ 触发 ISR 重新验证
+内网拓扑泄露的风险主要来自**第 1 类 URL——服务卡片和书签的跳转地址，这是业务数据本身的性质决定的，不是清洗链路可以解决的。
 
 #### API Host 校验覆盖的四类端点
 
@@ -483,31 +503,48 @@ export default async function handler(req, res) {
 
 ---
 
-### 综合安全视角
+### 综合安全视角——三类 URL 与凭证的去向
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                          信息 / 能力获取路径                            │
-├──────────────────────────────────────┬───────────────────────────────┤
-│    GET / （不经过中间件，无条件）       │   /api/* （经过中间件 Host 校验）│
-├──────────────────────────────────────┼───────────────────────────────┤
-│ ✅ services 展示配置（经清洗）          │   A 类：冗余的配置展示            │
-│ ✅ bookmarks 展示配置                 │   B 类：基础设施实时状态 ✅        │
-│ ✅ widgets 展示配置（经清洗）           │   C 类：外部 API 代理 ✅          │
-│ ✅ initialSettings（providers 被排除） │   D 类：有副作用操作 ✅            │
-│ ❌ 任何 API key / 密码 / 连接凭证      │                                │
-│ ❌ 实时状态数据                        │                                │
-│ ❌ 触发 ISR / Ping 等操作              │                                │
-└──────────────────────────────────────┴───────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                           信息 / 能力获取路径                                       │
+├──────────────────────────────────────────┬───────────────────────────────────────┤
+│      GET / （不经过中间件，无条件）         │    /api/* （经过中间件 Host 校验）     │
+├──────────────────────────────────────────┼───────────────────────────────────────┤
+│ ┌─ 第 1 类：跳转展示 URL ─┐                │                                       │
+│ │ ✅ service.href 卡片跳转 │                │                                       │
+│ │ ✅ service.ping 探测地址 │                │                                       │
+│ │ ✅ service.siteMonitor   │                │                                       │
+│ │ ✅ bookmark.href 书签 URL │                │ A 类：配置展示端点（冗余保护）          │
+│ └─────────────────────────┘                │                                       │
+│                                           │ B 类：实时状态端点 ✅ 核心保护          │
+│ ┌─ 第 2 类：Widget 私有字段 ─┐              │ C 类：外部请求代理 ✅ 防 SSRF/盗用     │
+│ │ ❌ widget.url              │              │ D 类：有副作用端点 ✅ 防滥用            │
+│ │ ❌ widget.username         │              │                                       │
+│ │ ❌ widget.password         │              │                                       │
+│ │ ❌ widget.apiKey           │              │                                       │
+│ │   （仅服务端通过            │              │                                       │
+│ │    getServiceWidget 读取） │              │                                       │
+│ └───────────────────────────┘              │                                       │
+│                                           │                                       │
+│ ┌─ 第 3 类：基础设施连接凭证 ─┐             │                                       │
+│ │ ❌ settings.providers       │              │                                       │
+│ │ ❌ docker.yaml 连接参数     │              │                                       │
+│ │ ❌ kubeconfig 凭证          │              │                                       │
+│ │   （仅服务端专用函数读取）  │              │                                       │
+│ └───────────────────────────┘              │                                       │
+└──────────────────────────────────────────┴───────────────────────────────────────┘
 ```
 
-**结论修正：**
+**修正后的最终结论：**
 
-1. 不能说"`GET /` 返回 HTML + 完整业务数据"——更准确的说法是：**`GET /` 返回 HTML + 经白名单过滤的展示配置数据**。连接凭证、API key、目标服务 URL（除少数白名单类型）从未进入 `__NEXT_DATA__`。
+1. 不能说"`GET /` 返回完整业务数据"——准确的说法是：**`GET /` 返回 HTML + 经白名单过滤的展示配置数据，其中包含服务卡片和书签的跳转 URL（可能泄露内网拓扑），但不含 Widget 的目标服务地址、不含 API key/密码/基础设施连接凭证**。
 
-2. 不能说"中间件只保护实时数据和副作用"——**中间件同时保护实时状态类端点（B）、外部请求代理类端点（C，防 SSRF + 防盗用）和有副作用端点（D）**。只有配置展示类端点（A）的保护是冗余的。
+2. 不能说"中间件只保护实时数据和副作用"——**中间件同时保护：(B) 实时状态端点（需要 widget 私有字段才能访问目标服务 API）；(C) 外部请求代理端点（防止 SSRF 和 API key 被盗用）；(D) 有副作用端点（防止 ISR 滥用、内网 Ping 扫描）**。只有配置展示类端点 (A) 的保护是冗余的。
 
-3. 对于 bookmarks URL 可能暴露内网拓扑的问题，这属于**业务数据本身的敏感性**，不是中间件或清洗链路能解决的。在敏感场景下需要额外的访问控制层。
+3. 对第 1 类 URL（跳转地址）和第 3 类凭证（连接信息）分别适用完全不同的防护策略：
+   - **第 1 类 URL（卡片/书签跳转）**：是业务展示必须的字段，**清洗链路不做过滤**。敏感场景需在反向代理层做访问控制，或在 services.yaml/bookmarks.yaml 中避免写入真实内网 IP（改用 DNS + 内网 DNS 解析）。
+   - **第 2/3 类凭证**：**清洗链路完整过滤**，通过服务端代理模式保证只在 Node.js 环境读取，中间件保护代理端点不被滥用。
 
 ### 1.3 动态路由解析
 
@@ -1233,18 +1270,21 @@ res.revalidate("/") 触发 ISR 重新生成
 window.location.reload() 全量刷新页面（获取新的 __NEXT_DATA__）
 ```
 
-### 7.4 攻击者视角——数据获取路径对比
+### 7.4 攻击者视角——三类 URL 与凭证的获取路径
 
 ```
 路径 A：GET / （不经过中间件）
     → HTML 源码 → __NEXT_DATA__
-    → ✅ services 展示配置（经 cleanServiceGroups 脱敏，无 url/username/password/apiKey）
-    → ✅ bookmarks 展示配置（含 URL，可能暴露内网拓扑）
-    → ✅ widgets 展示配置（经 cleanWidgetGroups 脱敏）
-    → ✅ initialSettings（providers 被排除）
-    → ❌ 任何凭证（apiKey/password/username/连接信息）
-    → ❌ 实时状态数据
-    → ❌ 触发副作用操作
+    → 第 1 类 URL ✅：
+        · service.href / service.ping / service.siteMonitor（卡片跳转/健康检查地址）
+        · bookmark.href（书签跳转地址）
+        · 所有卡片的 icon / description / server / container / namespace（展示信息）
+        · initialSettings（layout/theme/background，providers 已被解构排除）
+    → 第 2 类 Widget 凭证 ❌：（经 cleanServiceGroups / cleanWidgetGroups 过滤）
+        · widget.url / username / password / apiKey 均不存在
+    → 第 3 类基础设施凭证 ❌：
+        · settings.providers 已排除
+        · docker.yaml / kubeconfig 从不进入 fallback
 
 路径 B：GET /api/services （经过中间件，A 类配置展示）
     → Host 校验 → 失败则 400
@@ -1252,13 +1292,13 @@ window.location.reload() 全量刷新页面（获取新的 __NEXT_DATA__）
 
 路径 C：GET /api/services/proxy?... （经过中间件，B 类实时状态）
     → Host 校验 → 失败则 400
-    → 成功则服务端取完整配置（getServiceWidget 含 url/password）→ 代发请求 → 返回实时数据
-    → 这是中间件真正保护的核心价值点
+    → 成功则服务端取完整配置（getServiceWidget 含 url/password）
+    → 代发请求到目标服务 → 返回实时数据
 
 路径 D：GET /api/widgets/weather?index=0 （经过中间件，C 类外部请求代理）
     → Host 校验 → 失败则 400
-    → 成功则服务端取 apiKey（getPrivateWidgetOptions）→ 代发请求到第三方 API
-    → 防止 SSRF 和 API key 盗用
+    → 成功则服务端取 apiKey（getPrivateWidgetOptions）
+    → 代发请求到第三方 API → 返回结果
 
 路径 E：GET /api/revalidate （经过中间件，D 类有副作用）
     → Host 校验 → 失败则 400
@@ -1266,10 +1306,10 @@ window.location.reload() 全量刷新页面（获取新的 __NEXT_DATA__）
 ```
 
 **总结：**
-- 对配置展示数据（A 类）：`GET /` 是无保护的泄露通道，中间件保护 `/api/services` 等端点只是"防君子不防小人"
-- 对实时状态数据（B 类）：中间件是唯一屏障，防止攻击者遍历内网基础设施
-- 对外部请求代理（C 类）：中间件防止 SSRF 和 API key 配额盗用
-- 对有副作用操作（D 类）：中间件防止资源滥用（ISR 重建、Ping 扫描）
+- 对**第 1 类 URL（卡片/书签跳转）**：`GET /` 是无保护的泄露通道，中间件对此无能为力
+- 对**第 2 类 Widget 凭证（url/username/password/apiKey）**：清洗链路保证不进入 fallback，中间件保护使用这些凭证的代理端点
+- 对**第 3 类基础设施凭证（providers/docker/kubeconfig）**：解构排除 + 服务端专用函数双重保证，从不进入任何客户端数据结构
+- 中间件的真正价值：保护 **B 类实时状态端点**（防内网探测）、**C 类外部代理端点**（防 SSRF + 防盗用）、**D 类有副作用端点**（防滥用）
 
 ---
 
