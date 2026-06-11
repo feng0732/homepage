@@ -67,11 +67,12 @@ item.jsx (服务项组件)
 - **使用库**: `@kubernetes/client-node`
 - **采集逻辑**:
   - 查询指定 namespace 下匹配 label 的 Pods
-  - 判断所有/部分 Pod 是否处于 Running 或 Succeeded 状态
-- **状态映射**:
-  - 所有 Ready → `running`
-  - 部分 Ready → `partial`
-  - 无 Ready → `down`
+  - 根据 `pod.status.phase` 判断所有/部分 Pod 是否处于 `Running` 或 `Succeeded` 阶段
+  - ⚠️ 注意：判断依据是 Pod Phase 而非 Ready 条件，详见第六章 6.1 节
+- **状态映射**（基于 Pod Phase）:
+  - 所有 Pod phase ∈ [`Running`, `Succeeded`] → `running`
+  - 部分 Pod phase ∈ [`Running`, `Succeeded`] → `partial`
+  - 无 Pod 满足 → `down`
   - 无 Pod → `not found`
 
 ### 2.5 Proxmox 虚拟机状态采集
@@ -254,7 +255,132 @@ export default function useWidgetAPI(widget, ...options) {
 
 ---
 
-## 六、完整调用链路示例
+## 六、代码理解易误判点澄清
+
+### 6.1 Kubernetes 状态判断：基于 Pod Phase 而非 Ready 条件
+
+**容易误判之处**: 变量名 `someReady` / `allReady` 暗示检查的是 Pod 的 Ready 条件，但实际检查的是 **Pod Phase**。
+
+**API 端点核心代码**（[kubernetes/status/[...service].js#L53-L60](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/pages/api/kubernetes/status/[...service].js#L53-L60)）:
+
+```javascript
+const someReady = pods.find((pod) => ["Succeeded", "Running"].includes(pod.status.phase));
+const allReady = pods.every((pod) => ["Succeeded", "Running"].includes(pod.status.phase));
+```
+
+**实际判断依据是 `pod.status.phase`**，而非 `pod.status.conditions` 中的 Ready 条件。
+
+**两者的关键区别**:
+
+| 判断维度 | Pod Phase | Ready 条件 |
+|---------|-----------|-----------|
+| 字段路径 | `pod.status.phase` | `pod.status.conditions[type="Ready"].status` |
+| Running 含义 | 容器已创建且至少一个正在运行 | 容器正在运行 **且** 通过了就绪探针和启动探针 |
+| 典型误判场景 | Pod phase=Running 但 Ready=false（正在启动、健康检查未通过） | 不会出现此误判 |
+| Succeeded 含义 | 容器成功执行完毕（CronJob 等一次性任务） | N/A（Succeeded Pod 通常 Ready=false） |
+
+**影响**: 一个 Pod 可能 `phase=Running`（状态指示器显示绿色 running）但 `Ready=false`（实际尚未就绪、无法接收流量）。这意味着 Kubernetes 状态指示器在 Pod 启动过程中可能过早地显示"正常"。
+
+**前端组件额外说明**（[kubernetes-status.jsx#L18-L21](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/components/services/kubernetes-status.jsx#L18-L21)）:
+
+```javascript
+if (data.status === "running") {
+  statusTitle = data.health ?? data.status;
+  statusLabel = statusTitle;
+  colorClass = "text-emerald-500/80";
+}
+```
+
+前端组件在 `data.status === "running"` 时会尝试读取 `data.health`，但当前后端 API **并未返回 `health` 字段**，因此 `data.health` 始终为 `undefined`，`statusTitle` 退化为显示原始的 `"running"` 字符串。这不像 Docker 状态组件那样有 healthy/starting/unhealthy 的细分。
+
+---
+
+### 6.2 状态指示器刷新与普通服务小组件刷新的区别
+
+在 [item.jsx](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/components/services/item.jsx) 中，每个服务卡片同时包含两类组件，它们的刷新机制**完全独立**：
+
+#### 两类组件对比
+
+| 维度 | 状态指示器组件 | 展开面板 Widget 组件 |
+|------|--------------|-------------------|
+| **所在位置** | 卡片右上角（始终可见） | 卡片下方（需点击展开） |
+| **Docker** | `<Status />` | `<Docker />` |
+| **Kubernetes** | `<KubernetesStatus />` | `<Kubernetes />` |
+| **Proxmox** | `<ProxmoxStatus />` | `<ProxmoxVM />` |
+| **Ping / SiteMonitor** | `<Ping />` / `<SiteMonitor />` | 无对应 widget |
+| **useSWR 调用方式** | 直接调用 `useSWR(url)` | 直接调用 `useSWR(url)` |
+| **refreshInterval** | Ping/SiteMonitor: 30s; 其他: 无 | Docker/K8s/Proxmox: 无 |
+
+#### SWR 缓存共享机制
+
+状态指示器与展开面板 widget 对同一服务使用**完全相同的 SWR URL key**：
+
+| 类型 | 状态指示器 URL | Widget URL | 是否共享缓存 |
+|------|--------------|-----------|------------|
+| Docker | `/api/docker/status/{container}/{server}` | `/api/docker/status/{container}/{server}` | ✅ 共享 |
+| Kubernetes | `/api/kubernetes/status/{ns}/{app}?podSelector=` | `/api/kubernetes/status/{ns}/{app}?podSelector=` | ✅ 共享 |
+| Proxmox | `/api/proxmox/stats/{node}/{vmid}?type=` | `/api/proxmox/stats/{node}/{vmid}?type=` | ✅ 共享 |
+
+SWR 以 URL 为缓存 key，相同 URL 的请求会共享同一条缓存数据。这意味着：
+- 状态指示器首次挂载时发起请求，widget 展开时**不会重复请求**，直接复用缓存
+- 任何一方触发重新验证（如窗口聚焦），另一方也会同步更新
+- 但两者都没有设置 `refreshInterval`，因此**日常运行中不会主动刷新**
+
+#### useWidgetAPI 与直接 useSWR 的区别
+
+普通 widget 组件（如 glances、customapi 等）通过 [useWidgetAPI](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/utils/proxy/use-widget-api.js) 封装调用，支持通过配置传入 `refreshInterval`：
+
+```javascript
+// useWidgetAPI 支持从 widget 配置读取 refreshInterval
+if (options && options[1]?.refreshInterval) {
+  config.refreshInterval = options[1].refreshInterval;
+}
+```
+
+而**所有状态指示器组件都直接使用 `useSWR`**，不经过 `useWidgetAPI` 封装，因此：
+- 状态指示器的 `refreshInterval` 是**硬编码**的（Ping/SiteMonitor 各 30s）
+- 其他状态指示器（Docker/K8s/Proxmox）**无法通过配置设置刷新间隔**
+- Docker/K8s/Proxmox widget 同样直接使用 `useSWR`，也不支持配置 `refreshInterval`
+
+---
+
+### 6.3 不同指示器缺乏统一周期刷新的影响
+
+#### 现状总结
+
+| 指示器类型 | refreshInterval | 刷新触发方式 | 数据时效性 |
+|-----------|----------------|------------|-----------|
+| Ping | 30s | 自动周期刷新 + 窗口聚焦 | ✅ 较好 |
+| Site Monitor | 30s | 自动周期刷新 + 窗口聚焦 | ✅ 较好 |
+| Docker Status | 无 | 仅窗口聚焦/网络恢复/首次挂载 | ⚠️ 依赖用户行为 |
+| Kubernetes Status | 无 | 仅窗口聚焦/网络恢复/首次挂载 | ⚠️ 依赖用户行为 |
+| Proxmox Status | 无 | 仅窗口聚焦/网络恢复/首次挂载 | ⚠️ 依赖用户行为 |
+
+#### 具体影响
+
+**1. Docker/K8s/Proxmox 状态可能长时间不更新**
+
+用户打开页面后，如果不切换标签页再切回来（触发窗口聚焦重验证），Docker/K8s/Proxmox 的状态指示器将一直显示首次挂载时的数据。一个容器从 running 变为 exited 后，指示器可能仍显示绿色。
+
+**2. 同一页面不同类型指示器状态更新频率不一致**
+
+如果服务同时配置了 `ping` 和 `container`，Ping 指示器每 30 秒自动刷新，而 Docker 状态指示器不会。用户可能看到 Ping 显示 up（绿色）但 Docker 状态指示器仍显示旧状态，造成混淆。
+
+**3. SWR 缓存共享带来的"虚假及时性"**
+
+虽然 Docker 状态指示器自身没有 `refreshInterval`，但它与 Docker widget（展开面板）共享 SWR 缓存。如果用户点击展开面板触发了 Docker widget 的渲染，widget 也会发起相同的 `useSWR` 请求。但由于两者都没有 `refreshInterval`，展开操作只会让 SWR 执行一次 stale-while-revalidate，不会建立持续刷新。
+
+**4. Ping/SiteMonitor 始终占用网络资源**
+
+Ping 和 Site Monitor 设置了 30 秒的 `refreshInterval`，即使用户长时间不操作页面，这两个组件也会持续发送请求。对于配置了大量 ping/siteMonitor 服务的页面，这会带来持续的 API 调用开销。
+
+**5. 窗口聚焦重验证的非确定性**
+
+Docker/K8s/Proxmox 的刷新依赖 SWR 的 `revalidateOnFocus` 默认行为。但用户切换标签页再切回的时机不可预测，无法保证状态数据在任何确定的时间窗口内更新。如果用户长时间在同一标签页操作（如编辑配置），状态指示器可能永远不刷新。
+
+---
+
+## 七、完整调用链路示例
 
 以 Ping 状态指示器为例：
 
