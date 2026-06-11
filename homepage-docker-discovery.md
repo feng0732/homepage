@@ -1,7 +1,18 @@
 # Homepage 服务发现与 Docker 集成代码分析
 
 本文档基于源代码事实，深度剖析 Homepage 项目中「服务探测 → 数据整理 → 页面展示」的完整数据链路。
-重点聚焦：**布局分组空组展示的精确边界** 和 **Kubernetes 资源错误降级的完整路径**。
+重点聚焦：**布局分组空组展示的精确边界** 和 **Kubernetes 接口错误从后端到前端组件的完整传播路径**。
+
+---
+
+## 核心发现摘要（本次最新修正）
+
+1. **SWR Fetcher 不检查 `res.ok`**：HTTP 4xx/5xx 的错误信息在 `data.error` 中，而非 `error` 对象中
+2. **K8s Component 缺失 `data.error` 检测**：API 返回 500 `{ error: "..." }` 时，不进 error 分支，而是显示 "offline" 或抛出 TypeError
+3. **K8s Status 徽章缺失 `data.error` 检测**：API 返回 500 时，显示灰色 "unknown"，而非红色 "error"
+4. **K8s Stats API 返回 `{ error: "..." }` 时，`statsData.stats` 为 undefined**，访问 `statsData.stats.cpuLimit` 会抛 TypeError（潜在 Bug）
+5. **Error 组件的 `error.data.error` 检查永远不命中**：fetcher 不构造这种结构
+6. **空组展示由 `pruneEmptyGroups()` 最终决定**：layout 定义的空组如果没有子组或服务，会被剪掉
 
 ---
 
@@ -61,7 +72,7 @@
 │    K8s Status:      /api/kubernetes/status/[ns]/[app]             │
 │    K8s Stats:       /api/kubernetes/stats/[ns]/[app]              │
 │                                                                    │
-│  ★ K8s 资源各级错误均有独立降级路径（见第三章详述）                │
+│  ★ K8s 接口错误传播路径已完全拆解（见第三章详述）                │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -420,7 +431,7 @@ Docker: 容器带 homepage.group=Infrastructure 有 1 个服务
 
 ---
 
-## 三、页面展示层 — 重点：Kubernetes 错误降级完整路径
+## 三、页面展示层 — 重点：Kubernetes 接口错误完整传播路径
 
 ### 3.1 首屏数据链路
 
@@ -428,7 +439,40 @@ Docker: 容器带 homepage.group=Infrastructure 有 1 个服务
 
 ---
 
-### 3.2 ★ Kubernetes 资源错误降级（完整路径追踪）
+### 3.2 ★ SWR Fetcher 的关键设计（最易误解的代码事实）
+
+**全局 fetcher 定义：** [index.jsx L186](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/index.jsx#L186) / [_app.jsx L77](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/_app.jsx#L77)
+
+```jsx
+<SWRConfig value={{
+  fallback,
+  fetcher: (resource, init) => fetch(resource, init).then((res) => res.json())
+}}>
+```
+
+**★ 代码事实**：fetcher **没有检查 `res.ok` 或 `res.status`**！
+
+这意味着：
+- **HTTP 2xx**：`res.json()` 正常解析 → `data` = 解析后的对象，`error` = undefined
+- **HTTP 4xx/5xx**：`res.json()` 仍会尝试解析 body → 只要是有效 JSON，`data` = 解析后的对象，`error` = undefined
+- **网络错误**（DNS 失败 / CORS / 网络断开）：`fetch()` reject → `error` = Error 对象，`data` = undefined
+- **JSON 解析失败**（body 不是有效 JSON）：`res.json()` reject → `error` = SyntaxError 对象，`data` = undefined
+
+**四种 HTTP 响应场景的 SWR 结果对照表：**
+
+| HTTP 状态 | JSON Body | `data` (SWR) | `error` (SWR) |
+|----------|-----------|-------------|--------------|
+| 200 | `{ status: "running" }` | `{ status: "running" }` | undefined |
+| 404 | `{ status: "not found" }` | `{ status: "not found" }` | undefined |
+| 500 | `{ error: "No kubernetes configuration" }` | `{ error: "No kubernetes configuration" }` | undefined |
+| 网络断开 | - | undefined | TypeError 对象 |
+
+> **这是之前分析最大的错误修正**：HTTP 4xx/5xx 的错误信息在 `data.error` 中，而不是 `error` 对象中！
+> `error` 对象只有在 fetch 本身失败（网络层）时才会被设置。
+
+---
+
+### 3.3 ★ Kubernetes 资源错误降级（完整路径追踪）
 
 K8s 的错误路径横跨三层：**发现层 → API 端点 → 渲染组件**，每层有独立的降级策略。
 
@@ -489,12 +533,12 @@ K8s 的错误路径横跨三层：**发现层 → API 端点 → 渲染组件**�
 
 #### 第二层：API 端点阶段（客户端按需请求）
 
-##### K8s 状态 API
+##### K8s 状态 API — HTTP 状态与 JSON 映射
 
 **文件：** [pages/api/kubernetes/status/[...service].js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/status/[...service].js)
 
-| 错误场景 | HTTP 状态 | 返回内容 | 代码位置 |
-|---------|----------|---------|---------|
+| 错误场景 | HTTP 状态 | JSON Body | 代码位置 |
+|---------|----------|-----------|---------|
 | 缺少 namespace/appName | 400 | `{ error: "kubernetes query parameters are required" }` | [L13-L17](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/status/[...service].js#L13-L17) |
 | getKubeConfig() 返回 null | 500 | `{ error: "No kubernetes configuration" }` | [L22-L26](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/status/[...service].js#L22-L26) |
 | listNamespacedPod 失败 | 500 | `{ error: "Error communicating with kubernetes" }` | [L34-L42](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/status/[...service].js#L34-L42) |
@@ -504,19 +548,18 @@ K8s 的错误路径横跨三层：**发现层 → API 端点 → 渲染组件**�
 | 无 Pod Ready | 200 | `{ status: "down" }` | [L55](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/status/[...service].js#L55) |
 | 未知异常 | 500 | `{ error: "unknown error" }` | [L64-L68](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/status/[...service].js#L64-L68) |
 
-##### K8s 统计 API
+##### K8s 统计 API — HTTP 状态与 JSON 映射
 
 **文件：** [pages/api/kubernetes/stats/[...service].js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/stats/[...service].js)
 
-| 错误场景 | HTTP 状态 | 返回内容 | 代码位置 |
-|---------|----------|---------|---------|
+| 错误场景 | HTTP 状态 | JSON Body | 代码位置 |
+|---------|----------|-----------|---------|
 | 缺少 namespace/appName | 400 | `{ error: "..." }` | [L14-L18](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/stats/[...service].js#L14-L18) |
 | getKubeConfig() 返回 null | 500 | `{ error: "No kubernetes configuration" }` | [L23-L27](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/stats/[...service].js#L23-L27) |
 | listNamespacedPod 失败 | 500 | `{ error: "Error communicating with kubernetes" }` | [L37-L45](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/stats/[...service].js#L37-L45) |
 | Pod 列表为空 | 404 | `{ error: "no pods found..." }` | [L49-L53](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/stats/[...service].js#L49-L53) |
-| getPodMetrics 失败 (404) | - | **静默降级**，namespaceMetrics = null | [L71-L80](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/stats/[...service].js#L71-L80) |
-| getPodMetrics 失败 (非 404) | - | logger.error + namespaceMetrics = null | [L76-L78](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/stats/[...service].js#L76-L78) |
-| namespaceMetrics 为 null | 200 | `{ stats: { cpu: 0, mem: 0, cpuLimit, memLimit, cpuUsage: 0, memUsage: 0 } }` | [L82-L101](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/stats/[...service].js#L82-L101) |
+| getPodMetrics 失败 (404) | 200 | `{ stats: { cpu: 0, mem: 0, cpuLimit, memLimit, cpuUsage: 0, memUsage: 0 } }` | [L71-L101](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/stats/[...service].js#L71-L101) |
+| getPodMetrics 失败 (非 404) | 200 | `{ stats: { cpu: 0, mem: 0, ... } }`（静默降级） | [L76-L78](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/stats/[...service].js#L76-L78) |
 | 未知异常 | 500 | `{ error: "unknown error" }` | [L104-L108](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/stats/[...service].js#L104-L108) |
 
 **★ 关键降级行为**：metrics-server 不可用时，stats API 仍返回 200，但 cpu/mem 值为 0。
@@ -524,50 +567,123 @@ K8s 的错误路径横跨三层：**发现层 → API 端点 → 渲染组件**�
 
 ---
 
-#### 第三层：渲染组件阶段
+#### 第三层：渲染组件阶段 — 完整传播路径
 
-##### K8s 组件渲染
+##### ★ K8s Stats API 错误 → K8s Component 的精确传播
 
-**文件：** [widgets/kubernetes/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/widgets/kubernetes/component.jsx)
+这是最复杂的路径。**后端 HTTP 状态 → SWR 结果 → 组件分支判断 → 最终展示** 五步走：
+
+| 后端场景 | HTTP 状态 | JSON Body | SWR `data` | SWR `error` | 进入哪个组件分支 | 最终展示 |
+|---------|----------|-----------|-----------|------------|----------------|---------|
+| **缺少参数** | 400 | `{ error: "..." }` | `{ error: "..." }` | undefined | `statsError` false<br>`statusData.status` 正常（假设 status API 正常）→ 不进 offline 分支<br>`statsData` 非空 → 不进骨架分支<br>`statsData.stats` = undefined<br>`statsData.stats.cpuLimit` → **抛出 TypeError** | React 渲染错误（可能被 ErrorBoundary 捕获） |
+| **无 K8s 配置** | 500 | `{ error: "No kubernetes configuration" }` | `{ error: "..." }` | undefined | 同上 → **TypeError** | 同上 |
+| **Pod 不存在** | 404 | `{ error: "no pods found..." }` | `{ error: "..." }` | undefined | 同上 → **TypeError** | 同上 |
+| **metrics 不可用** | 200 | `{ stats: { cpu:0, mem:0, ... } }` | `{ stats: { cpu:0, mem:0, ... } }` | undefined | 正常渲染分支 | 显示 **0% CPU / 0 bytes**（静默降级） |
+| **正常** | 200 | `{ stats: { cpu, mem, ... } }` | `{ stats: { cpu, mem, ... } }` | undefined | 正常渲染分支 | 正常显示指标 |
+| **网络断开** | - | - | undefined | TypeError 对象 | `if (statsError)` → 进入 error 分支 | Container → Error 组件（或 hideErrors → null） |
+| **JSON 解析失败** | 200（无效 JSON） | `<html>...</html>` | undefined | SyntaxError 对象 | `if (statsError)` → 进入 error 分支 | Container → Error 组件 |
+
+**代码逐行验证：** [widgets/kubernetes/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/widgets/kubernetes/component.jsx)
 
 ```jsx
-// L19-L21: API 请求本身失败（网络/500）
+// L11-L17: 发起 SWR 请求
+const { data: statusData, error: statusError } = useSWR(`/api/kubernetes/status/...`);
+const { data: statsData, error: statsError } = useSWR(`/api/kubernetes/stats/...`);
+
+// L19-L21: 只检测 SWR error（网络级失败）
+// ★ 注意：statsData.error（业务级错误）完全不检测！
 if (statsError || statusError) {
   return <Container service={service} error={statsError ?? statusError ?? statusData} />;
 }
 
-// L23-L32: 状态不是 running/partial（如 down/not found/error）
+// L23-L32: 检测 statusData.status 不是 running/partial
+// 当 status API 返回 500 { error: "..." } 时：
+//   statusData = { error: "..." }, statusData.status = undefined
+//   !undefined = true → 进入此分支，显示 "offline"
 if (statusData && (!statusData.status || 
     !(statusData.status.includes("running") || statusData.status.includes("partial")))) {
   return <Container><Block label="widget.status" value="docker.offline" /></Container>;
 }
 
-// L34-L41: 数据仍在加载（SWR 首次请求中）
+// L34-L41: 数据仍在加载
 if (!statsData || !statusData) {
   return <Container service={service}>
-    <Block label="docker.cpu" />    // 骨架：只有 label 无 value
+    <Block label="docker.cpu" />
     <Block label="docker.mem" />
   </Container>;
 }
 
 // L43-L64: 正常渲染
+// 当 stats API 返回 500 { error: "..." } 时：
+//   statsData = { error: "..." }, statsData.stats = undefined
+//   statsData.stats.cpuLimit → 抛出 TypeError！
+return (
+  <Container service={service}>
+    {(statsData.stats.cpuLimit && (...)) || (
+      <Block ... value={statsData.stats.cpu} />
+    )}
+    <Block ... value={statsData.stats.mem} />
+  </Container>
+);
 ```
 
-**Docker 组件对比**（多一层错误检测）：
+##### ★ K8s Status API 错误 → K8s Component 的精确传播
 
-**文件：** [widgets/docker/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/widgets/docker/component.jsx)
+| 后端场景 | HTTP 状态 | JSON Body | SWR `data` | SWR `error` | 进入哪个组件分支 | 最终展示 |
+|---------|----------|-----------|-----------|------------|----------------|---------|
+| **缺少参数** | 400 | `{ error: "..." }` | `{ error: "..." }` | undefined | `statusError` false<br>`statusData.status` = undefined → 进入 offline 分支 | "offline" 状态 Block |
+| **无 K8s 配置** | 500 | `{ error: "No kubernetes configuration" }` | `{ error: "..." }` | undefined | 同上 → offline 分支 | "offline" 状态 Block |
+| **Pod 不存在** | 404 | `{ status: "not found" }` | `{ status: "not found" }` | undefined | `statusData.status = "not found"` → 不含 "running" → offline 分支 | "offline" 状态 Block |
+| **无 Pod Ready** | 200 | `{ status: "down" }` | `{ status: "down" }` | undefined | 同上 → offline 分支 | "offline" 状态 Block |
+| **正常** | 200 | `{ status: "running" }` | `{ status: "running" }` | undefined | 正常渲染分支 | 正常显示指标 |
+| **网络断开** | - | - | undefined | TypeError 对象 | `if (statusError)` → error 分支 | Container → Error 组件 |
+
+> **关键发现**：K8s Status API 返回 4xx/5xx `{ error: "..." }` 时，K8s Component **不进 error 分支**，而是显示 **"offline"**！
+> 因为它只检查 `statusError`（SWR error 对象），不检查 `statusData.error`（JSON body 中的 error 字段）。
+
+##### Docker 组件对比（多一层检测）
+
+**文件：** [widgets/docker/component.jsx L19](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/widgets/docker/component.jsx#L19)
 
 ```jsx
-// L19: Docker 比 K8s 多检测 statsData?.error 和 statusData?.error
+// ★ Docker 比 K8s 多检测 statsData?.error 和 statusData?.error（业务级错误）
 if (statsError || statsData?.error || statusError || statusData?.error) {
-  // statsData.error = "not found" 等业务错误也会触发
   return <Container service={service} error={finalError} />;
 }
 ```
 
-> **差异**：Docker 组件检测了 `statsData.error` / `statusData.error`（API 返回 200 但 body 含 error 字段），
-> 而 K8s 组件只检测 SWR 的 `error` 对象（请求级别失败）。
-> 这意味着 K8s stats API 返回 `{ stats: { cpu: 0, mem: 0 } }` 时，K8s 组件**不会**进入错误分支。
+| 对比项 | K8s Component | Docker Component |
+|--------|--------------|-----------------|
+| 检测 `error` (SWR 网络级) | ✅ | ✅ |
+| 检测 `data.error` (业务级) | ❌ | ✅ |
+| API 返回 500 `{ error: "..." }` 时 | 显示 "offline" 或抛 TypeError | 显示 Error 组件 |
+
+##### K8s Status 徽章组件的传播路径
+
+**文件：** [kubernetes-status.jsx](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/components/services/kubernetes-status.jsx)
+
+| 后端场景 | JSON Body | `data` | `error` | 状态文本 | 颜色 |
+|---------|-----------|--------|---------|---------|------|
+| **缺少参数/配置** | `{ error: "..." }` | `{ error: "..." }` | undefined | `docker.unknown` | 灰色 |
+| **Pod 不存在** | `{ status: "not found" }` | `{ status: "not found" }` | undefined | `not found` | 橙色 |
+| **无 Pod Ready** | `{ status: "down" }` | `{ status: "down" }` | undefined | `down` | 橙色 |
+| **部分 Ready** | `{ status: "partial" }` | `{ status: "partial" }` | undefined | `partial` | 橙色 |
+| **正常** | `{ status: "running" }` | `{ status: "running" }` | undefined | `running` | 绿色 |
+| **网络断开** | - | undefined | TypeError | `docker.error` | 红色 |
+
+**代码逻辑：**
+```jsx
+if (error) {                  // 只有网络错误才进这里
+  statusLabel = t("docker.error");
+  colorClass = "text-rose-500/80";
+} else if (data) {
+  if (data.status === "running") { /* 绿色 */ }
+  if (data.status === "not found" || data.status === "down" || data.status === "partial") { /* 橙色 */ }
+  // ★ data.error 场景：data.status = undefined → 两个 if 都不进，保持默认 "unknown" 灰色
+}
+```
+
+> **关键发现**：K8s Status API 返回 4xx/5xx `{ error: "..." }` 时，徽章显示 **灰色 "unknown"**，而不是红色 "error"！
 
 ##### Container 错误展示组件
 
@@ -591,13 +707,23 @@ if (error) {
 
 **文件：** [widget/error.jsx](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/components/services/widget/error.jsx)
 
+```jsx
+// L21-L23: 解包 error.data.error
+// ★ 代码事实：error.data.error 永远不存在！
+// 因为本项目的 fetcher 没有构造这种结构。只有自定义 fetcher 手动 throw { data: ... } 才会有。
+if (error?.data?.error) {
+  error = error.data.error;
+}
+```
+
+**显示内容：**
 - 渲染为可展开的 `<details>` 元素
 - 显示 API error message、请求 URL、raw error、response data
-- 错误对象会被归一化：string → `{ message }`, number → `{ message: "Error N" }`, `{ data: { error } }` → 解包
+- 错误对象归一化：string → `{ message }`, number → `{ message: "Error N" }`
 
 ---
 
-### 3.3 ★ 错误降级全景决策树
+### 3.4 ★ 错误降级全景决策树（修正后）
 
 ```
 K8s 服务（从发现到展示）
@@ -621,50 +747,71 @@ K8s 服务（从发现到展示）
   │       → ★ 仅丢失 HTTPRoute 服务
   │
   ├─ API 端点阶段（客户端按需请求）
-  │   ├─ K8s Status API 500
-  │   │   → useSWR error 对象非空
-  │   │   → K8s Component 进入 error 分支
-  │   │   → Container → Error 组件（或 hideErrors → null）
   │   │
-  │   ├─ K8s Status API 404（Pod 不存在）
-  │   │   → statusData = { status: "not found" }
-  │   │   → "not found" 不含 "running"/"partial"
-  │   │   → ★ 显示 "offline" 状态
+  │   ├─ Status API 场景：
+  │   │   ├─ HTTP 4xx/5xx { error: "..." }
+  │   │   │   → data = { error: "..." }, error = undefined
+  │   │   │   → K8s Component: data.status undefined → offline 分支 → "offline"
+  │   │   │   → K8s Status 徽章: data.status undefined → 默认 → 灰色 "unknown"
+  │   │   │
+  │   │   ├─ HTTP 404 { status: "not found" }
+  │   │   │   → data = { status: "not found" }, error = undefined
+  │   │   │   → K8s Component: status 不含 "running" → offline 分支 → "offline"
+  │   │   │   → K8s Status 徽章: status="not found" → 橙色
+  │   │   │
+  │   │   ├─ 网络断开
+  │   │   │   → data = undefined, error = TypeError
+  │   │   │   → K8s Component: error 分支 → Container → Error 组件
+  │   │   │   → K8s Status 徽章: error 分支 → 红色 "error"
+  │   │   │
+  │   │   └─ 正常 → 显示 running/partial 状态
   │   │
-  │   ├─ K8s Stats API metrics 不可用
-  │   │   → statsData = { stats: { cpu:0, mem:0, ... } }
-  │   │   → ★ 正常渲染，显示 0% CPU / 0 bytes Mem（静默降级）
-  │   │
-  │   └─ K8s Stats API 404
-  │       → useSWR error 对象非空（HTTP 404）
-  │       → K8s Component 进入 error 分支
-  │       → Container → Error 组件
+  │   └─ Stats API 场景：
+  │       ├─ HTTP 4xx/5xx { error: "..." }
+  │       │   → data = { error: "..." }, error = undefined
+  │       │   → K8s Component: data.stats undefined → data.stats.cpuLimit 抛出 TypeError
+  │       │   → ★ React 渲染错误（潜在 Bug）
+  │       │
+  │       ├─ metrics-server 不可用
+  │       │   → data = { stats: { cpu:0, mem:0, ... } }, error = undefined
+  │       │   → 正常渲染，显示 0% CPU / 0 bytes（静默降级）
+  │       │
+  │       ├─ 网络断开
+  │       │   → data = undefined, error = TypeError
+  │       │   → error 分支 → Container → Error 组件
+  │       │
+  │       └─ 正常 → 显示 CPU / Mem 指标
   │
   └─ 渲染阶段
       ├─ error + hideErrors → 不渲染
       ├─ error + 不隐藏 → Error 详情组件
-      ├─ status=down → "offline"
+      ├─ status=down/not found/error(业务级) → "offline"
       ├─ status=running/partial → 显示指标
       └─ 数据加载中 → 骨架屏
 ```
 
 ---
 
-### 3.4 Docker 与 K8s 错误处理对比
+### 3.5 Docker 与 K8s 错误处理对比（修正后）
 
 | 对比维度 | Docker | Kubernetes |
 |---------|--------|-----------|
-| **发现阶段** | 单服务器失败 → 该服务器返回 []，其他服务器不受影响 | 三类资源并行，一类失败不影响其他 |
-| **API error 检测** | 检测 `statsData?.error` 和 `statusData?.error`（业务级） | 仅检测 SWR error（请求级） |
-| **metrics 不可用** | 不适用（Docker stats 直连） | 静默返回 0 值，前端正常渲染 |
-| **容器/Pod 不存在** | API 返回 `{ status: "not found" }` | API 返回 404 `{ status: "not found" }` |
+| **SWR fetcher** | 共享全局 fetcher，**不检查 `res.ok`** | 同 |
+| **HTTP 4xx/5xx → SWR** | `data.error` 有值，`error` = undefined | 同 |
+| **API error 检测** | ✅ 检测 `statsData?.error` + `statusData?.error`（业务级） | ❌ 仅检测 `error`（网络级），不检测 `data.error` |
+| **API 返回 500 `{ error: "..." }`** | 进入 error 分支 → Error 组件 | K8s Component: offline 分支（status API）/ TypeError（stats API）<br>K8s Status 徽章: 灰色 "unknown" |
+| **发现阶段容错** | 单服务器失败 → 该服务器返回 []，不影响其他 | 三类资源并行，一类失败不影响其他 |
+| **metrics 不可用** | 不适用（Docker stats 直连） | ✅ 静默返回 0 值，前端显示 0% CPU / 0 bytes |
+| **容器/Pod 不存在** | API 返回 `{ status: "not found" }` → offline | API 返回 404 `{ status: "not found" }` → offline |
 | **offline 判断** | status 不含 "running"/"partial" | 同 |
 | **骨架屏 Block 数** | 4 个（CPU/Mem/RX/TX） | 2 个（CPU/Mem） |
 | **错误隐藏** | `hideErrors` 或 `widget.hide_errors` | 同 |
+| **`error.data.error` 检查** | - | Error 组件有此检查，但 **永远不会命中**（fetcher 不构造此结构） |
+| **潜在 Bug** | - | K8s Component stats API 返回 `{ error: "..." }` 时 → `statsData.stats.cpuLimit` 抛 **TypeError** |
 
 ---
 
-### 3.5 组件层级结构
+### 3.6 组件层级结构
 
 ```
 pages/index.jsx (Home 组件)
@@ -695,7 +842,7 @@ pages/index.jsx (Home 组件)
 
 ---
 
-## 四、完整数据流时序图（含错误路径）
+## 四、完整数据流时序图（含错误路径精确标注）
 
 ```
 ┌───────────────┐
@@ -725,20 +872,29 @@ pages/index.jsx (Home 组件)
                 ▼
         ServicesGroup 渲染
         └─ Item
-            ├─ Status 徽章
-            │  └─ useSWR(/api/.../status)
-            │       ├─ 200 → 显示状态标签
-            │       ├─ 404 → "not found" / "offline"
-            │       └─ 500 → error 组件
+            ├─ KubernetesStatus 徽章
+            │  └─ useSWR(/api/kubernetes/status)
+            │       ├─ HTTP 200 { status: "running" } → 绿色 running
+            │       ├─ HTTP 4xx/5xx { error: "..." } → data.error 有值
+            │       │   → data.status = undefined → 灰色 unknown
+            │       ├─ HTTP 404 { status: "not found" } → 橙色 not found
+            │       ├─ 网络断开 → error 对象 → 红色 error
+            │       └─ JSON 解析失败 → error 对象 → 红色 error
             │
             └─ Stats 展开
-               └─ Component
-                  ├─ useSWR(/api/.../stats)
-                  │   ├─ 200 + 数据 → 渲染指标
-                  │   ├─ 200 + 零值 → ★ 静默降级（K8s metrics 不可用）
-                  │   ├─ 404 → error 组件
-                  │   └─ 500 → error 组件
-                  └─ error + hideErrors → null
+               └─ K8s Component
+                  ├─ useSWR(/api/kubernetes/status)
+                  │  ├─ HTTP 4xx/5xx { error } → statusData.status undefined → offline
+                  │  └─ 网络断开 → error 对象 → Container → Error 组件
+                  │
+                  └─ useSWR(/api/kubernetes/stats)
+                     ├─ HTTP 200 { stats: { cpu, mem, ... } } → 正常渲染
+                     ├─ HTTP 200 { stats: { cpu:0, mem:0 } } → 0% CPU / 0 bytes（静默降级）
+                     ├─ HTTP 4xx/5xx { error } → data.error 有值
+                     │   → data.stats undefined
+                     │   → data.stats.cpuLimit → TypeError（潜在 Bug）
+                     ├─ 网络断开 → error 对象 → Container → Error 组件
+                     └─ error + hideErrors → null
 ```
 
 ---
@@ -753,30 +909,52 @@ pages/index.jsx (Home 组件)
 - 只有子组中有服务时，父空组才会存活
 - 渲染层：services=[] 的组会渲染空 `<ul>`，但不会报错
 
-### 5.2 K8s 错误的分层降级
+### 5.2 ★ SWR Fetcher 设计（最关键的代码事实）
+
+- **全局 fetcher 不检查 `res.ok` 或 `res.status`**
+- HTTP 4xx/5xx 的错误在 `data.error` 中，而不是 `error` 对象中
+- `error` 对象只有在 **fetch 网络失败** 或 **JSON 解析失败** 时才会被设置
+- 这是整个错误传播路径的**根基**，影响所有组件的判断逻辑
+
+### 5.3 ★ K8s 组件的三层错误检测缺失
+
+1. **业务级错误检测缺失**：K8s Component 不检测 `data.error`，只检测 `error`
+   - Status API 返回 4xx/5xx → 显示 "offline" 而非错误
+   - Stats API 返回 4xx/5xx → 抛出 TypeError（潜在 Bug）
+
+2. **Status 徽章业务级错误检测缺失**：`data.error` 场景下 `data.status` = undefined → 显示灰色 "unknown"
+
+3. **`error.data.error` 检查永远不命中**：Error 组件有此代码，但 fetcher 不构造这种结构
+
+### 5.4 K8s 错误的分层降级
 
 | 层级 | 粒度 | 降级策略 |
 |-----|------|---------|
 | 整体发现 | K8s 全局 | 抛异常 → servicesResponse catch → [] |
 | 资源类型 | Ingress / Traefik / HTTPRoute | 各自 catch → []，互不影响 |
 | Namespace | HTTPRoute 的 namespace | 单个 namespace 失败 → filter 掉 null |
-| API 请求 | Status / Stats | 500 → error 组件；404 → offline |
-| Metrics | K8s Stats | metrics-server 不可用 → 返回 0 值（静默降级） |
+| API 请求（Status） | 4xx/5xx `{ error }` | data.error 有值，error 无值 → 显示 offline / unknown |
+| API 请求（Status） | 网络断开 | error 有值 → 显示红色 error |
+| API 请求（Stats） | 4xx/5xx `{ error }` | data.error 有值，error 无值 → 抛 TypeError（潜在 Bug） |
+| API 请求（Stats） | metrics 不可用 | 返回 `{ stats: { cpu:0, mem:0 } }` → 显示 0 值（静默降级） |
+| API 请求（Stats） | 网络断开 | error 有值 → Error 组件 |
 | 渲染 | Container | hideErrors → null；否则 → Error 详情 |
 
-### 5.3 Docker 错误与 K8s 的差异
+### 5.5 Docker 与 K8s 错误处理的关键差异
 
-- Docker 组件额外检测 `statsData?.error`（API 返回 200 但 body 含 error）
-- K8s metrics 不可用时**静默降级为 0 值**，Docker 不存在此场景
-- Docker 单服务器失败不影响其他服务器；K8s 单资源类型失败不影响其他类型
+| 差异点 | Docker | Kubernetes |
+|--------|--------|-----------|
+| `data.error` 检测 | ✅ 检测 `statsData?.error` + `statusData?.error` | ❌ 不检测 |
+| API 返回 500 `{ error }` | 进入 error 分支 → Error 组件 | Status: offline / unknown<br>Stats: 抛 TypeError |
+| 静默降级场景 | 无 | metrics-server 不可用 → 0 值显示 |
 
-### 5.4 安全设计
+### 5.6 安全设计
 
 - Widget 字段白名单：`cleanServiceGroups()` 解构赋值过滤
 - shvl 原型污染防护：拦截 `__proto__` / `constructor` / `prototype`
 - 环境变量替换白名单：仅 `HOMEPAGE_VAR_` 和 `HOMEPAGE_FILE_` 前缀
 
-### 5.5 性能优化
+### 5.7 性能优化
 
 - SSR 预取 + SWR fallback：首屏零额外请求
 - 按需加载：stats 数据只有展开卡片时才请求
@@ -789,6 +967,7 @@ pages/index.jsx (Home 组件)
 
 | 功能模块 | 文件路径 | 关键函数/组件 |
 |---------|---------|-------------|
+| SWR 全局 fetcher | [index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/index.jsx#L186) / [_app.jsx](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/_app.jsx#L77) | `fetcher` |
 | Docker 连接配置 | [docker.js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/utils/config/docker.js) | `getDockerArguments()` |
 | Docker 服务发现 | [service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/utils/config/service-helpers.js) | `servicesFromDocker()` |
 | K8s 服务发现 | [service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/utils/config/service-helpers.js) | `servicesFromKubernetes()` |
@@ -815,3 +994,4 @@ pages/index.jsx (Home 组件)
 | K8s Stats API | [stats/[...service].js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/stats/[...service].js) | `handler` |
 | Docker Status API | [status/[...service].js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/docker/status/[...service].js) | `handler` |
 | Docker Stats API | [stats/[...service].js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/docker/stats/[...service].js) | `handler` |
+| shvl 路径工具 | [shvl.js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/utils/config/shvl.js) | `set()` |
