@@ -561,30 +561,59 @@ export default function createUnifiProxyHandler({
    ```
    **⚠️ TrueNAS 的 WebSocket 路径**调用它时传入的 `endpoint` 已经是真实路径（如 `system/info`），所以能正确匹配到 `mappings.status` 并拿到 `validate: ["loadavg", "uptime_seconds"]`。
 2. 若 `mapping.allowEmpty === true` 且 data 是空 Buffer → 直接返回 true
-3. Buffer → JSON parse（第一次直接 parse，失败则去空白后再 parse）
-4. 遍历 `mapping.validate` 数组中的每个 key，若 JSON 中该 key 为 undefined 则标记 invalid
+3. Buffer → JSON parse（第一次直接 parse，失败则去空白后再 parse；两次都失败 → invalid）
+4. **仅当 dataParsed 为真值且非空时**，遍历 `mapping.validate` 数组中的每个 key，若 JSON 中该 key 为 undefined 则标记 invalid
 5. invalid 时 `logger.error` 详细日志（含期望字段、parse 错误、原始 data）
 
-**⚠️ 缺少 validate 字段时的行为**：
+**⚠️ 缺少 validate 字段时的行为（逐行精确分析）**：
+
+先看完整的检查流程 [validate-widget-data.js#L32-L38](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/utils/proxy/validate-widget-data.js#L32-L38)：
 ```javascript
-// validate-widget-data.js L33-37
+// ★ 外层条件：两个条件同时满足才会进入块内
 if (dataParsed && Object.entries(dataParsed).length) {
-  mapping?.validate?.forEach((key) => {   // ← 可选链 ?.forEach
+  // ★ 可选链短路：mapping 或 validate 任一个为 undefined/null 就不执行 forEach
+  mapping?.validate?.forEach((key) => {
     if (dataParsed[key] === undefined) {
       valid = false;
     }
   });
 }
 ```
-当 mapping 中没有 `validate` 字段时（如 TrueNAS 的 `alerts`、`pools`、`dataset`），`mapping?.validate` 为 `undefined`，`undefined?.forEach(...)` 是空操作，`valid` 保持 `true`，函数直接返回 `true`。
 
-**也就是说：缺少 validate 字段 = 不做任何字段校验 = 始终通过**。这是"约定优于配置"的体现——只在你关心特定字段时才声明 validate，否则只检查数据可解析且非空。
+**⚠️ 关键注意：这不是"非空校验"**。外层 `if` 是**"进入 validate 字段检查的门槛"**，不是校验条件本身。
 
-对于 TrueNAS WebSocket 路径，`sendMethod` 返回的 data 已经是 JavaScript 对象（`waitForEvent` 中 `parseJson: true` 自动解析了），不是 Buffer。因此 `Buffer.isBuffer(data)` 为 false，跳过 JSON parse 步骤，直接进入 validate 检查——如果没有 validate 字段，直接通过。
+让我们逐行拆解每一种边界情况（`valid` 初始值始终为 `true`）：
+
+| 输入 data | 是否 Buffer | Buffer parse 结果 | dataParsed | 外层条件<br>`dataParsed && length` | 是否进入块内 | `mapping.validate` | valid 结果 | 说明 |
+|----------|-----------|-----------------|-----------|-----------------------------------|------------|-------------------|-----------|------|
+| ✅ 缺少 validate + 正常非空对象<br>（TrueNAS alerts/pools WS 返回） | ❌ | 已解析 | `{a:1}` | `{a:1} && 1 = true` | ✅ | undefined → 短路 | **true** | `mapping?.validate` 为 undefined → `undefined?.forEach` 空操作 |
+| ✅ 缺少 validate + 正常非空数组<br>（TrueNAS alerts WS 返回 `[{},{}]`） | ❌ | 已解析 | `[1,2]` | `[1,2] && 2 = true` | ✅ | undefined → 短路 | **true** | 同上 |
+| ✅ 缺少 validate + 空对象 `{}` | ❌ | 已解析 | `{}` | `{} && 0 = false` | ❌ | - | **true** | 外层条件不满足，根本不进块，不检查 validate |
+| ✅ 缺少 validate + 空数组 `[]` | ❌ | 已解析 | `[]` | `[] && 0 = false` | ❌ | - | **true** | 同上 |
+| ✅ 缺少 validate + `null` | ❌ | 已解析 | `null` | `null && ... = false` | ❌ | - | **true** | 同上 |
+| ✅ 缺少 validate + 空 Buffer<br>（`mapping.allowEmpty=true`） | ✅ | - | - | - | - | - | **true** | L16 提前返回：`allowEmpty && data.length===0` |
+| ❌ 缺少 validate + Buffer parse 两次失败 | ✅ | ❌ 失败 | - | - | - | - | **false** | L27 直接 `valid = false`，不管有没有 validate |
+| ✅ 有 validate + 正常非空对象<br>（所有 key 存在） | ❌ | 已解析 | `{loadavg:[], uptime_seconds:123}` | true | ✅ | `["loadavg","uptime_seconds"]` | **true** | 所有 key 都不是 undefined |
+| ❌ 有 validate + 正常非空对象<br>（key 缺失） | ❌ | 已解析 | `{loadavg:[]}` | true | ✅ | `["loadavg","uptime_seconds"]` | **false** | `dataParsed.uptime_seconds === undefined` |
+| ✅ 有 validate + 空对象 `{}` | ❌ | 已解析 | `{}` | false | ❌ | `["loadavg","uptime_seconds"]` | **true** | ⚠️ 关键设计！外层条件不满足，**不检查 validate**，valid 保持 true |
+| ✅ 有 validate + 空数组 `[]` | ❌ | 已解析 | `[]` | false | ❌ | `["loadavg","uptime_seconds"]` | **true** | ⚠️ 同上，不检查 validate |
+| ✅ 有 validate + `null` | ❌ | 已解析 | `null` | false | ❌ | `["loadavg","uptime_seconds"]` | **true** | ⚠️ 同上，不检查 validate |
+| ❌ Buffer parse 两次失败<br>（任意 validate 情况） | ✅ | ❌ 失败 | - | - | - | 任意 | **false** | L27 直接 `valid = false` |
+
+**结论**：
+1. **缺少 validate 字段** → 无论 data 是空对象/空数组/null/正常非空，只要 Buffer parse 成功，`valid` 始终为 `true`
+2. **可选链空操作**是在 `dataParsed` 非空的前提下才会发生；如果 `dataParsed` 是空/假值，连块都不会进
+3. **Buffer 解析失败是硬失败** —— 不管有没有 validate 字段，两次 parse 都失败就直接 invalid
+4. **有 validate 字段 + 空 data** —— 依然返回 true，这是设计行为（因为外层条件不满足，不进入检查），不是 bug
+
+对于 TrueNAS WebSocket 路径的具体影响：
+- `sendMethod` 返回的 data 已经是 JS 对象（`waitForEvent` 自动解析），不是 Buffer → 跳过 Buffer 解析
+- **alerts/pools/dataset（无 validate）**：无论返回正常数组、空数组还是 null，`validateWidgetData` 始终返回 true
+- **status（有 validate）**：正常返回时检查 `loadavg` 和 `uptime_seconds` 两个 key；若返回空对象/空数组/null，也会"通过"（不检查字段）
 
 **⚠️ 调用位置**：
 - generic/credentialed：HTTP 200 时调用，validate 失败直接返回错误
-- **TrueNAS WebSocket 路径**：自己显式调用，位置在 `sendMethod` 拿到 data 之后、`map` 之前（顺序与 generic 一致）
+- **TrueNAS WebSocket 路径**：自己显式调用 [truenas/proxy.js#L150](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/truenas/proxy.js#L150)，位置在 `sendMethod` 拿到 data 之后、`map` 之前（顺序与 generic 一致）
 
 #### 5.4 api-helpers.js —— 杂项辅助
 
@@ -714,14 +743,14 @@ return res.status(200).json(data);
 ```
 **⚠️ 重要一致点**：validate 和 map 的调用顺序与 generic/credentialed 完全相同——**先 validate，后 map**。这保持了整个代理层的契约一致性。
 
-**⚠️ TrueNAS 各 endpoint 的 validate/map 行为差异**：
+**⚠️ TrueNAS 各 endpoint 的 validate/map 行为差异（含空数据情况**：
 
-| 逻辑 endpoint | 真实路径 | wsMethod | validate | map | validateWidgetData 行为 |
-|--------------|---------|----------|----------|-----|------------------------|
-| `alerts` | `alert/list` | `alert.list` | 无 | ✅ 有 | `mapping.validate` 为 undefined → `?.forEach` 空操作 → 直接通过 |
-| `status` | `system/info` | `system.info` | `["loadavg", "uptime_seconds"]` | 无 | 检查响应中 `loadavg` 和 `uptime_seconds` 两个 key 是否都存在 |
-| `pools` | `pool` | `pool.query` | 无 | ✅ 有 | 同 alerts，无 validate → 直接通过 |
-| `dataset` | `pool/dataset` | `pool.dataset.query` | 无 | 无 | 无 validate 也无 map → 原样返回 |
+| 逻辑 endpoint | 真实路径 | wsMethod | validate | map | validateWidgetData 行为（分情况） |
+|--------------|---------|----------|----------|-----|----------------------------------|
+| `alerts` | `alert/list` | `alert.list` | 无 | ✅ 有 | **数据非空**：`mapping.validate` 为 undefined → `?.forEach` 空操作 → true<br>**数据空**（`[]/{}/null`）：外层条件不满足 → 不进块 → true<br>**Buffer parse 失败**：false |
+| `status` | `system/info` | `system.info` | `["loadavg", "uptime_seconds"]` | 无 | **数据非空**：检查 `loadavg` 和 `uptime_seconds` 两个 key 是否都存在<br>**数据空**（`[]/{}/null`）：外层条件不满足 → 不检查 → true（⚠️ 即使字段缺失也通过）<br>**Buffer parse 失败**：false |
+| `pools` | `pool` | `pool.query` | 无 | ✅ 有 | 同 alerts，无 validate → 所有非空/空/parse 失败 |
+| `dataset` | `pool/dataset` | `pool.dataset.query` | 无 | 无 | 同 alerts，无 validate 也无 map → 原样返回 |
 
 **alerts 的 map 转换逻辑**（[widget.js#L14-L19](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/truenas/widget.js#L14-L19)）：
 ```javascript
@@ -977,7 +1006,9 @@ truenasProxyHandler
   ↓ authenticate(ws, widget)
   │   ← sendMethod(ws, "auth.login_with_api_key", [key]) → true
   ↓ sendMethod(ws, "system.info") → { loadavg: [...], uptime_seconds: 12345, ... }
-  ↓ validateWidgetData(widget, "system/info", data) → 检查 loadavg 和 uptime_seconds 字段存在
+  ↓ validateWidgetData(widget, "system/info", data)
+  │   ├─ 正常返回 { loadavg: [...], uptime_seconds: 12345 } → 检查两个字段都存在 → 通过
+  │   └─ 若返回空对象/空数组/null → 外层条件不满足 → 不检查字段 → 也通过（设计行为）
   ↓ validate 通过 → map 为 undefined → 不转换
   ↓ res.status(200).json(data)
   ↓
@@ -995,7 +1026,9 @@ truenasProxyHandler
 truenasProxyHandler
   ...（WebSocket 连接和鉴权同上）
   ↓ sendMethod(ws, "alert.list") → [{ dismissed: false, ... }, { dismissed: true, ... }, ...]
-  ↓ validateWidgetData(widget, "alert/list", data) → 此 mapping 无 validate 字段 → mapping?.validate?.forEach 空操作 → 直接通过
+  ↓ validateWidgetData(widget, "alert/list", data)
+  │   ├─ 正常返回数组 → dataParsed 非空 → mapping.validate 为 undefined → 可选链短路 → 通过
+  │   └─ 若返回空数组/空对象/null → 外层条件不满足 → 不进块 → 也通过
   ↓ map(data) → { pending: 1 }（Array.isArray 分支：filter(item => item.dismissed === false).length）
   ↓ res.status(200).json({ pending: 1 })
 ```
@@ -1013,7 +1046,10 @@ credentialedProxyHandler
   ↓ 因为无 key，自动加 Basic Auth 头（username + password）
   ↓ headers 三层合并 + application/json
   ↓ httpProxy(...) → 返回 [200, ...]
-  ↓ validateWidgetData → 检查 loadavg 和 uptime_seconds
+  ↓ validateWidgetData(widget, "system/info", <Buffer>)
+  │   ├─ Buffer JSON parse 成功 → { loadavg: [...], uptime_seconds: 12345 } → 检查两个字段 → 通过
+  │   ├─ Buffer parse 两次失败 → invalid → false
+  │   └─ 若解析后是空对象/空数组/null → 外层条件不满足 → 不检查字段 → 也通过（设计行为）
   ↓ validate 通过 → map（如果有）
   ↓ res.status(200).json(data)
 ```
