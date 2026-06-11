@@ -40,70 +40,97 @@ export const searchProviders = {
 
 ## 三、输入状态管理机制
 
-### 3.1 全局按键唤醒的隐含时序：首个字符如何进入输入框
+### 3.1 全局按键唤醒：只负责打开弹层，不保证首字符保留
 
-这是一个**非显式实现**的隐式行为。代码中**没有任何地方**手动提取 `e.key` 并将其拼接到 `searchString` 中，完全依赖浏览器事件的默认传播与执行时序：
+**核心事实**：全局按键处理只做一件事——`setSearching(true)` 打开弹层。代码中**没有任何逻辑**把首字符显式写入输入状态，也**没有测试用例**覆盖「唤醒后首字符是否保留」。首字符能否保留，完全是一个依赖运行时时序的隐含行为，无法从代码层面给出确定结论。
 
-**Step 1：全局监听捕获按键（仅唤醒，不获取字符）** [index.jsx#L253-L277](src/pages/index.jsx#L253-L277)
+**全局监听仅做唤醒** [index.jsx#L253-L277](src/pages/index.jsx#L253-L277)：
 ```javascript
 document.addEventListener("keydown", function handleKeyDown(e) {
   if (e.target.tagName === "BODY" || e.target.id === "inner_wrapper") {
     if (/* 匹配可输入字符、粘贴快捷键等 */) {
-      setSearching(true);  // 仅做一件事：标记打开
-      // ❗ 注意：此处既没有调用 e.preventDefault()，也没有读取 e.key
+      setSearching(true);  // 仅此一行，只改变打开状态
+      // ❗ 关键事实：
+      // 1. 没有 e.preventDefault() —— 浏览器默认行为会继续
+      // 2. 没有读取 e.key —— 根本不关心按了什么字符
+      // 3. 没有 setSearchString(e.key) —— 不会手动把字符写入状态
     }
   }
 });
 ```
 
-**Step 2：React 状态更新触发重渲染**
-- `searching` 状态从 `false` → `true`，`Home` 组件同步重渲染
-- `QuickLaunch` 组件收到新的 prop `isOpen={true}`
+---
 
-**Step 3：QuickLaunch 打开 effect 中主动聚焦输入框** [quicklaunch.jsx#L223-L239](src/components/quicklaunch.jsx#L223-L239)
+#### 输入框聚焦发生在组件打开后的副作用里
+
+弹层打开后，输入框通过 `useEffect` 获得焦点 [quicklaunch.jsx#L223-L239](src/components/quicklaunch.jsx#L223-L239)：
 ```javascript
 useEffect(() => {
   if (isOpen) {
-    searchField.current.focus();  // 🔑 关键：浏览器默认行为执行之前，输入框已获得焦点
+    searchField.current.focus();  // 👈 这是一个渲染后的副作用，不是同步执行的
     setHidden(false);
   }
 }, [isOpen]);
 ```
 
-**Step 4：浏览器默认行为被动完成字符注入**
-- 因为没有调用 `preventDefault()`，浏览器继续执行 `keydown` 的原生默认行为
-- 原生默认行为的逻辑是：**「向当前获得焦点的可输入元素插入按键字符」**
-- 此时输入框正好获得了焦点，字符被自动插入
-- 输入框内容变化触发 `onChange` → `handleSearchChange` → `setSearchString(...)`
+重要：`useEffect` 中的 `focus()` 是**渲染之后异步执行**的，它与触发打开的那一次 `keydown` 事件**不在同一个同步调用栈**上。
 
-**时序依赖图（隐含条件，代码未显式保证）**：
+---
+
+#### 时序分析：首字符大概率丢失
+
+结合 React 18 自动批处理机制 + 浏览器事件循环模型，触发唤醒的那一次按键，其字符**大概率无法进入输入框**：
+
 ```
-用户按下 'h' 键
+【宏任务】用户按下 'h' 键 → keydown 事件触发
     │
-    ▼
-keydown 事件同步分发
+    ├─ ① 原生事件监听器 handleKeyDown 同步执行
+    │     └─ setSearching(true)
+    │        └─ React 18 自动批处理：将更新加入调度队列
+    │           （不立即重渲染，状态更新是异步的）
     │
-    ├─→ ① 全局 handleKeyDown(e) 同步执行
-    │     └─ setSearching(true)   [仅标记，不 preventDefault]
+    ├─ ② 事件监听器函数返回
     │
-    ├─→ ② React 批处理微任务（依赖事件循环模型保证在默认行为之前）
-    │     ├─ state 更新：searching = true
-    │     ├─ 重渲染：<QuickLaunch isOpen={true} />
-    │     └─ useEffect 执行：searchField.current.focus()  ✓ 焦点已转移
+    ├─ ③ 浏览器执行 keydown 的默认行为
+    │     └─ 当前焦点仍在 BODY / #inner_wrapper
+    │        （因为 React 还没重渲染，输入框还没出现，更没获得焦点）
+    │        字符试图插入焦点元素 → BODY 不可输入 → 字符被丢弃
     │
-    └─→ ③ 浏览器默认行为（最后执行）
-          └─ 向当前焦点元素（输入框）插入 'h'
-              └─ onChange → handleSearchChange → setSearchString("h")
+    └─ 本次宏任务结束
+         │
+         ▼
+       微任务 / 下一轮调度
+         └─ React 处理批处理的状态更新
+            ├─ Home 组件重渲染，searching = true
+            ├─ QuickLaunch 挂载或显示
+            └─ useEffect 执行 → searchField.current.focus()
+               （⚠️ 但 keydown 的默认行为早已执行完毕，
+                  第一个 'h' 字符已经丢失了）
 ```
 
-> **隐含风险说明**：这套机制不是代码显式传递字符，而是利用「在同一个 keydown 事件中，React 微任务批处理先于浏览器默认行为执行」的时序特性。如果该特性在未来浏览器/React 版本中发生变化，或者 React 渲染卡顿导致 focus() 延迟，**第一个按键字符将丢失**——这是一个对运行时环境的隐式依赖。
+**为什么说"大概率"而非"一定"**：
+- React 的批处理调度时机在不同版本/模式下可能有差异（并发模式 vs 传统模式）
+- 不同浏览器的事件默认行为执行时机也可能略有不同
+- 粘贴快捷键（`Ctrl/Cmd + V`）的情况更复杂，剪贴板内容可能通过 `input` 事件等其他路径进入
 
-**全局键盘事件触发条件详解** [index.jsx#L253-L277](src/pages/index.jsx#L253-L277)：
+**但从代码角度可以确定的是**：
+1. ✅ 没有任何代码显式读取 `e.key` 并写入 `searchString`
+2. ✅ 聚焦发生在渲染后的 useEffect 中，与触发事件不同步
+3. ✅ 测试用例全部是 `fireEvent.keyDown(input, ...)` 直接在输入框上触发，**没有任何测试覆盖全局唤醒路径下的首字符保留**
+4. ❌ 无法从现有代码推导出「首字符一定保留」的结论
+
+---
+
+#### 全局键盘事件触发条件详解 [index.jsx#L253-L277](src/pages/index.jsx#L253-L277)
+
 只有当焦点位于 `BODY` 或 `#inner_wrapper`（即用户没有聚焦任何输入框/按钮）时，全局监听才生效：
-- **普通字符**：`e.key.length === 1` 且匹配字母/空格/Unicode 字母范围（包括西欧重音、西里尔字母等），且**没有**按修饰键（Alt/Ctrl/Cmd/Shift）时 → 唤醒
-- **特殊重音与感叹号**：由于某些键盘布局输入 `à-ü` / `!` 需要按住 Shift 等修饰键，因此额外作为例外匹配 → 唤醒
-- **粘贴快捷键**：`e.key === "v"` 且 `Ctrl/Cmd` 按下 → 唤醒（支持用户直接粘贴，剪贴板内容由浏览器默认行为填入输入框）
-- **Escape 键**：反向操作——`setSearchString("")` 清空输入内容 + `setSearching(false)` 关闭模态框
+
+| 按键类型 | 匹配条件 | 行为 |
+|---------|----------|------|
+| **普通字符** | `e.key.length === 1` 且匹配 `\w|\s|[à-ü]|[À-Ü]|[\w\u0430-\u044f]`，且无修饰键（Alt/Ctrl/Cmd/Shift） | `setSearching(true)` 唤醒 |
+| **重音与感叹号** | 单独匹配 `[à-ü]|[À-Ü]|!`（因为部分键盘布局输入这些字符需要按住 Shift 等修饰键，作为例外） | `setSearching(true)` 唤醒 |
+| **粘贴快捷键** | `e.key === "v"` 且 `Ctrl/Cmd` 按下 | `setSearching(true)` 唤醒 |
+| **Escape** | `e.key === "Escape"` | 反向操作：`setSearchString("")` + `setSearching(false)` 关闭并清空 |
 
 ### 3.2 Search Widget（独立搜索栏）
 
@@ -465,6 +492,6 @@ const parts = text.split(new RegExp(`(${searchString})`, "gi"));
 2. **currentSuggestion 闭包变量**：Search Widget 中用非 state 变量追踪选中项，在 React 严格模式或并发渲染下可能出现不一致
 3. **重复请求保护**：前端通过 `query !== searchSuggestions[0]` 判断避免重复请求，这依赖后端返回的第一个元素（原始 query）完全一致
 4. **关闭延迟**：QuickLaunch 关闭时使用 `setTimeout(200ms)` + `setTimeout(300ms)` 两段延迟，需在测试中通过 `act + setTimeout` 等待
-5. **全局首个字符丢失风险**：详见 3.1 节。唤醒的第一个按键不经过代码显式传递，完全依赖浏览器/React 事件微任务时序，渲染卡顿可能导致字符丢失
+5. **全局首字符丢失（代码未保证保留）**：详见 3.1 节。全局按键只负责 `setSearching(true)` 打开弹层，首字符没有任何代码显式写入 `searchString`；聚焦发生在渲染后的 `useEffect` 中，与触发事件不在同一调用栈。从代码层面无法证明首字符会保留，属于对运行时时序的隐式依赖
 6. **URL 检测正则的局限性**：`/.+[.:].+/` 会将 `ip:port`、`a.b` 等误认为 URL，在 catch 块才被纠正，有微小的性能开销
 7. **普通查询小写化会透传到搜索引擎**：QuickLaunch 中用户输入 `GitHub`，searchString 被转换为 `github`，后续 Web 搜索候选的 href 和建议接口的 query 参数**都会使用小写值**，自定义搜索引擎若区分大小写需留意
