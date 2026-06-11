@@ -41,7 +41,7 @@ Widget 代理层采用分层设计，从前端请求到后端目标服务 API �
 export default function useWidgetAPI(widget, ...options) {
   const config = {};
   if (options && options[1]?.refreshInterval) {
-    config.refreshInterval = options[1].refreshInterval;
+    config.refreshInterval = options[1]?.refreshInterval;
   }
   let url = formatProxyUrl(widget, ...options);
   if (options[0] === "") {
@@ -92,7 +92,7 @@ const serviceProxyHandler = widget.proxyHandler || genericProxyHandler;
 
 优先级：Widget 自定义 `proxyHandler` > 通用 `genericProxyHandler`
 
-#### 步骤 3：**关键分叉点**：无 endpoint 直接委托 + calendar 特例
+#### 步骤 3：**关键分叉点**：无 endpoint 快速委托 + calendar 特例
 
 ```javascript
 if (serviceProxyHandler instanceof Function) {
@@ -106,17 +106,19 @@ if (serviceProxyHandler instanceof Function) {
 }
 ```
 
-**⚠️ 这是容易读错的关键点**：
+**⚠️ 这是容易读错的关键点**——**自定义 proxyHandler 不一定都走快速分支**：
 
 | 分支条件 | 场景示例 | 后续行为 |
 |---------|---------|---------|
-| `!req.query.endpoint` | Pi-hole、Deluge 等完全自定义 proxy.js 的 Widget | **跳过所有 mappings 处理**，handler 自己负责全部逻辑，**map 参数为 undefined** |
-| `serviceProxyHandler === calendarProxyHandler` | Calendar widget（endpoint 传入的是集成名称而非 API 路径） | 即使请求带了 endpoint 参数，**也跳过 mappings**，直接委托给 calendarProxyHandler 内部用 endpoint 去匹配 integrations 数组 |
-| 其他情况 | Sonarr、Radarr 等配置了 mappings 的标准 Widget | 继续执行下面的 endpoint 映射逻辑 |
+| `!req.query.endpoint` | Pi-hole、Deluge（完全无 mappings，前端不传 endpoint） | **跳过所有 mappings 处理**，handler 自己负责全部逻辑，**map 参数为 undefined** |
+| `serviceProxyHandler === calendarProxyHandler` | Calendar（endpoint 是集成名称而非 API 路径） | 即使请求带了 endpoint 参数，**也跳过 mappings**，直接委托给 calendarProxyHandler 内部用 endpoint 去匹配 integrations 数组 |
+| 其他情况（有 endpoint 且非 calendar） | **TrueNAS**、Plex、FreshRSS、Sonarr、Radarr 等 | 继续执行下面的 endpoint 映射逻辑，**传递 map 参数** |
 
 calendar proxy handler 在 [calendar/proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/calendar/proxy.js#L7-L40) 内部用 `req.query.endpoint` 去匹配 `widget.integrations` 数组中的 `name` 字段，这就是为什么它需要特例化（mapping 的 endpoint 是真实路径，而 calendar 的 endpoint 只是集成项名称）。
 
-同时注意：**快速返回分支不传递 map 参数**。使用该分支的自定义 proxy 不会获得来自 mappings.map 的转换函数，数据转换必须自己在 proxy.js 内完成。
+**⚠️ 自定义 proxyHandler 的路径选择**：
+- **有 endpoint + 非 calendar** → 走 mapping 分支，**传 map 参数**（TrueNAS、Plex、FreshRSS 属于这一类）
+- **无 endpoint 或 calendar** → 走快速分支，**不传 map 参数**（Deluge、Pi-hole、Calendar 属于这一类）
 
 #### 步骤 4：处理 Endpoint Mapping（端点映射）
 
@@ -184,14 +186,14 @@ if (mapping?.headers) {
 }
 ```
 
-**最终委托调用（三选一）**：
+**最终委托调用（二选一）**：
 ```javascript
 if (endpointProxy instanceof Function) {
   return await endpointProxy(req, res, map); // 1️⃣ endpoint 专用 handler + map
 }
 return await serviceProxyHandler(req, res, map); // 2️⃣ widget 级 handler + map
 ```
-**注意**：与快速返回分支不同，这里**传递了 map 参数**。
+**注意**：与快速返回分支不同，这里**传递了 map 参数**。即使 `serviceProxyHandler` 是自定义的（如 TrueNAS、Plex、FreshRSS），也会收到 map。
 
 #### 步骤 5：正则白名单（Mappings 的兜底方案）
 
@@ -211,9 +213,11 @@ if (widget.allowedEndpoints instanceof RegExp) {
 
 核心文件：[widgets.js](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/widgets.js)
 
-这是一个集中注册文件，导入了所有 Widget 的配置并导出为字典。每个 Widget 目录下必须有 `widget.js`，典型配置分为以下几种类型：
+这是一个集中注册文件，导入了所有 Widget 的配置并导出为字典。每个 Widget 目录下必须有 `widget.js`。
 
-#### 类型 A：使用 generic Handler（最简洁，走 mappings）
+**⚠️ 自定义 proxyHandler 按"入口分支路径"分为 5 大类**：
+
+#### 类型 A：使用 generic Handler（最简洁，走 mapping 分支）
 以 [sonarr/widget.js](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/sonarr/widget.js) 为例：
 ```javascript
 import genericProxyHandler from "utils/proxy/handlers/generic";
@@ -230,23 +234,81 @@ const widget = {
 export default widget;
 ```
 
-#### 类型 B：使用 credentialed Handler（带 30+ 种内置认证）
+#### 类型 B：使用 credentialed Handler（带 30+ 种内置认证，走 mapping 分支）
 与 A 结构相同，只是 `proxyHandler` 换成 `credentialedProxyHandler`。
 
-#### 类型 C：完全自定义 proxy.js（可以走 mapping 分支，也可以走无 endpoint 快速分支）
+#### 类型 C：**走 mapping 分支的半复用自定义 proxy —— TrueNAS**
+**⚠️ 这是最特殊也最有代表性的自定义 proxy**，详见后文。[truenas/widget.js](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/truenas/widget.js)：
+```javascript
+import truenasProxyHandler from "./proxy";
+const widget = {
+  api: "{url}/api/v2.0/{endpoint}",
+  wsAPI: "{url}/api/current",
+  proxyHandler: truenasProxyHandler,
+  mappings: {
+    alerts: { endpoint: "alert/list", wsMethod: "alert.list", map: (data) => {...} },
+    status: { endpoint: "system/info", wsMethod: "system.info", validate: ["loadavg"] },
+    pools: { endpoint: "pool", wsMethod: "pool.query", map: (data) => {...} },
+    dataset: { endpoint: "pool/dataset", wsMethod: "pool.dataset.query" },
+  },
+};
+```
+关键特征：
+- `mappings` 中每个 endpoint 除了 `endpoint`（REST 路径）还有 `wsMethod`（WebSocket 方法名）
+- `proxyHandler` 是自定义的，但**走 mapping 分支**（有 endpoint，非 calendar）
+- 入口层会传 `map` 参数给它
+
+#### 类型 D：名义上有 mappings 但实际忽略的自定义 proxy —— Plex、FreshRSS
 以 [plex/widget.js](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/plex/widget.js) 为例：
 ```javascript
 import plexProxyHandler from "./proxy";
 const widget = {
   api: "{url}{endpoint}?X-Plex-Token={key}",
   proxyHandler: plexProxyHandler,
-  mappings: { unified: { endpoint: "/" } }, // 通过 mapping 分支把 unified 映射成 /
+  mappings: { unified: { endpoint: "/" } },
 };
 ```
+以 [freshrss/widget.js](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/freshrss/widget.js) 为例：
+```javascript
+import freshrssProxyHandler from "./proxy";
+const widget = {
+  api: "{url}/api/greader.php/{endpoint}?output=json",
+  proxyHandler: freshrssProxyHandler,
+  mappings: { info: { endpoint: "/" } },
+};
+```
+关键特征：
+- 名义上有 `mappings` 和 `endpoint`，**走 mapping 分支**，入口层会传 map 参数
+- 但函数签名是 `(req, res)`（不接收第三个参数，JS 会忽略多余参数）
+- 内部完全不使用 `req.query.endpoint`（自己硬编码调用多个真实 API）
+- `mappings` 仅用于通过入口层的合法性检查（否则会返回 403 "Unmapped proxy request"）
 
-**Plex 的关键点**：前端请求 `unified` endpoint，所以不会进入无 endpoint 快速分支；入口层先把 `unified` 映射成 `/`，再把请求交给 `plexProxyHandler`。不过 Plex 的真实路径转换和多 API 聚合仍由自定义 proxy 自己完成。
+#### 类型 E：走快速分支的完全自定义 proxy —— Deluge、Pi-hole
+以 [deluge/widget.js](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/deluge/widget.js) 为例：
+```javascript
+import delugeProxyHandler from "./proxy";
+const widget = {
+  api: "{url}/json",
+  proxyHandler: delugeProxyHandler,
+  // 注意：无 mappings，也无 {endpoint} 占位符
+};
+```
+以 [pihole/widget.js](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/pihole/widget.js) 为例：
+```javascript
+import piholeProxyHandler from "./proxy";
+const widget = {
+  api: "{url}/api/{endpoint}",
+  apiv5: "{url}/admin/api.php?{endpoint}&auth={key}",
+  proxyHandler: piholeProxyHandler,
+  // 注意：无 mappings
+};
+```
+关键特征：
+- 无 `mappings`（或 mappings 存在但前端不传 endpoint）
+- 走 `!req.query.endpoint` 快速分支
+- 函数签名 `(req, res)`，无 map 参数
 
-#### 类型 D：完全自定义 + calendar 特例（即使有 endpoint 也跳过 mappings）
+#### 类型 F：走 calendar 特例分支 —— Calendar
 [calendar/widget.js](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/calendar/widget.js)：
 ```javascript
 import calendarProxyHandler from "./proxy";
@@ -349,13 +411,15 @@ if (status === 200) {
 | `Token {key}` | tubearchivist, paperlessngx |
 | `X-Auth-Token: {key}` | miniflux |
 | `PRIVATE-TOKEN: {key}` | gitlab |
-| `Basic auth` | truenas (无 key 时), nextcloud (无 key 时), glances, esphome 等 |
+| `Basic auth` | truenas (无 key 时，v1 REST 模式), nextcloud (无 key 时), glances, esphome 等 |
 | `PVEAPIToken={user}={pass}` | proxmox |
 | `PBSAPIToken={user}:{pass}` | proxmoxbackupserver |
 | `X-CMC_PRO_API_KEY` | coinmarketcap |
 | `X-Finnhub-Token` | stocks (finnhub provider) |
 
 **⚠️ 返回校验与 map 顺序**：与 generic 完全一致，**先 validateWidgetData，后 map 转换**。
+
+**⚠️ TrueNAS v1 直接复用**：`return credentialedProxyHandler(req, res, map)`，把入口层传递的 map 原样转发，同时利用 credentialed 内置的 Basic Auth（无 key 时）。
 
 #### 4.3 jsonrpcProxyHandler —— JSON-RPC 协议代理（完整 Handler）
 
@@ -466,12 +530,21 @@ export default function createUnifiProxyHandler({
 
 工作流程：
 1. 通过 `widget.type` 和传入的 `endpoint`（**真实 API 路径**，不是逻辑名），反向查找 mapping 对象
+   ```javascript
+   // 注意：反向查找！用 endpoint 路径去匹配 mapping.endpoint
+   const mappingEntry = Object.values(widgets[widget.type].mappings).find(
+     (mapping) => mapping.endpoint === endpoint
+   );
+   ```
+   **⚠️ TrueNAS 的 WebSocket 路径**调用它时传入的 `endpoint` 已经是真实路径（如 `system/info`），所以能正确匹配到 `mappings.status` 并拿到 `validate: ["loadavg"]`。
 2. 若 `mapping.allowEmpty === true` 且 data 是空 Buffer → 直接返回 true
 3. Buffer → JSON parse（第一次直接 parse，失败则去空白后再 parse）
 4. 遍历 `mapping.validate` 数组中的每个 key，若 JSON 中该 key 为 undefined 则标记 invalid
 5. invalid 时 `logger.error` 详细日志（含期望字段、parse 错误、原始 data）
 
-**⚠️ 只在 HTTP 200 时被调用**（由 generic/credentialed 控制）。
+**⚠️ 调用位置**：
+- generic/credentialed：HTTP 200 时调用，validate 失败直接返回错误
+- **TrueNAS WebSocket 路径**：自己显式调用，位置在 `sendMethod` 拿到 data 之后、`map` 之前（顺序与 generic 一致）
 
 #### 5.4 api-helpers.js —— 杂项辅助
 
@@ -486,45 +559,199 @@ export default function createUnifiProxyHandler({
 
 ### 6. 具体 Widget 代理层（自定义 proxy.js）
 
-当通用 Handler 无法满足需求时（需要多 API 聚合、特殊认证、协议转换等），Widget 可以编写自己的 `proxy.js`。
+当通用 Handler 无法满足需求时（需要多 API 聚合、特殊认证、协议转换、版本分流等），Widget 可以编写自己的 `proxy.js`。
 
-**⚠️ 重要区分**：自定义 proxy.js 的入口调用路径取决于「走哪个入口分支」：
-- **走快速分支**（无 endpoint 或等于 calendarProxyHandler）：`serviceProxyHandler(req, res)`，**无 map 参数**，所有转换自己做
-- **走 mapping 分支**：入口层先处理 endpoint 映射、method/body/header 改写，再调用自定义 handler；Plex 就是这种路径
+**⚠️ 自定义 proxy.js 分类全景（按入口分支 + 对通用层的复用程度）**：
 
-以下是几种典型模式：
+| 类别 | 代表 | 入口分支 | 函数签名 | 是否接收/使用 map | 是否复用通用层 | 核心特征 |
+|------|------|---------|----------|------------------|---------------|---------|
+| **第一类：版本分流 + 协议混合 + 半复用（最复杂）** | **TrueNAS** | **mapping 分支** | `(req, res, map)` | ✅ 接收并使用（v1 转传给 credentialed，v2 自己调） | ✅ v1 直接 `return credentialedProxyHandler(...)`；v2 自己调 `validateWidgetData` + `map` | v1 REST / v2 WebSocket 双模式，半复用半自主 |
+| **第二类：名义上走 mapping 但实际忽略** | Plex、FreshRSS | mapping 分支 | `(req, res)` | ❌ 不接收（JS 忽略第三个参数） | ❌ 完全自主，只复用 `httpProxy` | mappings 仅用于通过合法性检查 |
+| **第三类：走快速分支（无 endpoint）** | Deluge、Pi-hole | 快速分支 | `(req, res)` | ❌ 不接收 | ⚠️ Deluge 复用 `sendJsonRpcRequest` 工具函数；Pi-hole 完全自主 | 无 mappings，前端不传 endpoint |
+| **第四类：calendar 特例分支** | Calendar | 快速分支 | `(req, res)` | ❌ 不接收 | ❌ 只复用 `httpProxy` | endpoint 是集成名称而非 API 路径 |
 
-#### 模式 A：多 API 聚合并缓存（Plex 走 mapping 分支后进入自定义 proxy）
+以下按复杂度从高到低详细说明：
+
+---
+
+#### 模式 F：版本分流 + 协议混合 + 半复用 credentialed（TrueNAS）
+
+**⚠️ 这是架构最精巧、最值得研究的自定义 proxy**，代码见 [truenas/proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/truenas/proxy.js)
+
+##### 函数签名（显式接收 map 参数）
+```javascript
+export default async function truenasProxyHandler(req, res, map) {
+  const { group, service, endpoint, index } = req.query;
+  // endpoint 已经是入口层改写后的真实 REST 路径，如 "system/info"
+  // ...
+}
+```
+
+##### 核心流程
+
+**① 版本分流** [truenas/proxy.js#L122-L126](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/truenas/proxy.js#L122-L126)
+```javascript
+const version = Number(widget.version ?? 1);
+if (Number.isNaN(version) || version < 2) {
+  // Use legacy REST proxy for version 1
+  return credentialedProxyHandler(req, res, map);  // ★ 直接委托给通用 handler！
+}
+// version >= 2：走 WebSocket 流程
+```
+
+**⚠️ v1 REST 模式的关键点**：
+- 直接 `return credentialedProxyHandler(req, res, map)`，把入口层传递的 `map` **原样转发**
+- 此时 `req` 已经被入口层改写过（method、body、endpoint 路径、extraHeaders 等）
+- 复用了 credentialed 内置的 Basic Auth（无 key 时）、三层请求头合并、validate+map 顺序
+- 这种模式相当于"在自定义 proxy 中打了个洞，直接走回通用流水线"
+
+**② v2+ WebSocket 模式**
+
+**②-1 反向查找 mapping 取 wsMethod** [truenas/proxy.js#L128-L134](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/truenas/proxy.js#L128-L134)
+```javascript
+const mappingEntry = Object.values(widgets[widget.type].mappings).find(
+  (mapping) => mapping.endpoint === endpoint  // endpoint 已经是真实路径，如 "system/info"
+);
+const wsMethod = mappingEntry.wsMethod;  // → "system.info"
+```
+入口层已经帮它做了 endpoint 名称→路径的转换，但 TrueNAS 需要的是 `wsMethod` 字段，所以**自己再反向查找一次 mapping**。这是一种"半复用"——入口层处理了 segments/query 参数和安全校验，但协议相关的字段（wsMethod）还得自己取。
+
+**②-2 WebSocket 连接与鉴权**
+
+WebSocket URL 构建：
+```javascript
+const wsUrl = new URL(formatApiCall(widgets[widget.type].wsAPI, { ...widget }));
+const useSecure = wsUrl.protocol === "https:" || Boolean(widget.key); // API key 要求 wss
+wsUrl.protocol = useSecure ? "wss:" : "ws:";
+const ws = new WebSocket(wsUrl, { rejectUnauthorized: false });
+```
+
+鉴权流程 [truenas/proxy.js#L84-L102](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/truenas/proxy.js#L84-L102)：
+```javascript
+async function authenticate(ws, widget) {
+  if (widget?.key) {
+    // 优先用 API Key
+    const apiKeyResult = await sendMethod(ws, "auth.login_with_api_key", [widget.key]);
+    if (apiKeyResult === true) return;
+  }
+  // 失败 fallback 到用户名密码
+  if (widget?.username && widget?.password) {
+    const loginResult = await sendMethod(ws, "auth.login", [widget.username, widget.password]);
+    if (loginResult === true) return;
+  }
+  throw new Error("TrueNAS authentication failed");
+}
+```
+
+JSON-RPC over WebSocket 工具函数 [truenas/proxy.js#L69-L82](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/truenas/proxy.js#L69-L82)：
+```javascript
+let nextId = 1;
+async function sendMethod(ws, method, params = []) {
+  const id = nextId++;
+  const payload = { jsonrpc: "2.0", id, method, params };  // JSON-RPC 2.0 格式
+  ws.send(JSON.stringify(payload));
+  return waitForEvent(ws, (message) => {
+    if (message?.id !== id) return undefined;  // 按 id 匹配响应
+    if (message?.error) return new Error(message.error?.message);
+    return message?.result ?? message;
+  });
+}
+```
+
+**②-3 validate 与 map 的位置（顺序与 generic 一致）** [truenas/proxy.js#L150-L156](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/truenas/proxy.js#L150-L156)
+```javascript
+data = await sendMethod(ws, wsMethod);
+
+// ★ 第一步：validate（与 generic 完全相同的调用，传入真实 endpoint 路径）
+if (!validateWidgetData(widget, endpoint, data)) {
+  return res.status(500).json({ error: { message: "Invalid data", ... } });
+}
+
+// ★ 第二步：map（与 generic 顺序完全一致）
+if (map) data = map(data);
+
+return res.status(200).json(data);
+```
+**⚠️ 重要一致点**：validate 和 map 的调用顺序与 generic/credentialed 完全相同——**先 validate，后 map**。这保持了整个代理层的契约一致性。
+
+##### TrueNAS 设计总结
+TrueNAS 是自定义 proxy 中**对通用层复用程度最高**的：
+- v1：100% 复用，直接 `return credentialedProxyHandler(...)`
+- v2：复用 `validateWidgetData` 工具函数 + `map` 转换函数 + 入口层的参数处理/安全校验
+- 仅协议（WebSocket）和认证流程是完全自定义的
+
+---
+
+#### 模式 A：多 API 聚合并缓存（Plex，名义上走 mapping 但实际忽略）
 
 **代表**：[plex/proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/plex/proxy.js)
 
+函数签名：
+```javascript
+export default async function plexProxyHandler(req, res) {  // ★ 不接收 map
+  const widget = await getWidget(req);
+  const { service, index } = req.query;
+  // 注意：根本不读 req.query.endpoint！
+  // ...
+}
+```
+
 特点：
-- 前端请求逻辑 endpoint `unified`，入口层将其映射成 `/` 后调用自定义 proxy，内部再调 3 类共 N 个真实 API
-- `fetchFromPlexAPI` 是封装的内部函数：Plex 返回 XML，用 `xml-js` 转 JSON
+- 名义上走 mapping 分支（有 endpoint），但入口层传的 map 被忽略
+- `req.query.endpoint` 被入口层改写为 "/"，但 Plex 根本不读它
+- 内部硬编码调 3 类共 N 个真实 API（`/status/sessions`、`/library/sections`、各媒体库条目数）
+- `fetchFromPlexAPI` 封装：Plex 返回 XML，用 `xml-js` 转 JSON
 - memory-cache 分级缓存：`librariesCacheKey`（6 小时）、`albumsCacheKey/tvCacheKey/moviesCacheKey`（10 分钟）
 - 对不同类型的媒体库并行 `Promise.all` 调对应条目数 API，累加计数
 - 最终手动构造 `{ streams, albums, movies, tv }` 返回
 
-#### 模式 B：版本分支 + 协议转换（走快速分支）
+---
+
+#### 模式 B：版本分支 + 协议转换（Pi-hole，走快速分支）
 
 **代表**：[pihole/proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/pihole/proxy.js)
 
+函数签名：
+```javascript
+export default async function piholeProxyHandler(req, res) {  // ★ 不接收 map
+  const { group, service, index } = req.query;
+  // 注意：无 endpoint 参数
+  // ...
+}
+```
+
 特点：
+- 走 `!req.query.endpoint` 快速分支（前端不传 endpoint）
 - `widget.version < 6`（v5）：直接调 `apiv5` 模板 URL，query 参数传 auth token，响应原样透传
 - `widget.version >= 6`（v6）：完全不同的流程——POST `/api/auth` 拿 `session.sid` → 缓存 sid（有效期为 API 返回的 validity 秒数）→ `X-FTL-SID` 请求头调业务 API → 手动字段映射，把 v6 响应格式转换为 v5 兼容格式返回前端
 - 前端组件不需要关心后端版本，数据接口统一
 
-#### 模式 C：登录态管理（401 自动重试）+ 多 API 聚合（FreshRSS 走 mapping 分支后进入自定义 proxy）
+---
+
+#### 模式 C：登录态管理（401 自动重试）+ 多 API 聚合（FreshRSS，名义上走 mapping 但实际忽略）
 
 **代表**：[freshrss/proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/freshrss/proxy.js)
 
+函数签名：
+```javascript
+export default async function freshrssProxyHandler(req, res) {  // ★ 不接收 map
+  const { group, service, index } = req.query;
+  // 注意：根本不读 req.query.endpoint！
+  // ...
+}
+```
+
 特点：
+- 名义上走 mapping 分支（有 endpoint="info"），但入口层传的 map 被忽略
+- `req.query.endpoint` 被入口层改写为 "/"，但 FreshRSS 根本不读它
 - 使用 Google Account Login 协议（`accounts/ClientLogin`，`application/x-www-form-urlencoded` POST）
 - `apiCall` 封装了「调业务 API → 401 时重新登录 → 重试」的循环
 - 缓存 token（无过期时间，永久保存直到 401 触发刷新）
 - 最终聚合两个 API：`subscription/list`（取订阅数） + `unread-count`（取最大未读数）
 
-#### 模式 D：复用 sendJsonRpcRequest + 自定义错误码 + 登录重试（走快速分支）
+---
+
+#### 模式 D：复用 sendJsonRpcRequest + 自定义错误码 + 登录重试（Deluge，走快速分支）
 
 **⚠️ 与 jsonrpcProxyHandler 的关系重点区分**：
 
@@ -538,6 +765,7 @@ export default function createUnifiProxyHandler({
 | JSON-RPC method 来源 | `req.query.endpoint` | 写死的常量 `dataMethod = "web.update_ui"` 和 `loginMethod = "auth.login"` |
 | 认证流程 | 仅处理 HTTP Basic/Bearer（sendJsonRpcRequest 内置） | 额外：收到 JSON-RPC 错误码 1（未登录）→ 调 `auth.login` → 重试 |
 | 返回行为 | `res.status().end(data)` | `res.status().end(data)`（相同） |
+| map 参数 | 走 mapping 分支，接收并使用 | 走快速分支，无 map |
 
 Deluge 的核心流程：
 1. 调 `sendRpc(url, "web.update_ui", dataParams)` → 内部是 `sendJsonRpcRequest`
@@ -545,11 +773,22 @@ Deluge 的核心流程：
 3. 若 HTTP 403 → 调 `login(url, widget.password)`（`auth.login` method）→ 成功后**重试**数据请求
 4. 注意：`sendJsonRpcRequest` 已把 JSON 字符串化过，Deluge 返回时再次 `JSON.parse` 判断 `json.error`，最后又 `end(data)` 直接写回字符串——两次 parse 纯为判断错误码
 
+---
+
 #### 模式 E：集成 URL 直连（calendar 特例分支）
 
 **代表**：[calendar/proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/196-homepage/src/widgets/calendar/proxy.js)
 
 **⚠️ 这是入口层特例分支 `serviceProxyHandler === calendarProxyHandler` 的对应实现**：
+
+函数签名：
+```javascript
+export default async function calendarProxyHandler(req, res) {  // ★ 不接收 map
+  const { group, service, index, endpoint } = req.query;
+  // endpoint 是集成名称，不是 API 路径！
+  // ...
+}
+```
 
 特点：
 - `endpoint` 不是 API 路径，而是用户配置中 `integrations` 数组的 `name` 字段
@@ -576,12 +815,21 @@ Calendar 是唯一"endpoint 含义非 API 路径"的 widget，因此必须在入
 - **层 1（90% 场景）**：`widget.js` 仅配置 `api` + `proxyHandler: genericProxyHandler` + `mappings`，零代码
 - **层 2（认证复杂场景）**：换用 `credentialedProxyHandler`，认证逻辑集中维护（新增一种认证只需改 credentialed.js 一个文件）
 - **层 3（协议特殊场景）**：使用 `jsonrpcProxyHandler` / `synologyProxyHandler` 等专用 handler
-- **层 4（完全特殊场景）**：写自定义 `proxy.js`，可复用 `httpProxy` / `sendJsonRpcRequest` 等底层工具；可走 mapping 分支，也可走快速分支完全掌控流程
+- **层 4（半复用场景）**：像 TrueNAS 一样，部分版本/路径复用通用 handler，部分自主实现
+- **层 5（完全特殊场景）**：写自定义 `proxy.js`，可复用 `httpProxy` / `sendJsonRpcRequest` 等底层工具；可走 mapping 分支，也可走快速分支完全掌控流程
 
 ### 4. 入口层委托 + 请求对象改写
 入口层 `pages/api/services/proxy.js` 不是简单的路由分发，而是**主动改写 `req` 对象的字段**（`method`、`body`、`query.endpoint`、`extraHeaders`），把 mapping 中的声明式配置"预编译"到请求对象上，后续 handler 只需直接读这些字段即可正常工作。
 
-### 5. 安全机制（分层防御）
+### 5. 隐含契约一致性
+**先 validate 后 map** 的顺序在整个代理层保持一致：
+- generic.js：`validateWidgetData` → `if (map) resultData = map(resultData)`
+- credentialed.js：完全相同的顺序
+- truenas/proxy.js（WebSocket 路径）：`validateWidgetData` → `if (map) data = map(data)`（自己显式调用，顺序一致）
+
+这个契约确保了 `validate` 永远基于目标服务的原始数据结构，`map` 永远基于校验通过的数据。
+
+### 6. 安全机制（分层防御）
 - 入口层 endpoint 白名单（mapping 或正则），不允许任意路径代理
 - Segments key 白名单 + value 路径遍历防护（`/`、`\`、`..` 禁止）
 - Query 参数白名单（mapping.params + optionalParams 双重过滤）
@@ -628,7 +876,75 @@ genericProxyHandler (继续)
 前端 SWR 缓存 → 组件渲染
 ```
 
-### 示例 2：Deluge（走快速分支 + 自定义 proxy + 复用 sendJsonRpcRequest + 登录重试）
+### 示例 2：TrueNAS status 端点（走 mapping 分支 + 自定义 proxy + 版本分流 + v2 WebSocket）
+
+```
+前端 TrueNASWidget 组件
+  ↓ useWidgetAPI(widget, "status")
+  ↓ formatProxyUrl → /api/services/proxy?group=...&service=truenas&index=0&endpoint=status
+  ↓ HTTP GET
+pages/api/services/proxy.js (入口 L29)
+  ↓ 有 endpoint 且 handler 不是 calendar → 不进快速分支
+  ↓ widgets["truenas"].mappings["status"] → { endpoint: "system/info", wsMethod: "system.info", validate: ["loadavg"] }
+  ↓ mapping.method 未设置 → req.method = "GET"
+  ↓ mapping.body 未设置 → 不改写
+  ↓ req.query.endpoint = "system/info"（逻辑名 status → 真实 REST 路径 system/info）
+  ↓ segments/query 未传 → 不改写
+  ↓ map = undefined（此 endpoint 无 map 函数）
+  ↓ 调用 truenasProxyHandler(req, res, map=undefined)
+truenasProxyHandler
+  ↓ getServiceWidget 获取服务配置（含 version=2）
+  ↓ version >= 2 → 不走 REST，走 WebSocket
+  ↓ Object.values(mappings).find(m => m.endpoint === "system/info") → 取 wsMethod = "system.info"
+  ↓ formatApiCall("{url}/api/current", widget) → https://truenas.example.com/api/current
+  ↓ protocol 改 wss://（因为有 key）
+  ↓ new WebSocket(wsUrl) → waitForEvent "open"
+  ↓ authenticate(ws, widget)
+  │   ← sendMethod(ws, "auth.login_with_api_key", [key]) → true
+  ↓ sendMethod(ws, "system.info") → { loadavg: [...], uptime_seconds: 12345, ... }
+  ↓ validateWidgetData(widget, "system/info", data) → 检查 loadavg 字段存在
+  ↓ validate 通过 → map 为 undefined → 不转换
+  ↓ res.status(200).json(data)
+  ↓
+前端 SWR 缓存 → 组件渲染
+```
+
+### 示例 3：TrueNAS alerts 端点（v2 WebSocket 且有 validate + map）
+
+```
+...（入口层处理同上）
+  ↓ widgets["truenas"].mappings["alerts"] → { endpoint: "alert/list", wsMethod: "alert.list", map: (data) => {...} }
+  ↓ req.query.endpoint = "alert/list"
+  ↓ map = mapping.map（有转换函数）
+  ↓ 调用 truenasProxyHandler(req, res, map=fn)
+truenasProxyHandler
+  ...（WebSocket 连接和鉴权同上）
+  ↓ sendMethod(ws, "alert.list") → [{ dismissed: false, ... }, { dismissed: true, ... }, ...]
+  ↓ validateWidgetData(widget, "alert/list", data) → 此 mapping 无 validate 字段 → 直接通过
+  ↓ map(data) → { pending: 1 }（统计未 dismissed 的数量）
+  ↓ res.status(200).json({ pending: 1 })
+```
+
+### 示例 4：TrueNAS v1 REST 模式（直接复用 credentialed）
+
+```
+...（入口层处理同上）
+  ↓ widget.version = 1
+truenasProxyHandler
+  ↓ version < 2 → return credentialedProxyHandler(req, res, map)
+credentialedProxyHandler
+  ↓ formatApiCall("{url}/api/v2.0/{endpoint}", { endpoint: "system/info", ... })
+  ↓ → https://truenas.example.com/api/v2.0/system/info
+  ↓ 因为无 key，自动加 Basic Auth 头（username + password）
+  ↓ headers 三层合并 + application/json
+  ↓ httpProxy(...) → 返回 [200, ...]
+  ↓ validateWidgetData → 检查 loadavg
+  ↓ validate 通过 → map（如果有）
+  ↓ res.status(200).json(data)
+```
+**注意**：整个过程 truenasProxyHandler 没有做任何自定义处理，相当于"透明代理"直接把请求转发给 credentialed。
+
+### 示例 5：Deluge（走快速分支 + 自定义 proxy + 复用 sendJsonRpcRequest + 登录重试）
 
 ```
 前端 DelugeWidget 组件
