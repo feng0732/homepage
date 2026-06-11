@@ -618,7 +618,480 @@ sonarrData?.forEach((event) => {
 
 ---
 
-## 十一、相关文件索引
+## 十一、边界流程补充分析
+
+### 11.1 队列开关 `enableQueue` 关闭时的完整行为
+
+#### 问题：`enableQueue=false` 或未设置时，`queue/details` 请求是否还会发出？
+
+**答案：会。** 这是一个容易被误解的关键行为。
+
+以 Sonarr 为例，[component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/sonarr/component.jsx#L28-L31) 的 4 个 `useWidgetAPI` 调用是 **无条件执行** 的：
+
+```javascript
+// L28-L31：无论 enableQueue 设置如何，这些 Hook 都会执行
+const { data: wantedData, error: wantedError } = useWidgetAPI(widget, "wanted/missing");
+const { data: queuedData, error: queuedError } = useWidgetAPI(widget, "queue");
+const { data: seriesData, error: seriesError } = useWidgetAPI(widget, "series");
+const { data: queueDetailsData, error: queueDetailsError } = useWidgetAPI(widget, "queue/details");
+```
+
+`enableQueue` 的判断发生在数据请求 **之后**，在 [L59](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/sonarr/component.jsx#L59)：
+
+```javascript
+const enableQueue = widget?.enableQueue && Array.isArray(queueDetailsData) && queueDetailsData.length > 0;
+```
+
+这是一个 **三重条件** 的短路求值：
+
+| 条件 | 含义 | 值为 false 的情况 |
+|------|------|-------------------|
+| `widget?.enableQueue` | 配置中是否开启队列 | 未设置 `enableQueue` 或设为 `false` |
+| `Array.isArray(queueDetailsData)` | 接口返回的是否为数组 | 接口返回空对象、null、或出错 |
+| `queueDetailsData.length > 0` | 队列中是否有内容 | 队列为空 |
+
+**完整行为流程图：**
+
+```
+enableQueue 未设置 / false
+        │
+        ▼
+  4 个 useWidgetAPI 仍然全部执行
+  (SWR 仍会向 /api/services/proxy 发起请求)
+        │
+        ├── 全部成功 → enableQueue 为 false → 只渲染 3 个 Block，不渲染 QueueEntry
+        │
+        ├── queue/details 返回错误 → 整个组件进入错误态！
+        │    └─ 即使 enableQueue=false，queueDetailsError 仍会触发 L44-L47 的错误渲染
+        │
+        └── 其他接口出错 → 同样进入错误态
+```
+
+#### ⚠️ 设计隐患
+
+这意味着即使用户不关心队列信息（`enableQueue=false`），如果 `queue/details` 接口本身出错（如 Sonarr 服务端版本不兼容），**整个 Widget 都会显示错误**，包括本应正常显示的 wanted / queued / series 数据。
+
+修复思路：如果 `enableQueue` 为 false，可以在 `queue/details` 出错时不将其视为致命错误，或使用条件式请求（SWR 支持 `url = null` 跳过请求）。
+
+---
+
+### 11.2 错误状态的完整处理链路
+
+错误从产生到展示经过多层处理，每层都有不同行为。
+
+#### 11.2.1 错误产生源
+
+| 来源 | 代码位置 | 错误结构 |
+|------|----------|----------|
+| HTTP 错误（4xx/5xx） | [generic.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/utils/proxy/handlers/generic.js#L75-L91) L75-L91 | `{ error: { message: "HTTP Error", url: "***", data: ... } }` |
+| 数据校验失败 | [generic.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/utils/proxy/handlers/generic.js#L61-L65) L61-L65 | `{ error: { message: "Invalid data", url: "***", data: ... } }` |
+| 不支持的 endpoint | [proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/pages/api/services/proxy.js#L49-L52) L49-L52 | `{ error: "Unsupported service endpoint" }` (纯字符串) |
+| 网络超时/连接失败 | SWR 内部 fetch 异常 | 原生 Error 对象 |
+| Sonarr/Radarr 业务错误 | API 返回非 200 | 取决于上游服务 |
+
+#### 11.2.2 useWidgetAPI 的错误提升
+
+[use-widget-api.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/utils/proxy/use-widget-api.js#L16) L16：
+
+```javascript
+return { data, error: data?.error ?? error, mutate };
+```
+
+关键逻辑：**API 返回的业务错误（`data.error`）优先于 SWR 的网络错误（`error`）**。
+
+这意味着当服务端返回 `{ error: { message: "HTTP Error", ... } }` 时：
+- `data` = `{ error: { message: "HTTP Error", ... } }`（非 null）
+- `error` = SWR 层面的 undefined（fetch 本身成功）
+- 合并结果：`error` = `data.error` = `{ message: "HTTP Error", ... }`
+
+#### 11.2.3 Widget 组件的错误聚合
+
+Sonarr [component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/sonarr/component.jsx#L44-L47) L44-L47：
+
+```javascript
+if (wantedError || queuedError || seriesError || queueDetailsError) {
+  const finalError = wantedError ?? queuedError ?? seriesError ?? queueDetailsError;
+  return <Container service={service} error={finalError} />;
+}
+```
+
+**任一请求失败即整体报错**，且只展示第一个非空错误（按 wanted → queued → series → queueDetails 优先级）。
+
+#### 11.2.4 Container 的错误拦截
+
+[container.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/components/services/widget/container.jsx#L24-L29) L24-L29：
+
+```javascript
+if (error) {
+  if (settings.hideErrors || service.widget.hide_errors) {
+    return null;    // 静默吞掉错误，不渲染任何内容
+  }
+  return <Error service={service} error={error} />;
+}
+```
+
+这里有 **双重隐藏机制**：
+
+| 机制 | 作用域 | 来源 |
+|------|--------|------|
+| `settings.hideErrors` | 全局（所有 Widget） | 用户全局设置 |
+| `service.widget.hide_errors` | 单个 Widget | YAML 配置中的 `hideErrors: true` |
+
+两者满足其一即完全隐藏错误，Widget 区域变为空白。
+
+#### 11.2.5 Error 组件的容错格式化
+
+[error.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/components/services/widget/error.jsx#L12-L23) L12-L23：
+
+```javascript
+if (typeof error === "string") {
+  error = { message: error };       // "Unsupported service endpoint" → { message: "..." }
+} else if (typeof error === "number") {
+  error = { message: `Error ${error}` };  // HTTP 状态码数字 → { message: "Error 403" }
+}
+
+if (error?.data?.error) {
+  error = error.data.error;         // 嵌套提取
+}
+```
+
+最终展示的可折叠详情面板包含：
+- **message**：错误描述
+- **url**：脱敏后的请求 URL
+- **rawError**：原始异常
+- **data**：响应数据
+
+#### 11.2.6 完整错误链路图
+
+```
+Sonarr/Radarr API 返回 500
+        │
+        ▼
+genericProxyHandler
+  ├─ httpProxy() 返回 [500, "application/json", data]
+  ├─ sanitizeErrorURL() 脱敏 URL 中的 apikey
+  └─ res.status(500).json({ error: { message: "HTTP Error", url: "https://sonarr:8989/api/v3/queue?apikey=***" } })
+        │
+        ▼
+SWR fetch 成功（HTTP 200 from proxy），但 data 包含 error 字段
+        │
+        ▼
+useWidgetAPI 提升错误：error = data.error = { message: "HTTP Error", url: "..." }
+        │
+        ▼
+Sonarr Component: queueDetailsError 为 truthy
+  └─ finalError = wantedError ?? queuedError ?? seriesError ?? queueDetailsError
+     (如果 wanted/queued/series 也出错，取第一个非空)
+        │
+        ▼
+Container 检查隐藏设置
+  ├─ hideErrors (全局) 或 hide_errors (Widget 级) → return null (空白)
+  └─ 不隐藏 → <Error error={finalError} />
+        │
+        ▼
+Error 组件
+  ├─ 格式化 error 对象（容错 string/number/嵌套）
+  └─ 渲染可折叠 <details> 面板
+```
+
+---
+
+### 11.3 日历配置的覆盖与隐藏错误机制
+
+#### 11.3.1 日历 Widget 的配置合并链
+
+[calendar/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/component.jsx#L70-L86) L70-L86：
+
+```javascript
+const integrations = useMemo(
+  () =>
+    widget.integrations
+      ?.filter((integration) => integration?.type)
+      .map((integration) => ({
+        service: dynamic(() => import(`./integrations/${integration.type}.jsx`)),
+        widget: { ...widget, ...integration },   // ← 关键：integration 覆盖 widget
+      })) ?? [],
+  [widget],
+);
+```
+
+合并顺序 `{ ...widget, ...integration }` 意味着：
+
+```yaml
+widget:
+  type: calendar
+  url: http://sonarr:8989        # widget 层
+  key: API_KEY                    # widget 层
+  integrations:
+    - type: sonarr
+      url: http://sonarr-new:8989  # integration 层，覆盖 widget.url
+      color: teal                   # integration 层，新增
+      params:                       # integration 层，新增
+        includeSeries: "true"
+```
+
+合并后传给 Sonarr 集成组件的 `config` 对象：
+```javascript
+{
+  type: "sonarr",                    // integration.type 覆盖 widget.type
+  url: "http://sonarr-new:8989",    // integration.url 覆盖 widget.url
+  key: "API_KEY",                   // 保留 widget.key
+  color: "teal",                    // integration 新增
+  params: { includeSeries: "true" },// integration 新增
+  service_name: "...",              // 保留 widget 的
+  service_group: "...",             // 保留 widget 的
+}
+```
+
+> **注意**：`integration.type` 会覆盖 `widget.type`（`calendar` → `sonarr`），这使得 `useWidgetAPI(config, "calendar")` 能正确找到 `widgets["sonarr"].mappings["calendar"]` 来构造请求。
+
+#### 11.3.2 日历 API 请求参数的三层合并
+
+以 [sonarr.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/sonarr.jsx#L8-L14) L8-L14 为例：
+
+```javascript
+const { data: sonarrData, error: sonarrError } = useWidgetAPI(config, "calendar", {
+  ...params,                       // 第 1 层：日历组件传入的 start/end/unmonitored
+  includeSeries: "true",          // 第 2 层：Sonarr 集成硬编码的默认值
+  includeEpisodeFile: "false",
+  includeEpisodeImages: "false",
+  ...(config?.params ?? {}),       // 第 3 层：用户在 integration 中自定义的 params
+});
+```
+
+**覆盖优先级**（后者覆盖前者）：
+
+| 层级 | 来源 | 示例 |
+|------|------|------|
+| 第 1 层 | 日历父组件计算的日期范围 | `start: "2026-03-11"`, `end: "2026-09-11"` |
+| 第 2 层 | Sonarr 集成内置的默认参数 | `includeSeries: "true"` |
+| 第 3 层 | 用户 YAML 配置的 `params` | 可覆盖以上所有参数 |
+
+最终传到代理层的 `query` 参数经过 [proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/pages/api/services/proxy.js#L74-L86) L74-L86 的 **白名单过滤**：
+
+```javascript
+// widget.mappings.calendar.params = ["start", "end", "unmonitored", "includeSeries", ...]
+if (req.query.query && (mappingParams || optionalParams)) {
+  const queryParams = JSON.parse(req.query.query);
+  let params = [];
+  if (mappingParams) params = params.concat(mappingParams);       // 白名单
+  if (filteredOptionalParams) params = params.concat(filteredOptionalParams);
+  const query = new URLSearchParams(params.map((p) => [p, queryParams[p]]));
+  req.query.endpoint = `${req.query.endpoint}?${query}`;
+}
+```
+
+只转发 `mapping.params` 中声明的参数名，**用户自定义的 `params` 中如果有未声明参数会被静默丢弃**。
+
+#### 11.3.3 日历集成的隐藏错误机制
+
+[sonarr.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/sonarr.jsx#L39-L40) L39-L40：
+
+```javascript
+const error = sonarrError ?? sonarrData?.error;
+return error && !hideErrors && <Error error={{ message: `${config.type}: ${error.message ?? error}` }} />;
+```
+
+[Radarr 同理](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/radarr.jsx#L64-L65) L64-L65：
+
+```javascript
+const error = radarrError ?? radarrData?.error;
+return error && !hideErrors && <Error error={{ message: `${config.type}: ${error.message ?? error}` }} />;
+```
+
+**与 Widget 组件的错误处理有三点关键差异：**
+
+| 维度 | Widget 组件 (sonarr/component.jsx) | 日历集成 (calendar/integrations/sonarr.jsx) |
+|------|-------------------------------------|----------------------------------------------|
+| 错误影响范围 | **整个 Widget 停止渲染**，只显示错误 | **仅显示错误提示，不影响日历其他集成的事件** |
+| 隐藏方式 | `settings.hideErrors` + `widget.hide_errors` | 仅 `hideErrors` 参数（来自 `settings.hideErrors`） |
+| 数据流 | 错误时 return 后，不执行后续渲染 | 错误时 useEffect 直接 return，不影响已有的 `events` 状态 |
+
+**日历集成错误不阻断其他集成的原因：**
+
+1. 每个集成是独立的 React 组件，各自调用自己的 `useWidgetAPI`
+2. 各集成通过 `setEvents((prev) => ({ ...prev, ...eventsToAdd }))` 合并到共享 `events` 状态
+3. 如果 Sonarr 集成出错，`useEffect` 中 `if (!sonarrData || sonarrError) return;` 会跳过事件添加，但已由 Radarr 等其他集成添加的事件 **不受影响**
+4. 日历组件的 `<Container>` 不会收到错误，所以日历视图照常渲染
+
+```
+┌─ Calendar Component ──────────────────────────────┐
+│                                                    │
+│  ┌─ Sonarr Integration ─┐  ┌─ Radarr Integration ┐│
+│  │  error → 跳过事件添加  │  │  成功 → 添加事件    ││
+│  │  显示 Error 提示      │  │                     ││
+│  └───────────────────────┘  └─────────────────────┘│
+│                                                    │
+│  events = { ...radarrEvents }  ← Sonarr 的被跳过  │
+│                                                    │
+│  ┌─ Monthly / Agenda ──────────────────────────┐  │
+│  │  只展示 Radarr 的事件，Sonarr 错误不影响渲染  │  │
+│  └──────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────┘
+```
+
+#### 11.3.4 `hideErrors` 的传递路径
+
+[calendar/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/component.jsx#L97-L107) L97-L107：
+
+```javascript
+<Integration
+  config={integration.widget}
+  params={params}
+  setEvents={setEvents}
+  hideErrors={settings.hideErrors}   // ← 全局设置，非 widget 级
+/>
+```
+
+**注意**：日历集成只传了 `settings.hideErrors`，**没有传** `widget.hide_errors`。这与 Widget 组件的 Container 有所不同：
+- Container 同时检查 `settings.hideErrors || service.widget.hide_errors`
+- 日历集成只检查 `hideErrors`（仅全局设置）
+
+这意味着即使某个日历 integration 配置了 `hideErrors: true`，在日历集成层面仍然可能显示错误（因为 `widget.hide_errors` 没有传递到 integration 的 `hideErrors` prop）。不过配置层已将 `hideErrors` 转为 `hide_errors` 字段传给前端，而日历集成代码只检查 `hideErrors` prop，所以 **日历集成的 widget 级错误隐藏实际上是失效的**。
+
+---
+
+### 11.4 跳转链接缺少字段时的处理
+
+#### 11.4.1 Sonarr 日历链接
+
+[sonarr.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/sonarr.jsx#L32) L32：
+
+```javascript
+url: config?.baseUrl && event.series.titleSlug && `${config.baseUrl}/series/${event.series.titleSlug}`,
+```
+
+这是一个 **三重短路求值**，逐一检查：
+
+| 条件 | 缺失场景 | 结果 |
+|------|----------|------|
+| `config?.baseUrl` 为 falsy | 日历 integration 未配置 `baseUrl` | `url` = `undefined`（或 `false`） |
+| `event.series.titleSlug` 为 falsy | Sonarr API 返回的事件中 `series.titleSlug` 缺失 | `url` = `undefined`（或 `false`） |
+| 两者都存在 | 正常情况 | `url` = `"https://sonarr.example/series/show"` |
+
+**URL 为 falsy 时的表现**：日历组件在渲染事件时，如果 `url` 为 falsy，不会生成可点击的链接，事件只显示文本。
+
+#### 11.4.2 Radarr 日历链接
+
+[radarr.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/radarr.jsx#L25) L25：
+
+```javascript
+const url = config?.baseUrl && event.titleSlug && `${config.baseUrl}/movie/${event.titleSlug}`;
+```
+
+逻辑与 Sonarr 一致，但有一个区别：**`url` 变量在循环外定义**，被 3 种事件类型（影院/实体/数字）**共享**。如果 `baseUrl` 或 `titleSlug` 缺失，**同一电影的所有事件都不可点击**。
+
+#### 11.4.3 `baseUrl` 的来源追踪
+
+`baseUrl` 不在 [service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/utils/config/service-helpers.js) 的白名单中（不在 L256-L439 的解构列表中），说明它 **不是从 services.yaml 的 widget 配置直接传给前端的**。
+
+`baseUrl` 的实际来源是日历组件的配置合并：
+
+[calendar/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/component.jsx#L83) L83：
+
+```javascript
+widget: { ...widget, ...integration },
+```
+
+而 `integration` 来自 `widget.integrations` 数组中的元素。在配置清洗阶段 [service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/utils/config/service-helpers.js#L623-L635) L623-L635：
+
+```javascript
+if (type === "calendar") {
+  if (integrations) {
+    if (Array.isArray(integrations)) {
+      widget.integrations = integrations.map((integration) => {
+        if (!integration || typeof integration !== "object") {
+          return integration;
+        }
+        const { url, ...integrationWithoutUrl } = integration;   // ← 删除了 url！
+        return integrationWithoutUrl;
+      });
+    }
+  }
+}
+```
+
+**关键发现：日历集成配置中的 `url` 字段在配置清洗时被主动删除了！**
+
+这意味着传给前端的 integration 对象中 **没有 `url`**，只有 `type`、`key` 等字段。那 `baseUrl` 从哪来？
+
+查看测试文件 [sonarr.test.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/sonarr.test.jsx#L32) L32：
+
+```javascript
+config={{ type: "sonarr", baseUrl: "https://sonarr.example", color: "teal" }}
+```
+
+测试中 `baseUrl` 是直接传入的。但实际运行时，在配置清洗中 `url` 被删除后，`baseUrl` 字段并未被显式添加。
+
+因此 **在实际运行中**，如果没有在 integration 配置中显式设置 `baseUrl`（作为独立于 `url` 的字段），`config.baseUrl` 将为 `undefined`，导致 **所有日历事件都不可点击**。
+
+这是设计上的一个有意行为：由于服务端代理机制使得前端不知道 Sonarr/Radarr 的真实 URL（只通过 `/api/services/proxy` 中转），日历事件默认就无法直接链接到 Sonarr/Radarr 的 Web 界面。用户需要额外配置 `baseUrl` 字段才能启用跳转链接。
+
+#### 11.4.4 `titleSlug` 缺失时的防御
+
+Sonarr 的 `event.series.titleSlug` 和 Radarr 的 `event.titleSlug` 依赖于上游 API 返回数据的完整性：
+
+- **Sonarr**：由于 `calendar` mapping 声明了 `includeSeries: "true"`，`event.series` 对象通常存在
+- **Radarr**：`event.titleSlug` 是电影资源的标准字段，通常存在
+
+但如果 API 返回异常数据导致字段缺失，短路求值确保 `url` 为 `undefined` 而非拼接出无效 URL（如 `https://sonarr/series/undefined`）。
+
+#### 11.4.5 Sonarr 队列标题的防御性处理
+
+[sonarr/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/sonarr/component.jsx#L14-L22) L14-L22：
+
+```javascript
+function getTitle(queueEntry, seriesData) {
+  let title = "";
+  const seriesTitle = seriesData.find((entry) => entry.id === queueEntry.seriesId)?.title;
+  if (seriesTitle) title += `${seriesTitle}: `;
+  const { episodeTitle } = queueEntry;
+  if (episodeTitle) title += episodeTitle;
+  if (title === "") return null;
+  return title;
+}
+```
+
+防御逻辑：
+
+| 场景 | seriesTitle | episodeTitle | 返回值 | 使用处 |
+|------|-------------|--------------|--------|--------|
+| 正常 | "Breaking Bad" | "Pilot" | `"Breaking Bad: Pilot"` | QueueEntry title |
+| 缺少剧集名 | "Breaking Bad" | undefined | `"Breaking Bad: "` | QueueEntry title |
+| 缺少剧集标题 | undefined | "Pilot" | `"Pilot"` | QueueEntry title |
+| 都缺失 | undefined | undefined | `null` | 降级为 `t("sonarr.unknown")` |
+
+而 Radarr 的标题查找方式不同（[radarr/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/radarr/component.jsx#L64) L64）：
+
+```javascript
+title={moviesData.all.find((entry) => entry.id === queueEntry.movieId)?.title ?? t("radarr.unknown")}
+```
+
+使用 `?.` 可选链 + `??` 空值合并，如果 `find()` 返回 `undefined` 或找到的对象 `title` 为 `undefined`，都降级为 `t("radarr.unknown")`。
+
+---
+
+### 11.5 边界场景速查表
+
+| 场景 | 行为 | 影响 |
+|------|------|------|
+| `enableQueue` 未设置 | 4 个请求全部发出，队列详情不渲染 | 浪费一次 `queue/details` 请求 |
+| `enableQueue=false` 且 `queue/details` 出错 | 整个 Widget 进入错误态 | 正常统计也被隐藏 |
+| `enableQueue=true` 但队列为空 | `queueDetailsData.length === 0`，不渲染 QueueEntry | 正常，无额外影响 |
+| 日历 integration 的 `url` 被清洗删除 | `baseUrl` 为 undefined，事件不可点击 | 需用户额外配置 `baseUrl` |
+| 日历 integration 的 `titleSlug` 缺失 | `url` 为 undefined，单条事件不可点击 | 不影响其他事件 |
+| Sonarr 队列条目缺少 seriesId | `getTitle` 返回 `null`，降级为 `"unknown"` | 不影响其他条目 |
+| Radarr 队列条目 movieId 不匹配 | `find` 返回 `undefined`，降级为 `"unknown"` | 不影响其他条目 |
+| Sonarr 日历错误 | 该集成事件不添加，显示 Error 提示 | 不影响 Radarr 等其他集成 |
+| `settings.hideErrors=true` | Widget 错误和日历集成错误都隐藏 | 用户无法感知异常 |
+| `widget.hide_errors=true` | Widget 错误隐藏，日历集成错误 **可能仍显示** | 日历集成未传递此字段 |
+| `event.series` 为 null (Sonarr) | `event.series.title` 抛异常 | ⚠️ **未防御，可能导致集成崩溃** |
+
+> **最后一条**是真正的隐患：[sonarr.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/sonarr.jsx#L24) L24 的 `event.series.title` 如果 `event.series` 为 `null`，将抛出 `TypeError: Cannot read properties of null`。虽然 `includeSeries: "true"` 通常保证 `series` 存在，但极端情况下（如 Sonarr API 返回不完整数据）可能触发此问题。Radarr 不受影响，因为它直接访问 `event.title`，不依赖嵌套对象。
+
+---
+
+## 十二、相关文件索引
 
 | 文件路径 | 职责 |
 |----------|------|
@@ -633,5 +1106,10 @@ sonarrData?.forEach((event) => {
 | [src/widgets/radarr/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/radarr/component.jsx) | Radarr UI 组件 |
 | [src/widgets/calendar/integrations/sonarr.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/sonarr.jsx) | Sonarr 日历集成 |
 | [src/widgets/calendar/integrations/radarr.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/radarr.jsx) | Radarr 日历集成 |
+| [src/widgets/calendar/integrations/sonarr.test.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/sonarr.test.jsx) | Sonarr 日历集成测试 |
+| [src/widgets/calendar/integrations/radarr.test.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/integrations/radarr.test.jsx) | Radarr 日历集成测试 |
+| [src/widgets/calendar/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/calendar/component.jsx) | 日历主组件（集成加载 + 配置合并） |
+| [src/components/services/widget/container.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/components/services/widget/container.jsx) | Widget 容器（错误拦截 + 字段过滤 + 高亮） |
+| [src/components/services/widget/error.jsx](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/components/services/widget/error.jsx) | 错误展示组件（容错格式化 + 可折叠面板） |
 | [src/widgets/widgets.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/widgets.js) | Widget 定义注册表 |
 | [src/widgets/components.js](file:///d:/fz/0601/solo-dogfeeding/code/197-homepage/src/widgets/components.js) | Widget 组件注册表（懒加载） |
