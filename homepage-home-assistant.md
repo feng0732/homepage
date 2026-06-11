@@ -767,7 +767,7 @@ HA API 原始响应
 └─────────────────────────────────────────────────┘
 ```
 
-### 10.6 Container 字段过滤的匹配规则
+### 10.7 Container 字段过滤的匹配规则
 
 [Container](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/components/services/widget/container.jsx#L34-L63) 的过滤逻辑核心：
 
@@ -797,6 +797,195 @@ visibleChildren = childrenArray?.filter((child) =>
 - HA 的 `component.jsx` 创建 `<Block label={d.label} />` 时没有传 `field` prop
 - 因此 Container 匹配时使用 `child.props.label`，即 proxy.js 返回的 `label` 值
 - 如果 custom 查询的 label 是 `"Living Room"`，fields 中必须写完整的 `"homeassistant.Living Room"` 才能匹配——但这基本不可行，这就是互斥设计的根本原因
+
+### 10.8 `fields` 空值边界的完整行为分析
+
+`fields` 在 YAML 中有多种合法写法，而服务端和前端对每种值的处理**逻辑不同**，这造成了一系列不对称的边界行为。下面逐个场景分析。
+
+#### 前置知识：两条路径对 `fields` 的解析差异
+
+`fields` 在整个生命周期中经过两套独立的解析逻辑：
+
+**服务端路径** — `getServiceWidget()` → 返回原始 YAML 解析结果，**不做任何 fields 格式处理**：
+
+```
+YAML → yaml.load() → parseServicesToGroups() → 直接展开到 service 对象
+                                                          ↓
+                                              widget.fields = YAML 原始值（数组或字符串）
+```
+
+[proxy.js#L79](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/widgets/homeassistant/proxy.js#L79) 中 `!widget.fields` 的判断直接作用于这个原始值。
+
+**前端路径** — `cleanServiceGroups()` → 对 fields 做了专门的格式归一化，然后才传入前端 widget 对象：
+
+```
+YAML → yaml.load() → parseServicesToGroups() → cleanServiceGroups()
+                                                      ↓
+                                              fields 格式归一化:
+                                              - 数组 → 直接保留
+                                              - 字符串 → JSON.parse() 尝试解析
+                                                - 成功 → 使用解析后的数组
+                                                - 失败 → fieldsList = null
+                                              - 其他 → fieldsList = 原值
+                                                      ↓
+                                              widget.fields = fieldsList || null
+```
+
+[service-helpers.js#L441-L453](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/utils/config/service-helpers.js#L441-L453) 中做了 try-catch 保护。
+
+**前端 Container 二次解析** — [container.jsx#L35-L36](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/components/services/widget/container.jsx#L35-L36)：
+
+```javascript
+let fields = service?.widget?.fields;
+if (typeof fields === "string") fields = JSON.parse(service.widget.fields);
+```
+
+**没有 try-catch！** 如果走到这里且 fields 是无效 JSON 字符串，会直接抛出异常导致组件白屏崩溃。
+
+#### 逐场景行为分析
+
+##### 场景 1：`fields` 未配置（YAML 中不写 fields）
+
+```yaml
+widget:
+  type: homeassistant
+  url: http://hassio:8123
+  key: xxx
+```
+
+| 环节 | `fields` 的值 | 行为 |
+|------|--------------|------|
+| YAML 解析结果 | `undefined` | — |
+| 服务端 `getServiceWidget` | `undefined` | `!undefined` = `true` → 如果有 `custom` 则使用 custom 查询 |
+| `cleanServiceGroups` 处理 | 解构出 `undefined` → `fieldsList = undefined` → `fieldsList \|\| null` = `null` | 前端 widget.fields = `null` |
+| Container 二次解析 | `null`（不是 string）→ 跳过 JSON.parse | `fields = null` |
+| Container 过滤判断 | `if (fields && type)` → `null && "homeassistant"` = `false` | **不过滤，显示全部 Block** |
+
+**结果**：服务端和前端一致——如果配置了 custom 就显示全部自定义查询结果；没有 custom 时使用默认查询并显示全部 3 个 Block。
+
+##### 场景 2：`fields: []`（空数组）
+
+```yaml
+widget:
+  type: homeassistant
+  url: http://hassio:8123
+  key: xxx
+  fields: []
+```
+
+| 环节 | `fields` 的值 | 行为 |
+|------|--------------|------|
+| 服务端 `getServiceWidget` | `[]` | `![]` = `false`（空数组是 truthy！）→ **custom 被阻断**，使用默认查询 |
+| `cleanServiceGroups` 处理 | `[]`（数组直接保留）→ `fieldsList = []` → `[] \|\| null` = `[]`（空数组也是 truthy！） | 前端 widget.fields = `[]` |
+| Container 二次解析 | `[]`（不是 string）→ 跳过 JSON.parse | `fields = []` |
+| Container 过滤判断 | `if (fields && type)` → `[] && "homeassistant"` = `"homeassistant"` = **truthy** | 进入过滤 |
+| Container 过滤执行 | `fields.some(...)` = `false`（空数组 some 永远返回 false） | **所有 Block 被过滤掉，卡片内容为空** |
+
+**结果**：服务端用默认查询返回 3 条数据，但前端全部过滤掉。**卡片无内容，但不报错——这是静默空白的陷阱场景。**
+
+##### 场景 3：`fields: ""`（空字符串）
+
+```yaml
+widget:
+  type: homeassistant
+  url: http://hassio:8123
+  key: xxx
+  fields: ""
+```
+
+| 环节 | `fields` 的值 | 行为 |
+|------|--------------|------|
+| 服务端 `getServiceWidget` | `""` | `!""` = `true`（空字符串是 falsy）→ 如果有 `custom` 则**使用 custom 查询** |
+| `cleanServiceGroups` 处理 | `typeof fields === "string"` → `JSON.parse("")` → **抛出 SyntaxError** → catch 中 `fieldsList = null` → `null \|\| null` = `null` | 前端 widget.fields = `null` |
+| Container 二次解析 | `null`（不是 string）→ 跳过 JSON.parse | `fields = null` |
+| Container 过滤判断 | `if (fields && type)` → `null && "homeassistant"` = `false` | **不过滤，显示全部 Block** |
+
+**结果**：服务端和前端**逻辑一致**——空字符串等同于未配置。但如果同时配了 `custom`，服务端会使用 custom 查询（因为 `!""` 为 true），前端则显示全部返回结果。
+
+##### 场景 4：`fields` 为合法 JSON 字符串
+
+```yaml
+widget:
+  type: homeassistant
+  url: http://hassio:8123
+  key: xxx
+  fields: "[\"people_home\",\"lights_on\"]"
+```
+
+> 注意：YAML 中 `fields: '["people_home"]'` 这种写法在 yaml.load() 后 `fields` 会变成字符串 `'[\"people_home\"]'`。而 `fields: ["people_home"]` 写法 yaml.load() 后直接就是数组。
+
+| 环节 | `fields` 的值 | 行为 |
+|------|--------------|------|
+| 服务端 `getServiceWidget` | `'[\"people_home\",\"lights_on\"]'`（字符串） | `!string` = `false` → **custom 被阻断**，使用默认查询 |
+| `cleanServiceGroups` 处理 | `typeof fields === "string"` → `JSON.parse(...)` 成功 → `fieldsList = ["people_home","lights_on"]` → truthy | 前端 widget.fields = `["people_home","lights_on"]` |
+| Container 二次解析 | 已经是数组 → 跳过 JSON.parse | `fields = ["people_home","lights_on"]` |
+| Container 过滤判断 | `if (fields && type)` → truthy | 进入过滤 |
+| Container 过滤执行 | 匹配 `homeassistant.people_home` 和 `homeassistant.lights_on` | 只显示匹配的 2 个 Block |
+
+**结果**：行为正确，与预期一致。
+
+##### 场景 5：`fields` 为无效 JSON 字符串（解析失败）
+
+```yaml
+widget:
+  type: homeassistant
+  url: http://hassio:8123
+  key: xxx
+  fields: "people_home,lights_on"
+```
+
+| 环节 | `fields` 的值 | 行为 |
+|------|--------------|------|
+| 服务端 `getServiceWidget` | `"people_home,lights_on"`（字符串） | `!string` = `false` → **custom 被阻断**，使用默认查询 |
+| `cleanServiceGroups` 处理 | `typeof fields === "string"` → `JSON.parse("people_home,lights_on")` → **抛出 SyntaxError** → catch 中 `fieldsList = null` → `null \|\| null` = `null` | 前端 widget.fields = `null`（**有 try-catch 保护**） |
+| Container 二次解析 | `null` → 跳过 JSON.parse | `fields = null` |
+| Container 过滤判断 | `if (fields && type)` → `false` | 不过滤 |
+
+**但这里有一个危险的不对称！**
+
+服务端 `getServiceWidget` 返回的是**原始 YAML 解析结果**，其中 `fields = "people_home,lights_on"`（非空字符串 → truthy → 阻断 custom）。而前端 widget.fields 经过 `cleanServiceGroups` 归一化后是 `null`（不过滤 Block）。
+
+所以如果用户同时配了 `custom`：
+- 服务端：`!widget.fields` = `!"people_home,lights_on"` = `false` → **custom 被阻断**，用默认查询
+- 前端：`fields = null` → 不过滤 → 显示全部 3 个默认 Block
+
+如果用户没配 `custom`：
+- 服务端：默认查询
+- 前端：显示全部
+
+两种情况下前端表现相同，但原因不同。
+
+##### 场景 6：`fields` 为无效 JSON 字符串且前端 Container 触发了二次 JSON.parse
+
+有一种更危险的情况：如果由于某种原因（如未来代码变更、或缓存不一致），前端 Container 收到的 `fields` 仍然是字符串但 `cleanServiceGroups` 的 try-catch 未曾将其归一化，则 [container.jsx#L36](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/components/services/widget/container.jsx#L36) 的裸 `JSON.parse(service.widget.fields)` 会直接抛异常：
+
+```javascript
+// container.jsx 第 36 行 — 无 try-catch！
+if (typeof fields === "string") fields = JSON.parse(service.widget.fields);
+//                                                  ↑ 如果是无效 JSON → Uncaught SyntaxError
+//                                                  → 组件崩溃，白屏
+```
+
+**当前版本的防御依赖**：`cleanServiceGroups` 在前面已经把无效 JSON 字符串归一化为 `null`，所以正常流程不会走到这里。但这是一个**隐式依赖**而非显式防护——如果有人修改了 `cleanServiceGroups` 的逻辑，Container 就会失去保护。
+
+#### 边界场景汇总表
+
+| YAML 写法 | `getServiceWidget` 返回的 fields | 服务端 `!fields` | 服务端查询选择 | `cleanServiceGroups` 后前端 fields | 前端过滤 | 最终卡片 |
+|-----------|----------------------------------|:---:|---------|-------------------------------|---------|---------|
+| 不写 fields | `undefined` | `true` | custom（如有）/ 默认 | `null` | 不过滤 | 全部显示 |
+| `fields: []` | `[]` | `false` | **默认**（custom 被阻断） | `[]` | **全部过滤掉** | **空白卡片** |
+| `fields: ""` | `""` | `true` | custom（如有）/ 默认 | `null` | 不过滤 | 全部显示 |
+| `fields: ["people_home"]` | `["people_home"]` | `false` | **默认**（custom 被阻断） | `["people_home"]` | 只显示匹配项 | 部分显示 |
+| `fields: '["people_home"]'` | `'["people_home"]'` | `false` | **默认**（custom 被阻断） | `["people_home"]` | 只显示匹配项 | 部分显示 |
+| `fields: "invalid"` | `"invalid"` | `false` | **默认**（custom 被阻断） | `null` | 不过滤 | 全部显示（服务端用了默认查询） |
+
+#### 核心发现
+
+1. **`fields: []` 是最危险的边界**：服务端阻断 custom（空数组 truthy），前端全部过滤掉（空数组 some 返回 false），导致卡片静默空白，无错误提示。
+
+2. **服务端和前端对"空"的判断标准不同**：服务端 `!widget.fields` 只认 JS falsy（`undefined/null/false/""/0`），前端 `cleanServiceGroups` 额外处理了 JSON 解析失败的情况，两者对同一份配置可能做出不同的"是否有 fields"的判断。
+
+3. **Container 的 `JSON.parse` 缺少 try-catch**：[container.jsx#L36](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/components/services/widget/container.jsx#L36) 的裸解析依赖上游 `cleanServiceGroups` 的保护，属于隐式耦合。如果上游防护被绕过（例如直接传入未处理的字符串），会导致组件白屏崩溃。
 
 ---
 
@@ -992,7 +1181,7 @@ homeassistant 组件（不可配置）:
 | **视觉反馈** | 无闪烁，数据静默替换 | 页面显示加载中 → 完整重新渲染 |
 | **触发文件** | [component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/widgets/homeassistant/component.jsx#L9) | [index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/pages/index.jsx#L110-L131) + [hash.js](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/pages/api/hash.js) + [revalidate.js](file:///d:/fz/0601/solo-dogfeeding/code/199-homepage/src/pages/api/revalidate.js) |
 
-### 12.2 定时刷新的精确行为
+### 12.3 定时刷新的精确行为
 
 ```
 SWR refreshInterval: 60000 (60秒)
@@ -1021,7 +1210,7 @@ SWR refreshInterval: 60000 (60秒)
 - 代理接口每次执行都会通过服务端配置重新定位 widget，所以 `custom`、`url`、`key` 以及服务端用于取舍查询的 `fields` 可能在下一次代理请求中被感知
 - 前端已经拿到的 widget 对象不会因定时刷新而更新，因此 `fields` 的界面过滤、`hide_errors` 和高亮配置等前端行为仍要等服务列表重新获取或整页重载后才同步
 
-### 12.3 配置重载的精确行为
+### 12.4 配置重载的精确行为
 
 ```
 配置文件修改 (services.yaml, settings.yaml 等)
@@ -1052,7 +1241,7 @@ index.jsx 中的 useEffect 检测 hash 变化
 - 页面挂载和 SWR 默认重新验证会读取 `/api/hash`，窗口聚焦时还会显式调用 `mutateHash()` 再查一次
 - 因此配置变更通常在页面初次加载、窗口重新聚焦或 SWR 重新验证 hash 时被发现，而不是 Home Assistant widget 的 60 秒数据刷新直接触发整页重载
 
-### 12.4 两种刷新分别触发哪些更新
+### 12.5 两种刷新分别触发哪些更新
 
 | 更新内容 | 定时刷新 (60s) | 配置重载 |
 |---------|:---:|:---:|
@@ -1072,7 +1261,7 @@ index.jsx 中的 useEffect 检测 hash 变化
 - 这造成了一个不对称：改 `custom` 可能在下一次代理刷新后生效；改 `fields` 可能先影响服务端查询取舍，但前端过滤规则要等配置重载后才和服务端一致
 - **`refreshInterval` 特殊说明**：当前版本硬编码为 60 秒（第 12.1 节详述），改 YAML 的 `refreshInterval` 对 HA widget 没有任何效果，无论定时刷新还是配置重载都不能改变它
 
-### 12.5 窗口聚焦触发的双重效果
+### 12.6 窗口聚焦触发的双重效果
 
 当用户切回浏览器标签页时，两件事同时发生：
 
