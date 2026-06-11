@@ -11,7 +11,7 @@
 2. **K8s Component 缺失 `data.error` 检测**：API 返回 500 `{ error: "..." }` 时，不进 error 分支，而是显示 "offline" 或抛出 TypeError
 3. **K8s Status 徽章缺失 `data.error` 检测**：API 返回 500 时，显示灰色 "unknown"，而非红色 "error"
 4. **K8s Stats API 返回 `{ error: "..." }` 时，`statsData.stats` 为 undefined**，访问 `statsData.stats.cpuLimit` 会抛 TypeError（潜在 Bug）
-5. **Error 组件的 `error.data.error` 检查永远不命中**：fetcher 不构造这种结构
+5. **Error 组件的 `error.data.error` 适用范围精确限定**：仅在 Proxy 路径的特定场景命中，K8s/Docker 路径永远不命中
 6. **空组展示由 `pruneEmptyGroups()` 最终决定**：layout 定义的空组如果没有子组或服务，会被剪掉
 
 ---
@@ -709,10 +709,10 @@ if (error) {
 
 ```jsx
 // L21-L23: 解包 error.data.error
-// ★ 代码事实：error.data.error 永远不存在！
-// 因为本项目的 fetcher 没有构造这种结构。只有自定义 fetcher 手动 throw { data: ... } 才会有。
+// ★ 关键代码：这是一个"解包"机制，用于从嵌套的错误结构中提取最内层的实际错误
+// ★ 适用范围：仅在 Proxy 路径的特定场景命中，K8s/Docker 直接 useSWR 路径永远不命中
 if (error?.data?.error) {
-  error = error.data.error;
+  error = error.data.error; // eslint-disable-line no-param-reassign
 }
 ```
 
@@ -720,6 +720,214 @@ if (error?.data?.error) {
 - 渲染为可展开的 `<details>` 元素
 - 显示 API error message、请求 URL、raw error、response data
 - 错误对象归一化：string → `{ message }`, number → `{ message: "Error N" }`
+
+---
+
+#### ★ `error.data.error` 适用范围的精确限定（两条路径的本质区别）
+
+**两条根本不同的错误传播路径：**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ 路径 A：Proxy 路径（经过 useWidgetAPI）                            │
+│   xteve / watchtower / wgeasy / yourspotify / zabbix 等 100+ widget │
+│   → 使用 useWidgetAPI() hook                                        │
+│   → 会执行 error: data?.error ?? error 转换                         │
+│   → 错误对象结构丰富，可能包含 data.error                           │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 路径 B：直接 useSWR 路径（K8s / Docker）                            │
+│   → 直接使用 useSWR(url)                                            │
+│   → 不经过 useWidgetAPI，无 data.error 提升                          │
+│   → error.data.error 永远不存在！                                   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+##### 路径 A：Proxy 路径经过 useWidgetAPI 的完整错误链
+
+**全局 fetcher** [index.jsx L186](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/index.jsx#L186)：
+```jsx
+fetcher: (resource, init) => fetch(resource, init).then((res) => res.json())
+```
+不检查 `res.ok`，HTTP 4xx/5xx 也进入 `data`，不会抛异常。
+
+**useWidgetAPI 关键转换** [use-widget-api.js L16](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/utils/proxy/use-widget-api.js#L16)：
+```javascript
+return { data, error: data?.error ?? error, mutate };
+```
+将 `data.error` 提升为 `error` 返回值。
+
+---
+
+###### 子路径 A1：httpProxy 网络级错误（DNS 失败/连接超时/拒绝连接）
+
+**httpProxy 网络错误返回** [http.js L281-L292](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/utils/proxy/http.js#L281-L292)：
+```javascript
+return [
+  500,
+  "application/json",
+  {
+    error: {
+      message: rawError?.message ?? "Unknown error",
+      url: sanitizeErrorURL(url),
+      rawError,  // 原始 Error 对象
+    },
+  },
+  null,
+];
+```
+
+**genericProxyHandler 包装** [generic.js L75-L90](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/utils/proxy/handlers/generic.js#L75-L90)：
+```javascript
+return res.status(status).json({
+  error: {
+    message: "HTTP Error",
+    url: sanitizeErrorURL(url),
+    data: { error: { message: "Unknown error", url: "...", rawError: Error } },
+  },
+});
+```
+
+**完整数据流转：**
+```
+1. fetcher 解析 → data = {
+     error: {
+       message: "HTTP Error",
+       url: "...",
+       data: { error: { message: "Unknown error", ... } }  // 嵌套的内层错误
+     }
+   }
+2. useWidgetAPI → error = data.error = {
+     message: "HTTP Error",
+     url: "...",
+     data: { error: { message: "Unknown error", ... } }
+   }
+3. Error 组件 L21 → error.data.error 存在 → 解包 → error = {
+     message: "Unknown error",
+     url: "...",
+     rawError: Error
+   }
+```
+
+**✅ `error.data.error` 必然命中！** 这是设计该机制的主要场景。
+
+---
+
+###### 子路径 A2：上游 HTTP 4xx/5xx + 上游响应恰好包含 `error` 字段
+
+**genericProxyHandler 返回** [generic.js L84-L90](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/utils/proxy/handlers/generic.js#L84-L90)：
+```javascript
+return res.status(status).json({
+  error: {
+    message: "HTTP Error",
+    url: "...",
+    data: "<上游原始响应>",  // 如果上游返回 { error: "something" }
+  },
+});
+```
+
+**数据流转：**
+- 当上游响应恰好是 `{ error: "something" }` 时
+- `error.data` = `{ error: "something" }`
+- `error.data.error` = `"something"`（字符串）
+- ✅ 命中，解包后 error = `"something"` → 再包装为 `{ message: "something" }`
+
+---
+
+###### 子路径 A3：urbackup 代理错误（特殊情况）
+
+**urbackup 返回** [urbackup/proxy.js L28](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/widgets/urbackup/proxy.js#L28)：
+```javascript
+res.status(500).json({ error: "Error communicating with UrBackup server" });
+```
+
+**数据流转：**
+1. fetcher → `data = { error: "Error communicating with UrBackup server" }`
+2. useWidgetAPI → `error = "Error communicating with UrBackup server"`（**字符串！**）
+3. Error 组件 L15 → 包装为 `{ message: "Error communicating with UrBackup server" }`
+4. `error.data.error` = undefined（字符串没有 data 属性）
+
+**❌ `error.data.error` 不命中**
+
+---
+
+###### 子路径 A4：proxy.js 参数验证错误
+
+**proxy.js 返回** [proxy.js L24](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/services/proxy.js#L24)：
+```javascript
+return res.status(403).json({ error: "Unknown proxy service type" });
+```
+
+**数据流转：** 与 A3 相同，error 是字符串
+**❌ `error.data.error` 不命中**
+
+---
+
+###### 子路径 A5：wgeasy 手动构造错误对象
+
+**wgeasy 构造** [wgeasy/component.jsx L18](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/widgets/wgeasy/component.jsx#L18)：
+```javascript
+error = { message: infoData.statusMessage, data: infoData }
+```
+
+**数据流转：**
+- `error.data` = `infoData`（上游 API 返回的数据）
+- `error.data.error` = 取决于 infoData.error 是否存在
+- **✅ 可能命中也可能不命中**，取决于上游 API
+
+---
+
+##### 路径 B：K8s/Docker 直接 useSWR 路径
+
+**K8s Component** [kubernetes/component.jsx L13-L17](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/widgets/kubernetes/component.jsx#L13-L17)：
+```jsx
+const { data: statusData, error: statusError } = useSWR(`/api/kubernetes/status/...`);
+const { data: statsData, error: statsError } = useSWR(`/api/kubernetes/stats/...`);
+```
+
+**Docker Component** [docker/component.jsx L13-L17](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/widgets/docker/component.jsx#L13-L17)：
+```jsx
+const { data: statusData, error: statusError } = useSWR(`/api/docker/status/...`);
+const { data: statsData, error: statsError } = useSWR(`/api/docker/stats/...`);
+```
+
+**关键差异**：不经过 `useWidgetAPI`，没有 `data.error` 提升！
+
+---
+
+###### 子路径 B1：网络级错误（fetch 抛出）
+- SWR `error` = TypeError（原生 Error 对象）
+- `error.data.error` = undefined（Error 对象没有 data 属性）
+**❌ 不命中**
+
+---
+
+###### 子路径 B2：HTTP 4xx/5xx 返回 `{ error: "..." }`
+- fetcher 不检查 `res.ok` → `data = { error: "..." }`，`error = undefined`
+- K8s Component 不检测 `data.error` → **不会进入 error 分支**
+- Docker Component 检测 `data.error` → 传入 `error = { error: "..." }`（无 data 字段）
+- `error.data.error` = undefined
+**❌ 不命中**
+
+---
+
+##### `error.data.error` 命中场景汇总表
+
+| 路径 | 场景 | 是否命中 | 备注 |
+|------|------|----------|------|
+| A1 | httpProxy 网络级错误（DNS/超时/拒绝连接） | ✅ **必然命中** | 双重嵌套结构设计的解包机制 |
+| A2 | 上游 HTTP 4xx/5xx + 上游响应含 `error` 字段 | ✅ 可能命中 | 只有当上游恰好返回 `{ error: "..." }` 时 |
+| A3 | urbackup 代理错误 | ❌ 不命中 | error 是字符串 |
+| A4 | proxy.js 参数验证错误 | ❌ 不命中 | error 是字符串 |
+| A5 | wgeasy 手动构造 + 上游含 `error` | ✅ 可能命中 | 取决于上游 API |
+| B1 | K8s/Docker 网络级错误 | ❌ **永远不命中** | 原生 Error 对象，无 data 属性 |
+| B2 | K8s/Docker API 返回 `{ error }` + 组件检测 | ❌ **永远不命中** | error 对象无 data 字段 |
+
+> **核心结论**：`error.data.error` 是为 **Proxy 路径** 设计的错误解包机制，**K8s/Docker 路径上永远不会命中**。这解释了为什么 Error 组件有这段代码，但 K8s 场景下看似是死代码——因为这段代码根本不是给 K8s/Docker 用的！
 
 ---
 
@@ -924,7 +1132,7 @@ pages/index.jsx (Home 组件)
 
 2. **Status 徽章业务级错误检测缺失**：`data.error` 场景下 `data.status` = undefined → 显示灰色 "unknown"
 
-3. **`error.data.error` 检查永远不命中**：Error 组件有此代码，但 fetcher 不构造这种结构
+3. **`error.data.error` 检查在 K8s 路径上永远不命中**：Error 组件有此代码，但这是给 Proxy 路径设计的解包机制，K8s/Docker 直接 useSWR 路径不会构造这种嵌套结构（详见 3.3.7 节的精确分析）
 
 ### 5.4 K8s 错误的分层降级
 
@@ -947,6 +1155,10 @@ pages/index.jsx (Home 组件)
 | `data.error` 检测 | ✅ 检测 `statsData?.error` + `statusData?.error` | ❌ 不检测 |
 | API 返回 500 `{ error }` | 进入 error 分支 → Error 组件 | Status: offline / unknown<br>Stats: 抛 TypeError |
 | 静默降级场景 | 无 | metrics-server 不可用 → 0 值显示 |
+| 是否经过 `useWidgetAPI` | ❌ 直接 `useSWR()` | ❌ 直接 `useSWR()` |
+| `error.data.error` 命中 | ❌ 永远不命中 | ❌ 永远不命中 |
+
+> **关键补充**：K8s 和 Docker 都不经过 `useWidgetAPI`，所以 `error.data.error` 在这两条路径上都永远不会命中。这段代码是给 **Proxy 路径（xteve/watchtower/wgeasy 等 100+ widget）** 设计的，详见 3.3.7 节。
 
 ### 5.6 安全设计
 
@@ -968,6 +1180,13 @@ pages/index.jsx (Home 组件)
 | 功能模块 | 文件路径 | 关键函数/组件 |
 |---------|---------|-------------|
 | SWR 全局 fetcher | [index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/index.jsx#L186) / [_app.jsx](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/_app.jsx#L77) | `fetcher` |
+| useWidgetAPI (Proxy 路径 hook) | [use-widget-api.js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/utils/proxy/use-widget-api.js#L16) | `useWidgetAPI()` |
+| Proxy API 主入口 | [proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/services/proxy.js) | `handler` |
+| 通用 Proxy Handler | [generic.js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/utils/proxy/handlers/generic.js) | `genericProxyHandler()` |
+| HTTP 请求底层 | [http.js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/utils/proxy/http.js#L252) | `httpProxy()` |
+| xteve Proxy Handler | [xteve/proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/widgets/xteve/proxy.js) | `xteveProxyHandler()` |
+| watchtower Proxy Handler | [watchtower/proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/widgets/watchtower/proxy.js) | `watchtowerProxyHandler()` |
+| urbackup Proxy Handler | [urbackup/proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/widgets/urbackup/proxy.js) | `urbackupProxyHandler()` |
 | Docker 连接配置 | [docker.js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/utils/config/docker.js) | `getDockerArguments()` |
 | Docker 服务发现 | [service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/utils/config/service-helpers.js) | `servicesFromDocker()` |
 | K8s 服务发现 | [service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/utils/config/service-helpers.js) | `servicesFromKubernetes()` |
@@ -989,7 +1208,7 @@ pages/index.jsx (Home 组件)
 | Docker 统计组件 | [docker/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/widgets/docker/component.jsx) | `Component` |
 | K8s 统计组件 | [kubernetes/component.jsx](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/widgets/kubernetes/component.jsx) | `Component` |
 | Widget 错误容器 | [container.jsx](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/components/services/widget/container.jsx) | `Container` |
-| Widget 错误展示 | [error.jsx](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/components/services/widget/error.jsx) | `Error` |
+| Widget 错误展示 | [error.jsx](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/components/services/widget/error.jsx#L21) | `Error` |
 | K8s Status API | [status/[...service].js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/status/[...service].js) | `handler` |
 | K8s Stats API | [stats/[...service].js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/kubernetes/stats/[...service].js) | `handler` |
 | Docker Status API | [status/[...service].js](file:///d:/fz/0601/solo-dogfeeding/code/193-homepage/src/pages/api/docker/status/[...service].js) | `handler` |
