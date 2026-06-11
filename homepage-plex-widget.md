@@ -384,57 +384,180 @@ if (error) {
 
 ## 六、完整数据流转时序图（以 Plex 为例）
 
+### 6.1 首次加载流程
+
 ```
 用户浏览器                                  Next.js 服务端                                Plex 服务器
    │                                            │                                            │
-   │ ① 加载首页，services 配置下发（含 widget）  │                                            │
-   │   （字段已清洗，无 url/key）                │                                            │
+   │ ① 加载首页，services 配置下发              │                                            │
+   │   （cleanServiceGroups 白名单清洗，           │                                            │
+   │    去除 url/key 等敏感字段）               │                                            │
    │                                            │                                            │
    │ ② useWidgetAPI(widget, "unified")          │                                            │
+   │    refreshInterval: 5000 (SWR 5s 轮询)    │                                            │
    │    GET /api/services/proxy                 │                                            │
-   │    ?group=Media&service=Plex               │                                            │
-   │    &index=0&endpoint=unified               │───► proxy.js handler(req, res)             │
-   │                                            │    1. getServiceWidget() 取完整配置         │
-   │                                            │       （含 url/key，敏感字段在服务端）       │
-   │                                            │    2. widgets["plex"].proxyHandler          │
-   │                                            │       = plexProxyHandler                    │
-   │                                            │    3. mappings.unified.endpoint="/"         │
-   │                                            │       → plexProxyHandler 内部忽略           │
-   │                                            │    4. plexProxyHandler(req, res)            │
-   │                                            │       ├─ fetchFromPlexAPI("/status/...")─────┼───► GET /status/sessions
-   │                                            │       │   headers: X-Plex-Token={key}        │◄──┐ XML Response
-   │                                            │       │   xml2json → size="2" (string)       │   │
-   │                                            │       ├─ 查 libraries 缓存                  │   │
-   │                                            │       │  (未命中) GET /library/sections ──────┼───► GET /library/sections
-   │                                            │       │   → 缓存 6h                          │◄──┐
-   │                                            │       ├─ 查 counts 缓存                      │   │
-   │                                            │       │  (未命中) 并行 N 个 GET /sections/...─┼───► ...
-   │                                            │       │   → parseInt 后累加, 缓存 10min      │◄──┘
-   │                                            │       └─ 聚合 {streams, albums, movies, tv} │
+   │    ?group=Media&service=Plex             │───► pages/api/services/proxy.js handler     │
+   │    &index=0&endpoint=unified             │                                            │
+   │                                            │    1. getServiceWidget() 取服务端完整配置 │
+   │                                            │       （含 url/key，前端看不到）             │
+   │                                            │    2. widgets["plex"].proxyHandler   │
+   │                                            │       → plexProxyHandler              │
+   │                                            │    3. mappings.unified.endpoint="/"     │
+   │                                            │       → plexProxyHandler 内部忽略，         │
+   │                                            │         自行决定调用哪些真实 API         │
    │                                            │                                            │
-   │◄──────────── 200 JSON ────────────────────┤                                            │
-   │  { streams:"2", movies:800, ... }          │                                            │
+   │                                            │    4. plexProxyHandler(req, res)          │
+   │                                            │       ├─ fetchFromPlexAPI("/status/     ├───► GET /status/sessions
+   │                                            │       │   sessions")                     │◄──┐ XML <MediaContainer size="2">
+   │                                            │       │   xml2json → size="2" (string)     │   │ streams 值来源
+   │                                            │       │   （此请求从不缓存）                 │   │
+   │                                            │       │                                     │   │
+   │                                            │       ├─ memory-cache.get(libraries.xxx)   │   │
+   │                                            │       │  = null（首次未命中）                 │   │
+   │                                            │       ├─ fetchFromPlexAPI("/library/       ├───► GET /library/sections
+   │                                            │       │   sections")                         │◄──┐ 返回所有媒体库
+   │                                            │       │   → cache.put(libraries,            │   │
+   │                                            │       │     TTL = 1000*60*60*6           │   │
+   │                                            │       │         = 21,600,000 ms = 6 小时    │   │
+   │                                            │       │                                     │   │
+   │                                            │       ├─ memory-cache.get(albums/movies/    │   │
+   │                                            │       │   tv.xxx) = null（首次未命中）       │   │
+   │                                            │       ├─ Promise.all(并行 N 个)               │   │
+   │                                            │       │   ├─ movie 库 → GET /library/      ├───► GET .../all
+   │                                            │       │   │   sections/{key}/all              │◄──┐
+   │                                            │       │   ├─ show 库 → GET .../all         │   │
+   │                                            │       │   └─ artist 库 → GET .../albums         │   │
+   │                                            │       │   → parseInt(..., 10) 转为 number        │   │
+   │                                            │       │   → 累加 movies/tv/albums           │   │
+   │                                            │       │   → cache.put(albums/movies/tv,        │   │
+   │                                            │       │     TTL = 1000*60*10              │   │
+   │                                            │       │         = 600,000 ms = 10 分钟    │   │
+   │                                            │       └─ 聚合返回值                          │   │
+   │                                            │          { streams:"2", albums:150,        │◄──┘
+   │                                            │            movies:800, tv:3000 }            │
    │                                            │                                            │
-   │ ③ SWR 收到 data，触发重渲染                │                                            │
-   │    Container + 4 个 Block                  │                                            │
-   │    t("common.number") 格式化显示            │                                            │
+   │◄─────────────── 200 JSON ──────────────────┤                                            │
+   │  { streams:"2", albums:150,                │                                            │
+   │    movies:800, tv:3000 }                    │                                            │
    │                                            │                                            │
-   │ ④ 每 5s 刷新一次（refreshInterval:5000）    │──────── 同 ②，只重取 streams（缓存命中）─────┤
+   │ ③ SWR 收到 data，触发 React 重渲染            │                                            │
+   │    Container → 4 个 Block                       │                                            │
+   │    t("common.number", { value }) 格式化      │                                            │
+   │    （value 为 string "2" 时内部 Number()）     │                                            │
+   │    显示：2 / 150 / 800 / 3,000            │                                            │
 ```
+
+### 6.2 5 秒轮询与缓存过期的配合
+
+```
+t=0s     首次请求（见上图）
+          streams: 实时请求（未缓存）
+          libraries: 未命中 → 请求 Plex → 缓存 6h（过期时间 = t0 + 6h）
+          counts(movies/tv/albums): 未命中 → 请求 Plex → 缓存 10min（过期 = t0 + 10min）
+          ↓
+t=5s     SWR refreshInterval: 5000 触发（页面可见时才触发）
+         GET /api/services/proxy（第 2 次）
+         streams: 实时请求 Plex，重新取（可能变也可能不变）
+         libraries: memory-cache.get() → 命中（剩余 TTL ≈ 5h59m55s）
+         counts: memory-cache.get() → 命中（剩余 TTL ≈ 9m55s）
+         返回: movies/tv/albums 值与 t=0s 完全相同
+         ↓
+t=10s    SWR 第 3 次请求
+         ...同上，libraries/counts 仍命中缓存
+         streams 每次都重新请求 Plex
+         ↓
+         ...（每 5s 重复一次 streams 实时请求 + counts/libraries 读缓存）...
+         ↓
+t=10min (600s)   第 121 次 SWR 请求
+         streams: 实时请求
+         libraries: 命中（剩余 ≈ 5h50m）
+         counts: memory-cache.get() → null（TTL 到点过期了！）
+         → 重新并行请求 N 个库的 all/albums
+         → parseInt 累加
+         → cache.put()，新过期时间 = t600 + 10min
+         返回: streams 可能变化，movies/tv/albums 也可能变化了
+         ↓
+         ...（再 5s 一轮，counts 又开始新一轮缓存 10min 周期...）
+         ↓
+t=6h (21,600s)   libraries TTL 到点过期
+         → 重新请求 /library/sections，刷新媒体库列表（如新添加了某个库）
+         → cache.put()，新过期时间 = t6h + 6h
+```
+
+> **SWR refreshInterval 行为说明**：`src/utils/proxy/use-widget-api.js` 将 `refreshInterval: 5000` 直接透传给 `useSWR(url, config)`。SWR 默认在页面不可见（tab 切到后台）时暂停轮询，页面重新可见时立即触发一次请求。
 
 ---
 
 ## 七、Plex "不显眼"的代码层面原因总结
 
-| 维度 | Plex | Emby/Jellyfin | Tautulli |
-|------|------|---------------|----------|
-| **流展示** | ❌ 只显示 streams 数字 | ✅ 有播放进度条、播放控制、标题滚动显示 | ✅ 有播放进度条、标题滚动显示 |
-| **调用次数** | 1 次 `unified` 请求（proxy 内部聚合 4~N 个 API） | 2 次独立请求（Sessions + Count） | 1 次请求（`get_activity`，不含计数） |
-| **Proxy 复杂度** | 高（自定义 XML 处理 + 4 键缓存） | 中（Jellyfin 需自定义 Header，Emby 通用 proxy 即可） | 低（通用 proxy 即可） |
-| **配置项** | 少（仅 fields/hideErrors 通用项） | 多（enableBlocks/enableNowPlaying/enableUser/showEpisodeNumber 等 6+） | 多（enableUser/showEpisodeNumber 等 3+） |
-| **渲染复杂度** | 4 Block 基础组件 | CountBlocks + 自定义 SessionEntry + 播放控制按钮 | 自定义播放条组件（无 Block） |
-| **Proxy 内部聚合** | ✅ 是 | ❌ 否，各自独立 endpoint | ❌ 否 |
-| **输出类型** | `streams` 为 string，其余为 number | 全部为 JSON 原生类型 | 全部为 JSON 原生类型 |
+### 7.1 全维度对比表
+
+| 维度 | Plex | Emby | Jellyfin | Tautulli |
+|------|------|------|----------|----------|
+| **流展示** | ❌ 只显示 streams 数字 | ✅ 进度条 + 播放控制 + 标题 | ✅ 进度条 + 播放控制 + 标题 | ✅ 进度条 + 标题（无播放控制） |
+| **前端请求次数** | 1 次 `unified`（proxy 内部聚合 4~N 个 API） | 2 次（Sessions + Count） | 2 次（Sessions + Count） | 1 次（`get_activity`，不含计数） |
+| **前端刷新频率** | `5000ms`（统一，所有字段） | Sessions `5000ms` / Count `60000ms` | Sessions `5000ms` / Count `60000ms` | `5000ms`（统一） |
+| **后端缓存** | `memory-cache`：libraries `1000*60*60*6` = **6h**，counts `1000*60*10` = **10min**，streams 不缓存 | 无（每次请求都打 Emby 服务） | 无（每次请求都打 Jellyfin 服务） | 无（每次请求都打 Tautulli 服务） |
+| **Proxy 复杂度** | 高（自定义 XML 处理 + 4 键缓存 + 多库聚合） | 低（通用 proxy 即可） | 中（自定义 Header，其余通用） | 低（通用 proxy 即可） |
+| **播放流数计算口径** | **服务端**：`xml2json` 直接取 `MediaContainer._attributes.size`（string，API 返回的会话总数，含空闲） | **前端**：`sessionsData.filter(s => s?.NowPlayingItem).length`（只算正在播放的，排除空闲会话） | **前端**：同 Emby，`sessionsData.filter(s => s?.NowPlayingItem).length` | **前端**：`activityData.response.data.sessions.length`（直接用数组长度，不额外过滤） |
+| **输出类型一致性** | 不一致：`streams` 为 string，其余为 number | 一致：全部 JSON 原生 number | 一致：全部 JSON 原生 number | 一致：全部 JSON 原生类型 |
+| **计数粒度** | movies + tv + albums（tv 为 show 类型库条目总数，未区分剧集/单集） | MovieCount + SeriesCount + EpisodeCount + SongCount（细粒度） | 同 Emby | 无计数字段 |
+| **流详情保留** | ❌ proxy 只取 `_attributes.size`，完整 Session 详情被丢弃 | ✅ 保留完整 `NowPlayingItem` + `PlayState` | ✅ 同 Emby | ✅ 保留完整 sessions 对象数组 |
+| **配置项数量** | 少（通用 fields / hideErrors / highlight） | 多（enableBlocks / enableNowPlaying / enableMediaControl / enableUser / expandOneStreamToTwoRows / showEpisodeNumber 等 6+） | 同 Emby，另加 version 切换 V1/V2 | 中（enableUser / expandOneStreamToTwoRows / showEpisodeNumber 等 3+） |
+| **渲染复杂度** | 4 Block 基础组件，无自定义 UI | CountBlocks（可选）+ SessionEntry × N + 播放控制按钮 | 同 Emby | 自定义播放条组件（无 Block） |
+
+### 7.2 播放流数计算口径详细对比
+
+四种服务对"当前播放流数量"的**统计口径完全不同**，直接影响显示值的含义：
+
+| Widget | 统计时机 | 统计位置 | 统计方式 | 含义 | 空闲时值 |
+|---|---|---|---|---|---|
+| **Plex** | 服务端（proxy） | `src/widgets/plex/proxy.js` L84 | `MediaContainer._attributes.size` | Plex API 返回的 Session 总数（含暂停/空闲的会话） | `"0"`（string） |
+| **Emby** | 前端渲染时 | `src/widgets/emby/component.jsx` L266-L277 | `sessionsData.filter(s => s?.NowPlayingItem).length` | **正在播放**的会话数（有 NowPlayingItem 才算） | `0`（number）+ 显示 `t("emby.no_active")` 文案 |
+| **Jellyfin** | 前端渲染时 | `src/widgets/jellyfin/component.jsx` L274-L277 | 同 Emby，`filter(NowPlayingItem)` | 同 Emby，正在播放的会话数 | `0` + 显示 `t("jellyfin.no_active")` 文案 |
+| **Tautulli** | 前端渲染时 | `src/widgets/tautulli/component.jsx` L170 | `activityData.response.data.sessions.length` | Tautulli 返回的 sessions 数组长度（Tautulli 已自行过滤掉非活跃） | `0` + 显示 `t("tautulli.no_active")` 文案 |
+
+> **容易误解的点**：同样显示"播放流数"，Plex 的数字可能比 Emby/Jellyfin 大——因为 Plex 把暂停/空闲的会话也计入了，而 Emby/Jellyfin 通过 `filter(s => s?.NowPlayingItem)` 只统计真正在播放的。
+
+### 7.3 5 秒轮询（refreshInterval）的代码实现细节
+
+所有媒体服务的实时数据（播放流）均使用 5 秒轮询，代码路径一致：
+
+1. **组件传入**：各 widget 的 component.jsx 中：
+   - Plex: `refreshInterval: 5000`（`src/widgets/plex/component.jsx` L13）
+   - Emby Sessions: `refreshInterval: enableNowPlaying ? 5000 : undefined`（`src/widgets/emby/component.jsx` L212）
+   - Jellyfin Sessions: 同 Emby（`src/widgets/jellyfin/component.jsx` L220）
+   - Tautulli: `refreshInterval: 5000`（`src/widgets/tautulli/component.jsx` L144）
+
+2. **Hook 透传**：`src/utils/proxy/use-widget-api.js` L6-L9：
+   ```javascript
+   const config = {};
+   if (options && options[1]?.refreshInterval) {
+     config.refreshInterval = options[1].refreshInterval;
+   }
+   const { data, error, mutate } = useSWR(url, config);
+   ```
+
+3. **SWR 实际行为**：
+   - 页面在前台可见时，**每隔 5000ms 触发一次** `/api/services/proxy` 请求
+   - 标签页切到后台（不可见）时，SWR 自动暂停轮询（浏览器 `visibilitychange` API），切回前台立即触发一次请求
+   - 请求失败时仍按 5s 继续轮询，不会退避（未配置 `errorRetryInterval`）
+
+### 7.4 10 分钟 / 6 小时缓存（memory-cache TTL）的代码实现细节
+
+仅 Plex 使用后端缓存，其余服务均不缓存。`memory-cache` NPM 包的 TTL 参数单位为**毫秒**，具体代码：
+
+| 缓存项 | 代码位置 | TTL 表达式 | 实际毫秒值 | 实际时长 |
+|---|---|---|---|---|
+| **libraries**（媒体库列表） | `src/widgets/plex/proxy.js` L93 | `1000 * 60 * 60 * 6` | 21,600,000 ms | **6 小时** |
+| **albums**（专辑计数） | `src/widgets/plex/proxy.js` L125 | `1000 * 60 * 10` | 600,000 ms | **10 分钟** |
+| **movies**（电影计数） | `src/widgets/plex/proxy.js` L127 | `1000 * 60 * 10` | 600,000 ms | **10 分钟** |
+| **tv**（剧集计数） | `src/widgets/plex/proxy.js` L126 | `1000 * 60 * 10` | 600,000 ms | **10 分钟** |
+| **streams**（播放流数） | — | 无缓存（每次实时请求） | — | — |
+
+`memory-cache` 的过期策略：**惰性过期**，即仅当 `cache.get(key)` 被调用时才检查是否过期，过期则返回 `null` 并删除该键。没有后台线程主动清理。
+
+### 7.5 设计选择总结
 
 从代码角度看，Plex Widget 的"不显眼"是**设计选择 + 技术限制的叠加**：
 - Plex 官方 API 返回 XML 且需要多库聚合，在 proxy 层做了大量复杂度隐藏
@@ -444,6 +567,7 @@ if (error) {
   1. 在 `plexProxyHandler` 中解析 `/status/sessions` 的完整 Session 详情（当前只用了 `_attributes.size`，见 proxy.js L84）
   2. 在 component 中增加类似 Emby 的 `SessionEntry` 渲染逻辑
   3. 注意 Plex XML 的 Session 结构（`Video._attributes`）与 Emby JSON 结构（`NowPlayingItem`）不同，需要新的字段映射
+  4. 注意 Plex 的会话统计口径含暂停/空闲，需过滤出真正在播放的条目
 
 ---
 
