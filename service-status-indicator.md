@@ -323,7 +323,11 @@ if (data.status === "running") {
 
 SWR 以 URL 为缓存 key，相同 URL 的请求会共享同一条缓存数据。但理解以下行为至关重要：
 
-**SWR 默认配置（[\_app.jsx#L75-L79](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/pages/_app.jsx#L75-L79)）**：
+**SWR 项目使用版本与默认配置**：
+
+项目使用 SWR **2.4.1**（见 [package.json#L41](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/package.json#L41)）。
+
+全局配置仅设置了 fetcher（[\_app.jsx#L75-L79](file:///d:/fz/0601/solo-dogfeeding/code/205-homepage/src/pages/_app.jsx#L75-L79)）：
 
 ```javascript
 <SWRConfig
@@ -333,30 +337,64 @@ SWR 以 URL 为缓存 key，相同 URL 的请求会共享同一条缓存数据�
 >
 ```
 
-项目**未覆盖** SWR 的默认行为，因此：
-- `revalidateOnMount` 默认为 `true`
-- `dedupingInterval` 默认为 `2000` 毫秒
-- `revalidateOnFocus` 默认为 `true`
+项目**未覆盖**的 SWR 2.x 默认值（与挂载行为直接相关）：
 
-**挂载时的精确行为**：
+| 配置项 | 默认值 | 之前的误判 |
+|--------|-------|-----------|
+| `revalidateOnMount` | `undefined` | ❌ 误判为 `true` |
+| `revalidateIfStale` | `true` | ❌ 完全遗漏 |
+| `dedupingInterval` | `2000` 毫秒 | ✅ 正确 |
+| `revalidateOnFocus` | `true` | ✅ 正确 |
+| `revalidateOnReconnect` | `true` | ✅ 正确 |
+
+**`revalidateOnMount` 与 `revalidateIfStale` 的交互关系**：
+
+这是最容易理解错误的部分。SWR 2.x 中两者的判定逻辑如下：
+
+- 如果显式设置了 `revalidateOnMount`（`true` 或 `false`），**直接使用该值**
+- 如果 `revalidateOnMount` 为 `undefined`（默认值），则**回退到 `revalidateIfStale` 的逻辑**：
+  - 缓存中有数据（stale 状态）→ **执行重新验证**
+  - 缓存中无数据 → **一定执行请求**
+
+因此在项目的默认配置下，"组件挂载时是否发起请求"的准确依据是：
+
+| 缓存状态 | 挂载行为 | 等效判定 |
+|---------|---------|---------|
+| 空（无任何数据） | ✅ **一定发起请求** | 无数据可展示，必须请求 |
+| 有旧数据（stale） | ✅ **先展示缓存 + 后台重新验证** | `revalidateIfStale=true` 的 SWR 核心语义 |
+| 有旧数据 + 显式设置 `revalidateIfStale: false` | ❌ **仅展示缓存，不请求** | 纯只读模式 |
+
+**⚠️ 注意**：之前"因为 `revalidateOnMount=true` 所以挂载时一定重新请求"的表述不准确。实际行为并非由 `revalidateOnMount` 显式控制为 `true`，而是因为默认值为 `undefined`，回退到 `revalidateIfStale=true` 的语义——只要缓存有数据（stale），挂载时就会重新验证。如果未来项目在全局配置中设置 `revalidateIfStale: false`，挂载行为会发生根本变化。
+
+**挂载时的精确行为（基于正确配置理解）**：
 
 1. **首次打开页面，状态指示器先挂载**
-   - SWR 缓存中无数据，立即发起网络请求获取状态
-   - 请求返回后数据写入缓存
+   - SWR 缓存为空 → **必须发起网络请求**（与 `revalidateIfStale` 无关，因为无数据可 stale）
+   - 请求返回后数据写入缓存，`isLoading: false`
 
 2. **用户点击展开面板，widget 首次挂载**
    - widget 的 `useSWR` 使用完全相同的 URL key
-   - **先立即返回缓存中的旧数据**（SWR 的 stale-while-revalidate 机制）
-   - **然后再发起一次新的网络请求**进行重新验证（因为 `revalidateOnMount=true`）
-   - ⚠️ **并不是"不会重复请求"**，而是先展示缓存 + 后台重新请求
-   - 新请求返回后，状态指示器和 widget **都会同步更新**（共享缓存）
+   - 检测到缓存中**已有数据**（状态指示器先前写入）→ 处于 stale 状态
+   - 由于 `revalidateIfStale=true`（默认），**先立即返回缓存中的旧数据**渲染 UI
+   - **同时在后台发起一次新的网络请求**进行重新验证
+   - ⚠️ 并不是"不会重复请求"，而是先展示缓存 + 后台重新请求
+   - 新请求返回后，数据写入共享缓存，状态指示器和 widget **都会同步触发重渲染**
 
-3. **展开/折叠重复操作**
-   - 每次展开都是 widget 重新挂载，都会触发一次重新验证请求
-   - 如果两次展开间隔小于 `dedupingInterval`（2秒），请求会被去重合并
+3. **展开/折叠重复操作（每次间隔 > 2 秒）**
+   - 每次展开都是 widget 重新挂载
+   - 缓存中始终有上次请求的数据（stale）
+   - `revalidateIfStale=true` → **每次展开都会触发一次后台重新验证**
+   - 如果两次展开间隔 < `dedupingInterval`（2秒），则请求被去重合并（复用同一个 in-flight Promise）
 
-4. **窗口聚焦时**
-   - 状态指示器始终存在（始终可见），会触发重新验证
+4. **展开/折叠重复操作（间隔 < 2 秒）**
+   - 第一次展开触发请求 A，计时器启动（T=0）
+   - 2 秒内第二次展开，请求 A 仍在 `dedupingInterval` 时间窗内
+   - SWR 不创建新请求，直接复用请求 A 的 Promise
+   - 两次展开都等待同一个请求完成，实际只发送 1 个网络请求
+
+5. **窗口聚焦时**
+   - 状态指示器始终存在（始终可见），由于 `revalidateOnFocus=true`（默认），触发重新验证
+   - `focusThrottleInterval=5000ms`（默认）：5 秒内多次聚焦只触发一次
    - 重新验证的结果写入共享缓存，widget 下次展开时直接使用最新数据
 
 #### 展开面板的共用请求与额外资源请求差异
@@ -420,19 +458,21 @@ return res.status(200).json({
 
 假设首次加载页面时状态指示器已完成请求，用户点击展开卡片：
 
-| 类型 | 共用请求行为 | 额外请求行为 | 展开时新增网络请求数 |
-|------|------------|------------|------------------|
-| Docker | SWR 重新验证（复用缓存 + 后台刷新） | 首次请求 `/api/docker/stats/...` | 2 个（status 重验证 + stats 新请求） |
-| Kubernetes | SWR 重新验证（复用缓存 + 后台刷新） | 首次请求 `/api/kubernetes/stats/...` | 2 个（status 重验证 + stats 新请求） |
-| Proxmox | SWR 重新验证（复用缓存 + 后台刷新） | 无额外请求 | 1 个（唯一 URL 的重验证） |
+| 类型 | 共用请求行为（准确描述） | 额外请求行为 | 展开时新增网络请求数 |
+|------|----------------------|------------|------------------|
+| Docker | 缓存有数据 → `revalidateIfStale=true` → 先展示缓存 + 后台重验证 | 缓存为空 → 必须发起首次请求 `/api/docker/stats/...` | 2 个（status 重验证 + stats 新请求） |
+| Kubernetes | 缓存有数据 → `revalidateIfStale=true` → 先展示缓存 + 后台重验证 | 缓存为空 → 必须发起首次请求 `/api/kubernetes/stats/...` | 2 个（status 重验证 + stats 新请求） |
+| Proxmox | 缓存有数据 → `revalidateIfStale=true` → 先展示缓存 + 后台重验证 | 无额外请求（共用端点已含 cpu/mem） | 1 个（唯一 URL 的重验证） |
 
 如果用户先展开再折叠，然后 2 秒内再次展开：
 
 | 类型 | 再次展开时的网络请求数 | 原因 |
 |------|---------------------|------|
-| Docker | 0 个 | 两次挂载间隔 < `dedupingInterval`（2s），请求被去重 |
-| Kubernetes | 0 个 | 同上 |
-| Proxmox | 0 个 | 同上 |
+| Docker | status：0~1 个 / stats：0~1 个 | 若间隔 < `dedupingInterval`（2s），**对应类型**的请求被去重；超过 2s 则重新触发 `revalidateIfStale` 重新验证 |
+| Kubernetes | status：0~1 个 / stats：0~1 个 | 同上（两个独立 URL 独立判断去重） |
+| Proxmox | 0~1 个 | 同上 |
+
+**⚠️ 去重是按 URL 独立判断的**：Docker/K8s 各有 status 和 stats 两个 URL，若展开→折叠→再展开的间隔超过 2 秒，status URL 触发重验证（缓存有数据 + `revalidateIfStale=true`），同时 stats URL 也触发重验证（缓存有数据 + `revalidateIfStale=true`），合计最多 2 个请求；若间隔 < 2s 则各自独立去重，可能出现 status 被去重（0 个）而 stats 未去重（1 个）的混合情况。
 
 但两者都没有设置 `refreshInterval`，因此**日常运行中不会主动刷新**（仅依赖挂载重验证、窗口聚焦、网络恢复）
 
