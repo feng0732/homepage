@@ -441,20 +441,171 @@ const definedLayouts = initialSettings.layout ? Object.keys(initialSettings.layo
 
 ### 5.6 嵌套子组合并
 
-嵌套子组的处理涉及两个辅助函数：
+嵌套子组的处理涉及三个关键函数，以及一个核心内部属性 `parent`。
 
-**`findGroupByName()`** —— `src/utils/config/service-helpers.js` 第 710-725 行
+#### 5.6.1 `parent` 属性的本质：仅是内部临时归属标识
 
-深度优先搜索，找到子组时会动态附加 `parent` 属性，供后续归属判断使用。
+**`parent` 不是用户可配置的字段。** 它不出现在任何 YAML 文件、Docker 标签或 Kubernetes 注解中，也无法通过 `homepage.parent` 标签或 `gethomepage.dev/parent` 注解来设置。
 
-**`mergeSubgroups()`** —— `src/utils/config/api-response.js` 第 99-107 行
+`parent` 唯一的赋值来源是 `findGroupByName()` 函数在深度遍历配置树时的动态标注行为：
 
-当服务组来自 Docker/K8s 自动发现但 `parent` 属性指示它是嵌套子组时：
-1. 递归在 configuredGroups 树中查找同名组
-2. 找到后用合并后的 services 替换原 services（**同样是拼接+排序，不覆盖**）
-3. `ensureParentGroupExists()` 确保顶层父组在 sortedGroups 中有对应位置
+```js
+// src/utils/config/service-helpers.js 第 710-725 行
+export function findGroupByName(groups, name) {
+  for (let i = 0; i < groups.length; i += 1) {
+    const group = groups[i];
+    if (group.name === name) {
+      return group;              // 顶层直接匹配，不设 parent
+    } else if (group.groups) {
+      const foundGroup = findGroupByName(group.groups, name);
+      if (foundGroup) {
+        foundGroup.parent = group.name;  // ★ 在递归返回时动态标注父组名
+        return foundGroup;
+      }
+    }
+  }
+  return null;
+}
+```
 
-**重要限制**：嵌套子组的 **结构**（哪组是哪组的父）只能在 `services.yaml` 中声明。Docker/K8s 发现的子组必须匹配一个已在 services.yaml 中声明的嵌套路径，否则会被当作顶层组处理。
+**关键语义**：
+- 如果目标组是顶层数组的直接成员，`findGroupByName` 返回时 **不会** 设置 `parent`
+- 只有当目标组是在某个父组的 `groups` 子树中被递归找到时，才会被动态打上 `parent = 父组名` 标记
+- 这个标记在每次调用 `findGroupByName` 时重新计算，是 **临时的运行时状态**，不是持久化配置
+
+#### 5.6.2 `parent` 的消费链路
+
+`parent` 在 `servicesResponse()` 的主循环中被消费（`src/utils/config/api-response.js` 第 237-251 行）：
+
+```js
+if (definedLayouts) {
+  const layoutIndex = definedLayouts.findIndex((layout) => layout === mergedGroup.name);
+  if (layoutIndex > -1) sortedGroups[layoutIndex] = mergedGroup;
+  else if (configuredGroup.parent) {
+    // ← configuredGroup 来自 findGroupByName(configuredServices, groupName)
+    //   如果该组名在 configuredServices 树中是嵌套子组，
+    //   则 configuredGroup.parent 已被 findGroupByName 动态标注
+    mergeSubgroups(configuredServices, mergedGroup);
+    ensureParentGroupExists(sortedGroups, configuredServices, configuredGroup, definedLayouts);
+  } else unsortedGroups.push(mergedGroup);
+} else if (configuredGroup.parent) {
+  mergeSubgroups(configuredServices, mergedGroup);
+} else {
+  unsortedGroups.push(mergedGroup);
+}
+```
+
+**判断逻辑**：
+- 对每个 `groupName`，通过 `findGroupByName(configuredServices, groupName)` 在 **services.yaml 解析出的配置树** 中查找
+- 若找到且返回对象带有 `.parent`，说明该组名在 services.yaml 中是某个父组的嵌套子组
+- 此时不将该组当作独立顶层组放入 `sortedGroups` / `unsortedGroups`，而是通过 `mergeSubgroups` 将其服务挂回父组
+
+#### 5.6.3 `mergeSubgroups()` —— 将拼接结果写回父组的嵌套位置
+
+```js
+// src/utils/config/api-response.js 第 99-107 行
+function mergeSubgroups(configuredGroups, mergedGroup) {
+  configuredGroups.forEach((group) => {
+    if (group.name === mergedGroup.name) {
+      group.services = mergedGroup.services;  // 用三源拼接+排序后的结果替换
+    } else if (group.groups) {
+      mergeSubgroups(group.groups, mergedGroup);  // 递归深入子树
+    }
+  });
+}
+```
+
+在 `configuredServices` 树中递归查找与 `mergedGroup` 同名的组，找到后用三源拼接+排序后的 services 替换。效果是：Docker/K8s 发现的同名组服务被注入到 services.yaml 已声明的嵌套位置。
+
+#### 5.6.4 `ensureParentGroupExists()` —— 确保顶层父组进入排序结果
+
+```js
+// src/utils/config/api-response.js 第 109-121 行
+function ensureParentGroupExists(sortedGroups, configuredGroups, group, definedLayouts) {
+  const parentGroupName = group.parent;
+  const parentGroup = findGroupByName(configuredGroups, parentGroupName);
+  if (parentGroup && parentGroup.parent) {
+    // 父组本身也是嵌套子组 → 继续向上追溯
+    ensureParentGroupExists(sortedGroups, configuredGroups, parentGroup, definedLayouts);
+  } else {
+    // 到达顶层父组 → 放入 sortedGroups 对应 layout 位置
+    const parentGroupIndex = definedLayouts.findIndex((layout) => layout === parentGroupName);
+    if (parentGroupIndex > -1) {
+      sortedGroups[parentGroupIndex] = parentGroup;
+    }
+  }
+}
+```
+
+由于嵌套子组的服务被写回父组的 `groups` 子树中，子组自身不会出现在 `sortedGroups` / `unsortedGroups` 中。但子组的 **顶层父组** 必须被放入 `sortedGroups`，否则整个嵌套树都不会出现在最终输出中。此函数就是确保这一点。
+
+对于多层嵌套（如 `Root → Top → Child`），函数会递归向上追溯直到找到没有 `parent` 标记的顶层组。
+
+#### 5.6.5 自动发现服务进入嵌套子组的前提条件
+
+**核心前提**：services.yaml 或 settings.yaml 的 layout 必须已声明相应的嵌套子组结构。
+
+Docker/K8s 自动发现的服务本身 **只有 `group` 字段**（Docker 标签 `homepage.group`，K8s 注解 `gethomepage.dev/group`），该字段仅声明服务所属的组名，无法表达"这个组是某个父组的子组"这一层级关系。嵌套层级关系 **完全依赖** services.yaml 或 layout 中的声明。
+
+具体有两条路径：
+
+**路径 A：通过 services.yaml 声明嵌套结构**
+
+```yaml
+# services.yaml
+- Top:                    # 父组
+    - Child:              # 嵌套子组
+        - SvcA:
+            href: http://a
+```
+
+此时 `configuredServices` 树中已存在 `Top.groups[0].name = "Child"` 的嵌套结构。当 Docker 发现了 `homepage.group=Child` 的服务时：
+1. `mergedGroupsNames` 包含 "Child"
+2. `findGroupByName(configuredServices, "Child")` 在递归遍历中找到它，并动态标注 `parent = "Top"`
+3. 进入 `configuredGroup.parent` 分支，`mergeSubgroups` 将三源拼接结果写回 `Top.groups[0].services`
+4. `ensureParentGroupExists` 确保 "Top" 进入 sortedGroups
+
+**路径 B：通过 settings.yaml layout 声明嵌套结构**
+
+```yaml
+# settings.yaml
+layout:
+  Top:
+    Child:
+```
+
+此时 layout 先通过 `convertLayoutGroupToGroup()` 转换为空组结构，再通过 `mergeLayoutGroupsIntoConfigured()` 注入 `configuredServices` 树中，后续流程与路径 A 相同。
+
+**如果既没有在 services.yaml 也没有在 layout 中声明嵌套结构**，那么即使 Docker/K8s 发现了 `group=Child` 的服务，"Child" 只会被当作一个 **普通顶层组** 处理，不会被挂入任何父组。
+
+#### 5.6.6 `mergeLayoutGroupsIntoConfigured()` —— layout 声明的嵌套结构注入
+
+```js
+// src/utils/config/api-response.js 第 136-156 行
+function mergeLayoutGroupsIntoConfigured(configuredGroups, layoutGroups) {
+  for (const layoutGroup of layoutGroups) {
+    const existing = findGroupByName(configuredGroups, layoutGroup.name);
+    if (existing) {
+      // 组名已存在于 services.yaml → 递归合并子组
+      if (layoutGroup.groups?.length) {
+        existing.groups ??= [];
+        for (const sub of layoutGroup.groups) {
+          const existingSub = findGroupByName(existing.groups, sub.name);
+          if (!existingSub) {
+            existing.groups.push(sub);       // 新增子组
+          } else {
+            mergeLayoutGroupsIntoConfigured([existingSub], [sub]);  // 递归深合并
+          }
+        }
+      }
+    } else {
+      configuredGroups.push(layoutGroup);  // 全新组直接追加
+    }
+  }
+}
+```
+
+此函数在 `servicesResponse()` 的 Step 4 执行，将 layout 中声明的嵌套组结构注入到 `configuredServices` 树中。这使得即使 services.yaml 中没有声明某个子组，仅靠 layout 也可以建立起嵌套结构，为后续 Docker/K8s 服务的自动挂入提供"锚点"。
 
 ---
 
@@ -558,7 +709,7 @@ Services Widgets 也有类似的白名单过滤（`src/utils/config/service-help
 | **Bookmarks 组排序** | settings.layout key 出现顺序 → YAML 数组顺序 | 同 Services 组排序 |
 | **settings 中字段** | YAML 显式值 > 代码默认值 | 如 `headerStyle` 默认为 "underlined"，可被 YAML 覆盖 |
 | **环境变量替换** | 不涉及覆盖（值替换） | 在 YAML 解析前执行，占位符找不到匹配值则保留原文 |
-| **嵌套子组结构** | 仅 services.yaml 可声明 | Docker/K8s 发现的子组通过 `parent` 标注，挂入 services.yaml 已声明的嵌套树 |
+| **嵌套子组结构** | services.yaml 或 settings.yaml layout 可声明 | `parent` 是 `findGroupByName` 遍历配置树时的内部临时标注，不是用户可配置字段 |
 | **嵌套子组内的服务** | 同样是三源拼接 + 排序 | 进入子组后应用与顶层相同的 "拼接→过滤→排序" 流程 |
 | **Widget 单复数** | widgets 数组 + widget 单对象 → 合并为 widgets | widget 追加到数组末尾（`cleanServiceGroups`） |
 
@@ -584,11 +735,11 @@ Services Widgets 也有类似的白名单过滤（`src/utils/config/service-help
 6. **原型污染防护**：
    `shvl.set()` 会拒绝 `__proto__`、`constructor`、`prototype` 路径，这是安全设计，不是 Bug。
 
-7. **嵌套子组结构仅支持 services.yaml**：
-   Docker/K8s 自动发现的服务若想进入嵌套子组，必须：
-   - 在 services.yaml 中预先声明好该子组的嵌套路径
-   - Docker 标签 / K8s 注解中的 group 名匹配子组名
-   - 或者通过更复杂的 parent 属性机制挂入
+7. **`parent` 不是用户可配置字段**：
+   `parent` 属性是 `findGroupByName()` 在深度遍历 services.yaml 配置树时的 **内部临时标注**，仅用于标记"这个组在配置树中是某个父组的嵌套子组"。它不出现在任何 YAML 文件、Docker 标签（无 `homepage.parent`）或 Kubernetes 注解（无 `gethomepage.dev/parent`）中，每次运行时由代码动态计算。
 
-8. **配置文件中非法条目会被静默跳过**：
+8. **自动发现服务进入嵌套子组的前提条件**：
+   Docker/K8s 自动发现的服务只有 `group` 字段（Docker: `homepage.group`，K8s: `gethomepage.dev/group`），该字段仅声明组名，无法表达嵌套层级。要使自动发现的服务进入嵌套子组，**必须** 在 services.yaml 或 settings.yaml layout 中预先声明该子组结构。否则，该组只会被当作普通顶层组处理。
+
+9. **配置文件中非法条目会被静默跳过**：
    `parseServicesToGroups()` 中如果某个服务条目的值为 `null` 或空，会记录一条 warn 日志后跳过该条目（`src/utils/config/service-helpers.js` 第 29-32 行）。
