@@ -105,134 +105,409 @@ export const config = {
 
 **中间件的真实角色是 API 网关防护。** 它保护的是 `/api/*` 路由，防止通过伪造 Host 头直接访问这些接口。
 
-#### 页面数据暴露边界——不能只说"首页只返回 HTML"
+#### 页面数据暴露边界——fallback 中的数据经过白名单和脱敏处理
 
-上面的流程图容易产生一个误解：认为首页 `GET /` 不经过中间件就没有安全风险，"返回的只是 HTML 页面"。**这个说法不严谨。**
+需要澄清的是：`fallback` 中的 services、widgets、bookmarks **不等于原始配置文件内容**，也不等于服务端持有的完整配置数据。从原始 YAML/容器标签到进入 `__NEXT_DATA__` 之间有一条严格的清洗链路。以下按代码执行顺序拆开分析。
 
-实际上，`getStaticProps` 在服务端获取了完整的业务数据，这些数据以两种方式嵌入 HTML：
+### 清洗链路 1：services 数据
 
-**1. `initialSettings` 直接序列化为 `pageProps`**
+**执行顺序：** `servicesFromConfig / servicesFromDocker / servicesFromKubernetes` → `parseServicesToGroups` → `cleanServiceGroups` → `servicesResponse` 组装排序 → 进入 fallback
 
-[index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/index.jsx#L59-L68) 中 `getSettings()` 返回的 `settings`（排除 `providers` 后）作为 `initialSettings` 传入 props：
+**第一步：数据源读取与结构转换**
 
+`servicesFromConfig`（[service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/utils/config/service-helpers.js#L53-L61)）：
+```javascript
+export async function servicesFromConfig() {
+  checkAndCopyConfig("services.yaml");
+  const servicesYaml = path.join(CONF_DIR, "services.yaml");
+  const rawFileContents = await fs.readFile(servicesYaml, "utf8");
+  const fileContents = substituteEnvironmentVars(rawFileContents);
+  const services = yaml.load(fileContents);
+  return parseServicesToGroups(services);  // ← 结构转换
+}
+```
+
+`parseServicesToGroups`（[service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/utils/config/service-helpers.js#L17-L51)）将用户友好的 YAML 结构转换为内部结构：
+```javascript
+serviceGroupServices.push({
+  name: entryName,
+  ...entries[entryName],       // ← 原样展开 YAML 中的字段
+  weight: entries[entryName].weight ?? (serviceGroupServices.length + 1) * 100,
+  type: "service",
+});
+```
+
+在这一步，原始 YAML 中的 `url`、`icon`、`description`、`server`、`container` 等字段原样保留，**敏感字段如果写在 services.yaml 中也会保留**——但 services.yaml 本身并不存放凭证，凭证存放在 `providers`（settings.yaml）或 `docker.yaml`/`kubernetes.yaml` 的连接配置中。
+
+`servicesFromDocker`（[service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/utils/config/service-helpers.js#L63-L170)）有更严格的过滤，只提取 `homepage.` 前缀的容器标签：
+```javascript
+Object.keys(containerLabels).forEach((label) => {
+  if (label.startsWith("homepage.")) {
+    let value = label.replace("homepage.", "");
+    // ... instance 过滤逻辑 ...
+    shvl.set(constructedService, value, substitutedVal);
+  }
+});
+```
+构造的对象只包含 `container`、`server`、`weight`、`type` 四个固定字段 + 从标签解析出的白名单属性。Docker 连接凭证（Socket 路径、TLS 证书等）来自 `docker.yaml`，通过 `getDockerArguments()` 读取，**绝不会出现在 `constructedService` 对象中**。
+
+**第二步：`cleanServiceGroups`——Widget 配置白名单过滤**
+
+`cleanServiceGroups`（[service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/utils/config/service-helpers.js#L231-L708)）是最关键的脱敏步骤。它遍历每个服务的每个 widget，通过**显式解构白名单**的方式只保留展示所需的字段：
+
+```javascript
+const {
+  // all widgets
+  fields, hideErrors, highlight, type,
+
+  // arcane
+  env,
+
+  // azuredevops
+  repositoryId, userEmail,
+
+  // beszel
+  systemId,
+
+  // ... 约 100 个按 widget 类型分类的白名单字段 ...
+
+  // unraid
+  pool1, pool2, pool3, pool4,
+
+  // yourspotify
+  interval,
+
+  // technitium
+  range,
+
+  // spoolman
+  spoolIds,
+
+  // grafana
+  alerts,
+} = widgetData;  // ← 不在此解构列表中的字段被隐式丢弃
+```
+
+这段代码通过解构赋值实现白名单：`widgetData` 对象中所有不在上述白名单内的键都会被丢弃。**明确被排除的敏感字段包括：**
+- `url`（绝大部分 widget 类型，仅 search 和 glances 例外）
+- `username`、`password`
+- `key`、`apiKey`
+
+之后按 widget 类型组装返回的 `widget` 对象，结构是固定的最小集合：
+```javascript
+const widget = {
+  type,
+  fields: fieldsList || null,
+  hide_errors: hideErrors || false,
+  service_name: service.name,
+  service_group: serviceGroup.name,
+  index,
+};
+// 然后按 type 逐个添加白名单字段：
+if (type === "docker") {
+  if (server) widget.server = server;
+  if (container) widget.container = container;
+}
+```
+
+注意：对于 `calendar` widget 的 integrations，还做了**二次脱敏**——显式剥离 `url`：
+```javascript
+if (Array.isArray(integrations)) {
+  widget.integrations = integrations.map((integration) => {
+    if (!integration || typeof integration !== "object") return integration;
+    const { url, ...integrationWithoutUrl } = integration;  // ← 剥离 url
+    return integrationWithoutUrl;
+  });
+}
+```
+
+**第三步：`servicesResponse` 组装与排序**
+
+`servicesResponse`（[api-response.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/utils/config/api-response.js#L158-L256)）合并三个来源后，仅按 `weight` 排序、按 layout 分组，**不新增或删除字段**。最终进入 fallback 的 services 数组就是 `cleanServiceGroups` 的输出。
+
+---
+
+### 清洗链路 2：widgets 数据（全局 widgets，非 service widgets）
+
+**执行顺序：** `widgetsFromConfig` → `cleanWidgetGroups` → `widgetsResponse` → 进入 fallback
+
+**第一步：`widgetsFromConfig` 原始读取**
+
+[widget-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/utils/config/widget-helpers.js#L8-L27)：
+```javascript
+export async function widgetsFromConfig() {
+  const widgetsYaml = path.join(CONF_DIR, "widgets.yaml");
+  const rawFileContents = await fs.readFile(widgetsYaml, "utf8");
+  const fileContents = substituteEnvironmentVars(rawFileContents);
+  const widgets = yaml.load(fileContents);
+  const widgetsArray = widgets.map((group, index) => ({
+    type: Object.keys(group)[0],
+    options: { index, ...group[Object.keys(group)[0]] },
+  }));
+  return widgetsArray;  // ← 此时 options 中包含原始配置的全部字段
+}
+```
+
+**第二步：`cleanWidgetGroups`——凭证字段黑名单剔除 + url 按类型过滤**
+
+[widget-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/utils/config/widget-helpers.js#L29-L54)：
+```javascript
+export async function cleanWidgetGroups(widgets) {
+  return widgets.map((widget, index) => {
+    const sanitizedOptions = widget.options;
+    const optionKeys = Object.keys(sanitizedOptions);
+
+    // 黑名单：直接删除敏感凭证字段
+    ["username", "password", "key", "apiKey"].forEach((pO) => {
+      if (optionKeys.includes(pO)) {
+        delete sanitizedOptions[pO];
+      }
+    });
+
+    // 按类型过滤 url：search 和 glances 类型的 url 允许暴露，其余删除
+    if (widget.type !== "search" && widget.type !== "glances" && optionKeys.includes("url")) {
+      delete sanitizedOptions.url;
+    }
+
+    return {
+      type: widget.type,
+      options: { index, ...sanitizedOptions },
+    };
+  });
+}
+```
+
+**明确被剔除的字段：**
+- 永久剔除：`username`、`password`、`key`、`apiKey`
+- 条件剔除：`url`（仅 `search`、`glances` 类型保留）
+
+**被剔除的凭证通过 `getPrivateWidgetOptions` 在服务端按需取回**
+
+[widget-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/utils/config/widget-helpers.js#L56-L79)：
+```javascript
+export async function getPrivateWidgetOptions(type, widgetIndex) {
+  const widgets = await widgetsFromConfig();
+  const privateOptions = widgets.map((widget) => {
+    const { index, url, username, password, key, apiKey } = widget.options;
+    return {
+      type: widget.type,
+      options: { index, url, username, password, key, apiKey },
+    };
+  }) || {};
+  // ...
+}
+```
+
+这个函数**只在 API 路由的服务端代码中调用**（从不出现在客户端 bundle 中），调用方包括：
+- `/api/widgets/weather.js`：取 `apiKey` 调用天气 API
+- `/api/widgets/openweathermap.js`：取 `apiKey`
+- `/api/widgets/glances.js`：取 `url`、`username`、`password`
+- 各类 proxy handler：通过 `widgets[type].api` + widget 的私有字段拼接真实请求
+
+这形成了一个经典的**服务端代理模式**：客户端看到的只是脱敏后的 widget 配置（不含凭证），当需要获取实时数据时，客户端请求 `/api/widgets/*` 或 `/api/services/proxy`，API 路由在服务端通过 `getPrivateWidgetOptions` 取回凭证，代替用户向目标服务发起请求，再将结果返回给客户端。
+
+---
+
+### 清洗链路 3：bookmarks 数据
+
+**执行顺序：** `bookmarksResponse` 内部处理 → 进入 fallback
+
+[api-response.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/utils/config/api-response.js#L27-L71)：
+```javascript
+export async function bookmarksResponse() {
+  const bookmarksYaml = path.join(CONF_DIR, "bookmarks.yaml");
+  const rawFileContents = await fs.readFile(bookmarksYaml, "utf8");
+  const fileContents = substituteEnvironmentVars(rawFileContents);
+  const bookmarks = yaml.load(fileContents);
+
+  // YAML 结构 → JS 数组
+  const bookmarksArray = bookmarks.map((group) => ({
+    name: Object.keys(group)[0],
+    bookmarks: group[Object.keys(group)[0]].map((entries) => ({
+      name: Object.keys(entries)[0],
+      ...entries[Object.keys(entries)[0]][0],  // ← 原样展开 YAML 字段
+    })),
+  }));
+
+  // 按 layout 排序，不新增字段
+  return [...sortedGroups.filter((g) => g), ...unsortedGroups];
+}
+```
+
+bookmarks.yaml 本身只存储书签的展示字段（`name`、`href`、`icon`、`description` 等），不含任何凭证，所以不需要单独的脱敏步骤。**暴露的风险在于 bookmark 的 URL 本身可能揭示内网服务地址**。
+
+---
+
+### 清洗链路 4：initialSettings 数据
+
+[index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/index.jsx#L59-L60)：
 ```javascript
 const { providers, ...settings } = getSettings();
-// ...
-return {
-  props: {
-    initialSettings: settings,  // 包含 title, layout, theme, color, background 等
-    // ...
-  },
-};
 ```
 
-`providers` 被解构排除，说明设计者有意识地**不在客户端暴露 Docker/K8s/Proxmox 的连接凭证**。但 `settings` 中其余字段（布局、主题、背景图 URL、base 路径等）仍然会被序列化到 `__NEXT_DATA__` 中。
+`providers` 被显式解构排除——这是 settings.yaml 中存放 Docker/Kubernetes/Proxmox 连接信息的字段。其余字段（`title`、`layout`、`theme`、`color`、`background`、`base`、`language` 等展示相关配置）原样进入 `initialSettings` 并被序列化。
 
-**2. `fallback` 携带完整的 services / bookmarks / widgets 数据**
+---
 
-[index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/index.jsx#L69-L74)：
+### 总结：`__NEXT_DATA__` 中到底包含什么、不包含什么
+
+| 数据 | 进入 fallback 前的处理 | 是否包含敏感信息 |
+|------|----------------------|:---:|
+| `fallback["/api/services"]` | `cleanServiceGroups` 的 widget 白名单解构 + calendar integrations url 剥离 | ❌ 不含 url/username/password/apiKey |
+| `fallback["/api/widgets"]` | `cleanWidgetGroups` 的敏感字段黑名单删除 + url 按类型过滤 | ❌ 不含 username/password/key/apiKey；除 search/glances 外不含 url |
+| `fallback["/api/bookmarks"]` | YAML 原样展开，无凭证字段 | ⚠️ 书签 URL 可能暴露内网拓扑 |
+| `initialSettings` | `providers` 解构排除 | ❌ 不含 Docker/K8s/Proxmox 连接凭证 |
+
+**因此，说"fallback 携带完整业务数据"不严谨。** 更准确的表述是：fallback 携带**展示层面的完整配置数据**（服务/书签名称、图标、描述、展示参数等），但**不含连接凭证、API key、目标服务 URL（少数白名单类型除外）**。真正的敏感凭证仅存在于服务端的 YAML 文件中，通过 `getPrivateWidgetOptions`、`getDockerArguments` 等服务端专用函数按需读取，从未进入客户端 bundle。
+
+**修正后的信息泄露边界：**
+
+攻击者通过 `GET /`（不经过中间件）可以获取：
+- ✅ 所有服务项的名称、图标、描述、权重、分组、widget 展示参数
+- ✅ 所有书签的名称、URL、图标、描述
+- ✅ 所有小部件的类型、展示参数（不含 url/username/password/key/apiKey）
+- ✅ 网站标题、布局、主题、颜色、背景图 URL、base 路径
+- ❌ 无法获取任何 API key、密码、用户名
+- ❌ 无法获取绝大部分 widget 的目标服务 URL
+- ❌ 无法获取 Docker/Kubernetes/Proxmox 的连接配置
+
+攻击者通过受中间件保护的 API 端点（Host 合法时）还能获取：
+- ✅ 实时状态数据（容器状态、系统指标、天气、下载进度等）
+- ✅ 自定义 CSS/JS 文件内容
+- ✅ 配置文件哈希、校验结果
+- ✅ 对内网主机发起 Ping 探测
+- ✅ 触发 ISR 重新验证
+
+#### API Host 校验覆盖的四类端点
+
+middleware 的 `matcher: "/api/:path*"` 保护项目中全部 30 多个 API 端点。按功能和安全属性重新归类如下：
+
+| 类别 | 端点 | 作用 | 服务端凭证使用 | 中间件保护价值 |
+|------|------|------|:---:|:---:|
+| **A. 配置展示类** | `/api/services`、`/api/bookmarks`、`/api/widgets`、`/api/theme` | 返回经清洗链路脱敏的展示配置数据 | ❌ 不使用凭证 | ⚠️ 冗余（`GET /` 的 `__NEXT_DATA__` 已暴露同等数据） |
+| **B. 实时状态类** | `/api/services/proxy`、`/api/docker/status/[...service]`、`/api/docker/stats/[...service]`、`/api/kubernetes/status/[...service]`、`/api/kubernetes/stats/[...service]`、`/api/proxmox/stats/[...service]`、`/api/widgets/glances`、`/api/widgets/longhorn`、`/api/widgets/resources` | 查询基础设施实时状态（容器状态、系统指标等） | ✅ 使用 `widget.url/username/password` 等（来自 `getPrivateWidgetOptions` 或 `getServiceWidget`） | ✅ **核心保护对象** |
+| **C. 外部请求代理类** | `/api/widgets/weather`、`/api/widgets/openweathermap`、`/api/widgets/openmeteo`、`/api/widgets/stocks`、`/api/releases`、`/api/siteMonitor`、`/api/search/searchSuggestion`、（所有 widget 的 proxy endpoint） | 服务端代发请求到外部 API，隐藏 API key 和目标 URL | ✅ 使用 `apiKey`（来自 `getPrivateWidgetOptions`）或 `serviceItem.url`（来自 `getServiceItem`） | ✅ **防止 SSRF + 凭证泄露** |
+| **D. 有副作用类** | `/api/revalidate`、`/api/ping`、`/api/validate`、`/api/hash`、`/api/config/[path]`（写）、`/api/healthcheck` | 触发服务端行为（重建缓存、探测内网、读取文件） | 不涉及凭证，但有状态/带宽消耗 | ✅ **防止滥用** |
+
+下面按类别详细分析。
+
+**A. 配置展示类端点——中间件保护价值有限**
+
+这类端点直接复用 `servicesResponse` / `bookmarksResponse` / `widgetsResponse`，返回值与 `getStaticProps` 注入 fallback 的数据完全相同：
+
+- `/api/services`（[src/pages/api/services/index.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/api/services/index.js#L1-L4)）：`res.send(await servicesResponse())`
+- `/api/bookmarks`（[src/pages/api/bookmarks.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/api/bookmarks.js#L1-L4)）：`res.send(await bookmarksResponse())`
+- `/api/widgets`（[src/pages/api/widgets/index.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/api/widgets/index.js#L1-L4)）：`res.send(await widgetsResponse())`
+- `/api/theme`（[src/pages/api/theme.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/api/theme.js#L1-L13)）：从 settings.yaml 读 `color` 和 `theme`
+
+因为 `GET /` 本身不经过中间件，且 fallback 中的数据已经过同样的 `cleanServiceGroups` / `cleanWidgetGroups` 清洗，所以**即使中间件拦截 `/api/services`，攻击者从 `GET /` 的 HTML 源码中也能拿到等价数据**。中间件对这类端点的保护只是"避免直接通过 API 访问"，并不构成真正的安全边界。
+
+**B. 实时状态类端点——中间件的核心保护对象**
+
+这类端点需要服务端持有的私有凭证才能访问目标服务。中间件在这里是真正的防线。
+
+以 `/api/services/proxy`（[src/pages/api/services/proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/api/services/proxy.js#L1-L50)）为例：
 
 ```javascript
-fallback: {
-  "/api/services": services,   // 所有服务项的名称、URL、图标、描述等
-  "/api/bookmarks": bookmarks, // 所有书签的名称、URL
-  "/api/widgets": widgets,     // 所有小部件的配置
-  "/api/hash": false,
-},
+export default async function handler(req, res) {
+  const { service, group, index } = req.query;
+  const serviceWidget = await getServiceWidget(group, service, index);  // ← 服务端读完整配置
+  // getServiceWidget 直接从 servicesFromConfig/servicesFromDocker 读取，
+  // 返回的是未经 cleanServiceGroups 处理的原始配置（含 url、username、password 等）
+
+  const type = serviceWidget?.type;
+  const widget = widgets[type];
+
+  // 使用 widget 的私有字段（url/username/password 等）构造真实请求
+  let urlString = formatApiCall(widgets[widget.type].api, { endpoint, ...widget });
+  const headers = {
+    ...(widget.username && widget.password
+      ? { Authorization: `Basic ${Buffer.from(`${widget.username}:${widget.password}`).toString("base64")}` }
+      : {}),
+  };
+  const [status, contentType, data] = await httpProxy(url, { method, headers });
+  // ...
+}
 ```
 
-这些数据在服务端通过 `servicesResponse()`、`bookmarksResponse()`、`widgetsResponse()` 获取，**与对应的 API 端点 `/api/services`、`/api/bookmarks`、`/api/widgets` 返回的数据完全相同**。
+关键在于 `getServiceWidget`（[service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/utils/config/service-helpers.js#L727-L761)）返回的是**未经清洗的完整配置对象**，包含 `url`、`username`、`password`、`apiKey` 等。这个函数只在 API 路由的服务端代码中被导入调用，从不进入客户端 bundle。`cleanServiceGroups` 仅用于服务端渲染时构造 fallback 数据，**不用于 API 路由的 proxy 处理**——proxy 处理需要完整配置才能访问目标服务。
 
-Next.js 在 SSR 时将整个 `pageProps`（包含 `initialSettings` 和 `fallback`）序列化为 JSON，嵌入到 HTML 中的 `<script id="__NEXT_DATA__">` 标签。任何人只需查看 HTML 源码，就能直接读取这些数据。
+典型的实时状态端点：
+- `/api/docker/stats/[...service]`：查询 Docker 容器资源占用
+- `/api/kubernetes/status/[...service]`：查询 Kubernetes Pod 状态
+- `/api/proxmox/stats/[...service]`：查询 Proxmox VM/CT 状态
+- `/api/widgets/glances`：通过 Glances API 获取系统指标，使用 `getPrivateWidgetOptions("glances", index)` 取回 `url/username/password`
 
-**因此，`GET /` 返回的并非"只是 HTML"，而是 HTML + 完整的业务数据快照。**
+如果没有中间件的 Host 校验，攻击者可以通过构造请求遍历内网基础设施的所有端点。
 
-#### API Host 校验的实际保护范围
+**C. 外部请求代理类端点——防止 SSRF 与凭证泄露**
 
-既然 `GET /` 的 HTML 源码已经包含了 services/bookmarks/widgets 的完整数据，那 API 中间件保护 `/api/services` 等端点的意义何在？需要精确区分哪些数据只在 API 端点暴露，哪些在页面 HTML 中就已暴露：
+这类端点在服务端代用户调用第三方 API，关键作用是**将 API key 限制在服务端**，不在客户端暴露。
 
-| 数据 | 页面 HTML 中的 `__NEXT_DATA__` | API 端点 | 中间件保护有效？ |
-|------|:---:|:---:|:---:|
-| 服务列表（名称、URL、图标、描述） | ✅ `fallback["/api/services"]` | ✅ `/api/services` | ❌ 已通过 HTML 暴露 |
-| 书签列表（名称、URL） | ✅ `fallback["/api/bookmarks"]` | ✅ `/api/bookmarks` | ❌ 已通过 HTML 暴露 |
-| 小部件配置（类型、参数） | ✅ `fallback["/api/widgets"]` | ✅ `/api/widgets` | ❌ 已通过 HTML 暴露 |
-| 设置（布局、主题、背景） | ✅ `initialSettings` | ❌ 无独立端点 | 不适用 |
-| Docker/K8s/Proxmox 连接凭证 | ❌ `providers` 被解构排除 | ❌ 无独立暴露端点 | 不适用 |
-| 服务实时状态（ping、资源占用） | ❌ 不在 fallback 中 | ✅ `/api/services/proxy` | ✅ **中间件有效** |
-| Glances 系统指标 | ❌ 不在 fallback 中 | ✅ `/api/widgets/glances` | ✅ **中间件有效** |
-| 天气/股票/Longhorn 实时数据 | ❌ 不在 fallback 中 | ✅ `/api/widgets/*` | ✅ **中间件有效** |
-| 配置文件哈希 | ❌ fallback 中为 `false` | ✅ `/api/hash` | ✅ **中间件有效** |
-| 配置 YAML 校验结果 | ❌ 不在 props 中 | ✅ `/api/validate` | ✅ **中间件有效** |
-| Ping 探测结果 | ❌ 不在 props 中 | ✅ `/api/ping` | ✅ **中间件有效** |
-| 自定义 CSS/JS 文件内容 | ❌ 不在 props 中 | ✅ `/api/config/custom.css` 等 | ✅ **中间件有效** |
-| ISR 重新验证触发 | ❌ 不在 props 中 | ✅ `/api/revalidate` | ✅ **中间件有效** |
-| Widget 实时数据代理 | ❌ 不在 props 中 | ✅ `/api/services/proxy` | ✅ **中间件有效** |
-
-**核心结论：中间件保护的重点不是"静态配置数据"（这些已经通过 HTML 暴露了），而是"实时动态数据"和"有副作用的操作"。**
-
-具体来说：
-
-1. **静态配置数据已被 HTML 暴露，中间件无法再保护**：services、bookmarks、widgets 的结构化数据已经通过 `__NEXT_DATA__` 完全暴露在页面 HTML 中。即使 `/api/services` 被中间件拦截，攻击者只需请求 `GET /` 就能获取同样的数据。
-
-2. **中间件有效保护的是实时数据通道**：[proxy.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/api/services/proxy.js#L1-L115) 提供的服务实时状态代理（如 Docker 容器状态、Glances 系统指标、智能家居状态等）不经过 `getStaticProps`，只在客户端通过 SWR 动态请求获取。这些请求必须经过中间件的 Host 校验，中间件在这里确实起到了防护作用。
-
-3. **中间件有效保护有副作用的端点**：`/api/revalidate` 能触发 ISR 重新生成，`/api/ping` 能对内网主机发起 ICMP 探测。这些是有安全影响的操作，必须通过中间件限制访问。
-
-#### 客户端再请求与中间件的关系
-
-首页的客户端代码在 Hydration 后，通过 SWR 发起两类数据请求：
-
-**第一类：使用 fallback 缓存的请求（首次不会真正发网络请求）**
+以 `/api/widgets/weather.js`（[src/pages/api/widgets/weather.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/api/widgets/weather.js#L1-L22)）为例：
 
 ```javascript
-const { data: services } = useSWR("/api/services");
-const { data: bookmarks } = useSWR("/api/bookmarks");
-const { data: widgets } = useSWR("/api/widgets");
+export default async function handler(req, res) {
+  const { latitude, longitude, provider, cache, lang, index } = req.query;
+  const privateWidgetOptions = await getPrivateWidgetOptions("weatherapi", index);
+  let { apiKey } = privateWidgetOptions;  // ← 服务端取回 API key
+
+  if (!apiKey && !provider) return res.status(400).json({ error: "Missing service configuration." });
+
+  const weatherURL = provider === "weatherapi"
+    ? `https://api.weatherapi.com/v1/current.json?key=${apiKey}&q=${latitude},${longitude}&lang=${lang}`
+    : `https://api.open-meteo.com/v1/forecast?...`;
+
+  return res.send(await cachedRequest(weatherURL, cache));  // ← 服务端发请求，API key 不暴露给客户端
+}
 ```
 
-由于 `fallback` 中已有这些 key 的数据，SWR 首次渲染直接使用缓存，**不会发起网络请求**。后续在窗口获得焦点或 revalidate 间隔到达时，SWR 才会真正请求 `/api/services` 等，此时**请求经过中间件**。如果 Host 不合法，revalidate 请求失败，但页面仍显示 fallback 中的旧数据。
+同类端点：
+- `/api/widgets/openweathermap.js`：类似地使用 `getPrivateWidgetOptions("openweathermap", index)` 的 `apiKey`
+- `/api/releases.js`（[src/pages/api/releases.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/api/releases.js#L1-L13)）：代发请求到 GitHub API
+- `/api/siteMonitor.js`（[src/pages/api/siteMonitor.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/api/siteMonitor.js#L1-L51)）：使用 `serviceItem.siteMonitor`（来自 `getServiceItem`，含内网 URL）对内网服务做 HTTP 健康检查
+- `/api/search/searchSuggestion.js`：代发搜索建议请求
 
-**第二类：无 fallback 缓存的实时请求（必须经过中间件）**
+这类端点的中间件价值有两重：
+1. **防止 SSRF（Server-Side Request Forgery）**：`/api/siteMonitor` 能对任意由配置指定的 URL 发起 HTTP 请求，如果 Host 不合法者可以访问，可被用于探测内网
+2. **间接保护 API key**：虽然 API key 从未出现在响应中，但攻击者如果可以无限制调用 `/api/widgets/weather`，等于盗用服务端的 key 配额
 
-```javascript
-const { data: errorsData } = useSWR("/api/validate");
-const { data: hashData, mutate: mutateHash } = useSWR("/api/hash");
+**D. 有副作用类端点——防止资源滥用**
+
+- `/api/revalidate`（[src/pages/api/revalidate.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/api/revalidate.js#L1-L8)）：`res.revalidate("/")` 触发 ISR 重新生成，会重新读取所有配置并执行渲染，消耗 CPU 和 IO
+- `/api/ping`：对内网主机发起 ICMP 探测，可被用于网络扫描
+- `/api/validate`：解析所有 YAML 配置并返回错误列表，暴露配置结构信息
+- `/api/hash`：返回配置文件的 SHA-1 哈希，用于客户端判断是否需要刷新
+- `/api/config/[path]`（[src/pages/api/config/[path].js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/api/config/[path].js#L1-L34)）：读取 `custom.css` / `custom.js`（只读，无写接口，但有文件 IO 开销）
+- `/api/healthcheck`（[src/pages/api/healthcheck.js](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/pages/api/healthcheck.js#L1-L3)）：虽然只是返回 "up"，但属于服务探测端点
+
+---
+
+### 综合安全视角
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                          信息 / 能力获取路径                            │
+├──────────────────────────────────────┬───────────────────────────────┤
+│    GET / （不经过中间件，无条件）       │   /api/* （经过中间件 Host 校验）│
+├──────────────────────────────────────┼───────────────────────────────┤
+│ ✅ services 展示配置（经清洗）          │   A 类：冗余的配置展示            │
+│ ✅ bookmarks 展示配置                 │   B 类：基础设施实时状态 ✅        │
+│ ✅ widgets 展示配置（经清洗）           │   C 类：外部 API 代理 ✅          │
+│ ✅ initialSettings（providers 被排除） │   D 类：有副作用操作 ✅            │
+│ ❌ 任何 API key / 密码 / 连接凭证      │                                │
+│ ❌ 实时状态数据                        │                                │
+│ ❌ 触发 ISR / Ping 等操作              │                                │
+└──────────────────────────────────────┴───────────────────────────────┘
 ```
 
-`/api/hash` 在 fallback 中设为 `false`，SWR 发现缓存无效，会立即发起网络请求。这类请求**必须通过中间件**的 Host 校验才能成功。此外，各 Widget 组件通过 [useWidgetAPI](file:///d:/fz/0601/solo-dogfeeding/code/212-homepage/src/utils/proxy/use-widget-api.js#L1-L16) 发起的实时数据请求（如 `/api/services/proxy?...`）也全部经过中间件。
+**结论修正：**
 
-**所以中间件对客户端请求的实际效果是：**
+1. 不能说"`GET /` 返回 HTML + 完整业务数据"——更准确的说法是：**`GET /` 返回 HTML + 经白名单过滤的展示配置数据**。连接凭证、API key、目标服务 URL（除少数白名单类型）从未进入 `__NEXT_DATA__`。
 
-- 静态配置数据：首次渲染不受影响（使用 fallback 缓存），后续 revalidate 受中间件控制
-- 实时动态数据：完全受中间件控制，Host 不合法则无法获取实时状态
-- 有副作用的操作：完全受中间件控制，Host 不合法则无法触发
+2. 不能说"中间件只保护实时数据和副作用"——**中间件同时保护实时状态类端点（B）、外部请求代理类端点（C，防 SSRF + 防盗用）和有副作用端点（D）**。只有配置展示类端点（A）的保护是冗余的。
 
-#### 安全视角下的完整数据暴露边界
-
-```
-攻击者请求 GET /（不经过中间件）
-    ↓
-获取 HTML 源码
-    ↓
-解析 <script id="__NEXT_DATA__">
-    ↓
-可获取的静态数据：
-    ├─ 所有服务项的名称、URL、图标、描述
-    ├─ 所有书签的名称、URL
-    ├─ 所有小部件的配置（类型、参数）
-    ├─ 设置（布局、主题、背景图 URL、base 路径等）
-    └─ 翻译字典（i18n）
-
-无法获取的数据（只在 API 端点暴露，受中间件保护）：
-    ├─ 服务实时状态（容器运行状态、资源占用等）
-    ├─ 系统监控指标（CPU、内存、磁盘等）
-    ├─ 自定义 CSS/JS 文件内容
-    ├─ 配置文件哈希值
-    ├─ 内网 Ping 探测结果
-    └─ 无权触发 ISR 重新验证
-```
-
-这意味着：**即使中间件正确配置，`GET /` 仍然是信息泄露的通道**。如果部署场景中 services/bookmarks/widgets 的名称和 URL 属于敏感信息（例如暴露了内网服务拓扑），仅靠中间件的 Host 校验是不够的，还需要在反向代理层对 `GET /` 本身做访问控制，或者在 `getStaticProps` 中对嵌入 fallback 的数据做脱敏处理。
+3. 对于 bookmarks URL 可能暴露内网拓扑的问题，这属于**业务数据本身的敏感性**，不是中间件或清洗链路能解决的。在敏感场景下需要额外的访问控制层。
 
 ### 1.3 动态路由解析
 
@@ -866,9 +1141,19 @@ useEffect(() => {
     ↓
 [服务端取数] getStaticProps()
     ├─ getSettings() → settings（providers 被排除，不进入客户端）
-    ├─ servicesResponse() → services（完整服务列表，含名称/URL/图标）
-    ├─ bookmarksResponse() → bookmarks（完整书签列表，含名称/URL）
-    ├─ widgetsResponse() → widgets（完整小部件配置）
+    ├─ servicesResponse()
+    │   ├─ servicesFromConfig/... 读取原始数据
+    │   ├─ cleanServiceGroups() widget 白名单过滤
+    │   │   ├─ 剔除 url/username/password/key/apiKey
+    │   │   └─ calendar integrations 二次脱敏剥离 url
+    │   └─ → services（仅展示配置，无凭证）
+    ├─ bookmarksResponse() → bookmarks（YAML 原样，不含凭证）
+    ├─ widgetsResponse()
+    │   ├─ widgetsFromConfig() 读取 widgets.yaml
+    │   ├─ cleanWidgetGroups()
+    │   │   ├─ 黑名单删除 username/password/key/apiKey
+    │   │   └─ 条件删除 url（search/glances 例外）
+    │   └─ → widgets（仅展示配置，无凭证）
     └─ serverSideTranslations() → i18n 翻译字典
     ↓
 返回 pageProps: { initialSettings, fallback, _nextI18Next }
@@ -880,13 +1165,13 @@ useEffect(() => {
     ├─ Index → SWRConfig fallback 数据桥
     └─ Home → 业务内容（settings 此时为 {}）
     ↓
-[数据注入] pageProps 完整序列化为 __NEXT_DATA__
-    ├─ initialSettings：布局、主题、背景等设置
-    ├─ fallback["/api/services"]：完整服务列表 ← 安全关注点
-    ├─ fallback["/api/bookmarks"]：完整书签列表 ← 安全关注点
-    └─ fallback["/api/widgets"]：完整小部件配置 ← 安全关注点
+[数据注入] pageProps 序列化为 __NEXT_DATA__
+    ├─ initialSettings：布局、主题、背景等设置（providers 被排除）
+    ├─ fallback["/api/services"]：经 cleanServiceGroups 脱敏的服务配置
+    ├─ fallback["/api/bookmarks"]：书签展示数据
+    └─ fallback["/api/widgets"]：经 cleanWidgetGroups 脱敏的 widget 配置
     ↓
-HTTP 响应返回 HTML（内含可被查看的明文业务数据）
+HTTP 响应返回 HTML（内含经脱敏的展示配置）
     ↓
 [客户端]
     ├─ 浏览器解析 HTML，显示静态内容
@@ -952,20 +1237,39 @@ window.location.reload() 全量刷新页面（获取新的 __NEXT_DATA__）
 
 ```
 路径 A：GET / （不经过中间件）
-    → HTML 源码 → __NEXT_DATA__ → 静态配置数据 ✅
-    → 无法获取实时动态数据 ❌
-    → 无法触发副作用操作 ❌
+    → HTML 源码 → __NEXT_DATA__
+    → ✅ services 展示配置（经 cleanServiceGroups 脱敏，无 url/username/password/apiKey）
+    → ✅ bookmarks 展示配置（含 URL，可能暴露内网拓扑）
+    → ✅ widgets 展示配置（经 cleanWidgetGroups 脱敏）
+    → ✅ initialSettings（providers 被排除）
+    → ❌ 任何凭证（apiKey/password/username/连接信息）
+    → ❌ 实时状态数据
+    → ❌ 触发副作用操作
 
-路径 B：GET /api/services （经过中间件）
-    → Host 校验 → 失败则 400 ❌
+路径 B：GET /api/services （经过中间件，A 类配置展示）
+    → Host 校验 → 失败则 400
     → 即使成功，数据与路径 A 的 fallback 完全相同（冗余通道）
 
-路径 C：GET /api/services/proxy?... （经过中间件）
-    → Host 校验 → 失败则 400 ❌
-    → 成功则获取实时动态数据 ✅（这才是中间件真正保护的）
+路径 C：GET /api/services/proxy?... （经过中间件，B 类实时状态）
+    → Host 校验 → 失败则 400
+    → 成功则服务端取完整配置（getServiceWidget 含 url/password）→ 代发请求 → 返回实时数据
+    → 这是中间件真正保护的核心价值点
+
+路径 D：GET /api/widgets/weather?index=0 （经过中间件，C 类外部请求代理）
+    → Host 校验 → 失败则 400
+    → 成功则服务端取 apiKey（getPrivateWidgetOptions）→ 代发请求到第三方 API
+    → 防止 SSRF 和 API key 盗用
+
+路径 E：GET /api/revalidate （经过中间件，D 类有副作用）
+    → Host 校验 → 失败则 400
+    → 成功则 res.revalidate("/") 触发 ISR 重新生成
 ```
 
-**结论：** 对静态配置数据而言，`GET /` 是无保护的泄露通道，中间件保护 `/api/services` 等端点只是"防君子不防小人"；对实时动态数据而言，中间件是唯一屏障。
+**总结：**
+- 对配置展示数据（A 类）：`GET /` 是无保护的泄露通道，中间件保护 `/api/services` 等端点只是"防君子不防小人"
+- 对实时状态数据（B 类）：中间件是唯一屏障，防止攻击者遍历内网基础设施
+- 对外部请求代理（C 类）：中间件防止 SSRF 和 API key 配额盗用
+- 对有副作用操作（D 类）：中间件防止资源滥用（ISR 重建、Ping 扫描）
 
 ---
 
