@@ -206,26 +206,173 @@ const { data, error } = useSWR(
 
 ## 七、刷新节奏与数据流时序
 
+### 7.1 SWR 版本与全局配置
+
+项目使用 SWR v2.4.1（见 [package.json](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/package.json#L41)）。
+
+SWR 的全局配置有两层：
+
+**App 级**（[\_app.jsx](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/src/pages/_app.jsx#L75-L79)）：
+```jsx
+<SWRConfig
+  value={{
+    fetcher: (resource, init) => fetch(resource, init).then((res) => res.json()),
+  }}
+>
+```
+
+**页面级**（[index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/src/pages/index.jsx#L186)）：
+```jsx
+<SWRConfig value={{ fallback, fetcher: (resource, init) => fetch(resource, init).then((res) => res.json()) }}>
+```
+
+两层配置均只声明了 `fetcher` 和（页面级的）`fallback`，**未显式覆盖任何 SWR 行为开关**，因此所有组件均采用 SWR v2 的**默认值**。
+
+Ping/SiteMonitor 组件自身的 SWR 调用（[ping.jsx](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/src/components/services/ping.jsx#L6-L8)、[site-monitor.jsx](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/src/components/services/site-monitor.jsx#L6-L8)）：
+```jsx
+const { data, error } = useSWR(url, { refreshInterval: 30000 });
+```
+只显式设置了 `refreshInterval: 30000`，其余也走 SWR 默认。
+
+### 7.2 SWR v2 与探测相关的默认行为
+
+下表列出与 Ping / SiteMonitor 探测请求直接相关的 SWR v2 默认行为：
+
+| SWR 选项 | 默认值 | 含义 | 对 Ping/SiteMonitor 的影响 |
+|---|---|---|---|
+| `revalidateOnFocus` | `true` | 页面重新获得焦点时触发重新验证 | 切回标签页或窗口时，会立即触发一次探测请求 |
+| `revalidateOnReconnect` | `true` | 网络恢复在线时触发重新验证 | 网络断开→恢复后，立即触发一次探测请求 |
+| `refreshWhenHidden` | `false` | 页面隐藏时是否继续按 `refreshInterval` 刷新 | 切到后台标签页时，30 秒定时器**暂停** |
+| `refreshWhenOffline` | `false` | 浏览器离线时是否继续按 `refreshInterval` 刷新 | 断网时，30 秒定时器**暂停** |
+| `focusThrottleInterval` | `5000` (ms) | 焦点重验的最小间隔（节流） | 5 秒内连续获得焦点，最多只触发 1 次额外探测 |
+| `dedupingInterval` | `2000` (ms) | 相同 key 请求的去重窗口 | 2 秒内同一服务的多次请求会合并为一次 |
+| `revalidateIfStale` | `true` | 有缓存数据但过期时组件挂载是否重验 | 组件首次挂载时使用 fallback 数据后仍会发请求 |
+| `revalidateOnMount` | `true` | 组件挂载时是否重验 | 组件挂载即立即发起第一次探测 |
+
+### 7.3 各场景下的探测行为详解
+
+#### 场景 1：正常前台浏览（理想情况）
+
 ```
 时间轴 (秒)
-0         30        60        90       …
-│         │         │         │
-├─ SWR 首次请求 ─┤         │         │
-│  (组件挂载时)   │         │         │
-│         ├─ SWR 自动刷新 ─┤         │
-│         │         ├─ SWR 自动刷新 ─┤
-│         │         │         │
-▼         ▼         ▼         ▼
-每个 <Ping> / <SiteMonitor> 组件独立维护自己的 SWR 请求
+0          30         60         90         …
+│          │          │          │
+├─ 组件挂载，立即请求 ─┤          │          │
+│  (revalidateOnMount=true)      │          │
+│          ├─ refreshInterval 触发 ─┤          │
+│          │          ├─ refreshInterval 触发 ─┤
+│          │          │          │
+▼          ▼          ▼          ▼
+请求间隔精确 30 秒
 ```
 
-关键点：
+- `revalidateOnMount=true` → 组件首次挂载立即发请求。
+- `refreshInterval=30000` → 之后每隔 30 秒周期性请求。
+- `refreshWhenHidden=false` + 前台状态 → 定时器正常运行。
 
-1. **每组件独立轮询**：每个 `<Ping>` 和 `<SiteMonitor>` 组件各自维护一个 SWR 请求实例，互不干扰。
-2. **固定 30 秒刷新**：`refreshInterval: 30000` 是硬编码的，不可通过配置修改（与 widget 的 `refreshInterval` 不同）。
-3. **首次加载**：组件挂载时 SWR 立即发起请求，同时显示加载态（灰色 `Ping` / `Response` 文字）。
-4. **无去抖/节流**：SWR 的 `refreshInterval` 是精确的定时器，不会因窗口焦点变化而停止（SWR 默认在窗口重新获得焦点时也会触发 revalidate，但 `refreshInterval` 是独立定时器）。
-5. **缓存键**：SWR 的缓存键就是完整 URL（如 `/api/ping?groupName=g&serviceName=s`），同一服务不会重复请求。
+#### 场景 2：页面被切到后台（隐藏）
+
+```
+前台       切到后台                   切回前台
+   │           │                          │
+   ├─ 请求 ───┤                          ├─ 立即请求 (revalidateOnFocus)
+   │           │  (refreshInterval 暂停)  │  + 恢复 30s 定时
+   │           │                          │
+   ▼           ▼                          ▼
+          refreshWhenHidden=false    focusThrottleInterval=5s
+          → 后台期间不发请求          → 5 秒内重复切回不会重复请求
+```
+
+- `refreshWhenHidden=false` → 标签页隐藏（如最小化、切到其他 Tab）时，30 秒的 `refreshInterval` 定时器**挂起**，后台期间不会消耗网络资源做探测。
+- 重新切回前台：
+  - `revalidateOnFocus=true` → 立即触发一次额外的探测请求（不等下一个 30 秒到点）。
+  - `focusThrottleInterval=5000` → 如果用户在 5 秒内快速切出又切回，SWR 会节流，只发 1 次焦点重验请求，避免探测风暴。
+  - 同时 `refreshInterval` 定时器恢复运行，从切回时刻重新计时。
+
+**注意**：项目中存在一个 `useWindowFocus` hook（[window-focus.js](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/src/utils/hooks/window-focus.js)），但它只被 `Index` 组件用于检测窗口聚焦后主动 `mutateHash()`（检测配置变更），**与 Ping / SiteMonitor 的 SWR 行为无关**。Ping/SiteMonitor 的聚焦重验完全由 SWR 内部默认机制驱动。
+
+#### 场景 3：浏览器离线（断网）
+
+```
+在线         离线                          重新在线
+   │           │                             │
+   ├─ 请求 ───┤                             ├─ 立即请求 (revalidateOnReconnect)
+   │           │  (refreshInterval 暂停)     │  + 恢复 30s 定时
+   │           │                             │
+   ▼           ▼                             ▼
+          refreshWhenOffline=false
+          → 离线期间不发请求
+```
+
+- `refreshWhenOffline=false` → `navigator.onLine === false` 期间，30 秒定时器挂起。
+- 网络恢复（`online` 事件）时：
+  - `revalidateOnReconnect=true` → 立即触发一次探测请求，尽快反映恢复后的真实状态。
+  - 同时 `refreshInterval` 定时器重新启动。
+
+#### 场景 4：多个相同服务（SWR 去重）
+
+- `dedupingInterval=2000` → 若在 2 秒内对同一 URL（相同 `groupName` + `serviceName`）发起多次请求，SWR 只会实际发出 1 次网络请求，其他订阅者共享结果。
+- 在 Homepage 场景中，每个服务只渲染一个 Ping / SiteMonitor 组件，因此通常不会触发去重；但如果同服务被多个 Tab 或布局重复引用，此机制可以避免重复探测。
+
+#### 场景 5：服务端渲染（SSR）与首次加载
+
+- 页面通过 `getStaticProps()`（[index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/src/pages/index.jsx#L55-L95)）预取 `/api/services`、`/api/bookmarks`、`/api/widgets` 等基础数据，放入 SWR `fallback`。
+- **注意**：Ping (`/api/ping`) 和 SiteMonitor (`/api/siteMonitor`) 的数据**不在 SSR fallback 中**。
+- 因此：
+  - 首屏渲染时 Ping / SiteMonitor 组件没有缓存数据 → 进入 "加载中" 灰色状态。
+  - `revalidateIfStale=true` + `revalidateOnMount=true` → 客户端 hydration 后组件立即发起第一次探测请求。
+  - 30 秒定时从第一次请求完成后开始。
+
+### 7.4 完整时序图
+
+```
+用户打开页面
+    │
+    ├─ SSR 返回 HTML（无 Ping/SiteMonitor 数据）
+    │
+    ▼
+客户端 hydration
+    │
+    ├─ Ping 组件挂载
+    │   └─ revalidateOnMount=true → 立即 GET /api/ping?…  (第 1 次)
+    │
+    ├─ SiteMonitor 组件挂载
+    │   └─ revalidateOnMount=true → 立即 GET /api/siteMonitor?…  (第 1 次)
+    │
+    │  【用户切到其他标签页 - 页面隐藏】
+    │   └─ refreshWhenHidden=false → refreshInterval 暂停
+    │
+    │  【3 分钟后切回 - 页面重新聚焦】
+    │   ├─ revalidateOnFocus=true → 立即 GET /api/ping?…  (第 2 次，不等 30s)
+    │   ├─ revalidateOnFocus=true → 立即 GET /api/siteMonitor?…  (第 2 次)
+    │   ├─ focusThrottleInterval=5s → 5 秒内切回不重复请求
+    │   └─ refreshInterval 恢复，从此时开始计时
+    │
+    │  【网络短暂断开又恢复】
+    │   ├─ 离线期间 refreshInterval 暂停
+    │   ├─ revalidateOnReconnect=true → 立即 GET /api/ping?…  (第 3 次)
+    │   └─ revalidateOnReconnect=true → 立即 GET /api/siteMonitor?…  (第 3 次)
+    │
+    │  【正常前台，无人操作】
+    │   ├─ +30s → GET /api/ping?…  (第 4 次)
+    │   ├─ +30s → GET /api/siteMonitor?…  (第 4 次)
+    │   ├─ +60s → GET /api/ping?…  (第 5 次)
+    │   └─ ……
+    │
+    ▼
+探测请求并非严格每 30 秒一次，
+而是"30 秒定时 + 聚焦触发 + 重连触发"三者的叠加
+```
+
+### 7.5 小结
+
+刷新节奏的真实特征：
+
+1. **基础周期**：每组件独立 `refreshInterval: 30000`（30 秒），硬编码不可配。
+2. **后台暂停**：页面隐藏或离线时，30 秒定时器挂起，不消耗资源。
+3. **事件驱动即时刷新**：页面重新获得焦点或网络恢复时，SWR 会立即发起探测请求，不等下一个定时到点，确保状态及时更新。
+4. **防风暴保护**：`focusThrottleInterval=5000` 防止快速切换标签页造成探测风暴；`dedupingInterval=2000` 合并短时间内的重复请求。
+5. **首屏行为**：Ping/SiteMonitor 不在 SSR fallback 中，首屏显示灰色加载态，hydration 后立即开始探测。
 
 ---
 
@@ -306,6 +453,10 @@ const { data, error } = useSWR(
 | [service-helpers.js](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/src/utils/config/service-helpers.js) | 服务配置解析 + getServiceItem 查找链 |
 | [api-response.js](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/src/utils/config/api-response.js) | 服务数据汇总与排序，输出给 /api/services |
 | [settings.jsx](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/src/utils/contexts/settings.jsx) | 全局设置上下文（含 statusStyle） |
+| [_app.jsx](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/src/pages/_app.jsx) | 应用级 SWRConfig（全局 fetcher，使用默认行为） |
+| [index.jsx](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/src/pages/index.jsx) | 页面级 SWRConfig + SSR fallback + useWindowFocus |
+| [window-focus.js](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/src/utils/hooks/window-focus.js) | 窗口焦点 hook（仅用于 hash 检测，与探测 SWR 无关） |
+| [package.json](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/package.json) | 项目依赖：swr v2.4.1 |
 | [ping.test.jsx](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/src/components/services/ping.test.jsx) | Ping 组件单元测试 |
 | [site-monitor.test.jsx](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/src/components/services/site-monitor.test.jsx) | SiteMonitor 组件单元测试 |
 | [ping.test.js](file:///d:/fz/0601/solo-dogfeeding/code/210-homepage/src/__tests__/pages/api/ping.test.js) | Ping API 单元测试 |
